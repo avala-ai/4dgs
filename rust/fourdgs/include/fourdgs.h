@@ -150,6 +150,38 @@ typedef enum fourdgs_status {
  */
 const char *fourdgs_last_error(void);
 
+/**
+ * The identifier the specification's refusal table gives the last error on this thread —
+ * "magic-mismatch", "unsupported-major-version", "unknown-temporal-model",
+ * "unknown-quantization-scheme", "unknown-stream-codec", "window-index-out-of-range" —
+ * or NULL with *out_len 0 when the last error is not one of them.
+ *
+ * The status codes say what KIND of thing went wrong, and FOURDGS_STATUS_UNSUPPORTED_CODEC
+ * alone covers three of those six. This is how a caller says WHICH one, in the same words
+ * every other implementation of this format uses.
+ *
+ * NULL is not a failure. A truncated transport, an I/O error and a null-argument mistake
+ * are real errors that the refusal table does not name; the call still returns
+ * FOURDGS_STATUS_OK and the sentence is in fourdgs_last_error().
+ *
+ * NOT NUL-terminated — read exactly *out_len bytes, and see CALL FIRST, THEN READ THE OUT
+ * PARAMETERS above. The bytes are static and outlive any scene, so nothing frees them;
+ * which identifier they spell changes with the next call on this thread that fails.
+ *
+ * A null out parameter returns FOURDGS_STATUS_INVALID_ARGUMENT and, alone on this surface,
+ * leaves fourdgs_last_error() untouched rather than overwriting the diagnosis being read.
+ */
+int fourdgs_last_refusal_code(const char **out, size_t *out_len);
+
+/**
+ * The byte attached to the last failure on this thread, when the operation can place it.
+ *
+ * Absence is not an error: `*out_has_offset` is 0 and `*out_offset` is 0. Like
+ * fourdgs_last_refusal_code, null out parameters return INVALID_ARGUMENT without overwriting
+ * the diagnosis being queried.
+ */
+int fourdgs_last_error_offset(uint64_t *out_offset, int *out_has_offset);
+
 /** A short static name for a status code. Never null; valid forever. */
 const char *fourdgs_status_message(int status);
 
@@ -245,6 +277,32 @@ int fourdgs_open_path_ex(const char *path, int mode, fourdgs_scene **out);
  * identically, including when this call fails.
  */
 int fourdgs_open_reader_ex(fourdgs_reader reader, int mode, fourdgs_scene **out);
+
+/**
+ * Called once for every lifetime gaussian identity introduced by keyframe-delta payloads.
+ * `record_offset` is the byte offset of the keyframe or delta record that introduces `id`.
+ */
+typedef int (*fourdgs_identity_sink)(void *ctx, uint64_t record_offset, uint32_t id);
+
+/**
+ * Validate every keyframe-delta payload through one concrete read path over a range source.
+ *
+ * `mode` is FOURDGS_OPEN_SEQUENTIAL or FOURDGS_OPEN_INDEXED; AUTO is deliberately rejected so
+ * a validator states which path it certified. The core retains at most the current population
+ * and its GOP keyframe. It calls `identity` once per lifetime introduction with the introducing
+ * keyframe or delta record's byte offset, allowing the caller to prove uniqueness and compare
+ * the resulting distinct count with
+ * `*out_declared_gaussian_count` using bounded scratch storage at its I/O edge.
+ *
+ * Ownership of `reader.ctx` transfers to this call and `reader.release` is called exactly once,
+ * including on failure. The identity context remains caller-owned. On failure the count output is
+ * untouched; fourdgs_last_error, fourdgs_last_refusal_code, and fourdgs_last_error_offset carry
+ * the diagnosis.
+ */
+int fourdgs_validate_keyframe_delta_reader(fourdgs_reader reader, int mode,
+                                           void *identity_ctx,
+                                           fourdgs_identity_sink identity,
+                                           uint64_t *out_declared_gaussian_count);
 
 /**
  * Release a scene and invalidate every pointer borrowed from it. Null is ignored.
@@ -889,7 +947,8 @@ int fourdgs_peek_temporal_model(const uint8_t *data, size_t length, const char *
  * `indexed == 0` walks the file front to back, composing each chunk onto the last; a non-zero
  * `indexed` reads the index and walks only each instant's chain. The two must agree. On
  * success `out` owns a string freed with fourdgs_string_free. A file whose Header is not
- * keyframe-delta is reported FOURDGS_STATUS_MALFORMED on the streamed path.
+ * keyframe-delta is reported FOURDGS_STATUS_UNSUPPORTED_CODEC on either path: it declares
+ * a legal temporal model handled by a different reader, not a malformed file.
  */
 int fourdgs_keyframe_delta_states_json(const uint8_t *data, size_t length, int indexed,
                                        const char **out, size_t *out_len);
@@ -961,6 +1020,147 @@ int fourdgs_scene_object_states_json(fourdgs_scene *scene, const char **out, siz
  * allocation.
  */
 void fourdgs_string_free(const char *data, size_t length);
+
+/* ---------------------------------------------------------------------------
+ * Encoding a keyframe-delta file
+ *
+ * fourdgs_writer_* authors a gaussian-birth file — one population whose gaussians each
+ * carry their own birth time — and there is no way through it to say what this model is
+ * for: the same population, with identity, restated at a sequence of instants. So this is
+ * a second writer handle rather than a mode on the first, for the same reason a Delta
+ * Chunk is its own record and not a flag on Chunk (spec 5.18).
+ *
+ * The arithmetic stays in the core. A delta is a DIFFERENCE OF BINS, never a quantization
+ * of a difference (spec 11.7), which holds only if every sample is quantized up front on
+ * one set of grids derived from the whole sequence. So samples are accumulated by the
+ * handle and encoded in one pass at the end: a binding that assembled deltas itself would
+ * be a second encoder with its own rounding, and its files would not match the reference
+ * byte for byte.
+ *
+ * Two counting rules follow from that and catch implementers reading only the record
+ * layout: the Header's `gaussian_count` under this model is the number of DISTINCT ids
+ * across the sequence, not a sum over chunks; and a delta's update count counts
+ * OPERATIONS, not the population.
+ *
+ * The encoded buffer is the same owned fourdgs_buffer the gaussian-birth writer returns.
+ *
+ * TYPICAL USE
+ *
+ *     fourdgs_kd_writer *writer = fourdgs_kd_writer_new();
+ *     fourdgs_kd_writer_set_duration(writer, 1.0);
+ *     for (uint32_t i = 0; i < frames; i++)
+ *         fourdgs_kd_writer_add_sample(writer, i / (double)frames, count, ids,
+ *                                      positions, scales, rotations, colors,
+ *                                      motions, mu_t, sigma_t, win_lo, win_hi);
+ *
+ *     fourdgs_buffer *out = NULL;
+ *     if (fourdgs_kd_writer_encode(writer, &out) == FOURDGS_STATUS_OK) {
+ *         fwrite(fourdgs_buffer_data(out), 1, fourdgs_buffer_len(out), file);
+ *         fourdgs_buffer_free(out);
+ *     } else {
+ *         fprintf(stderr, "%s\n", fourdgs_last_error());
+ *     }
+ *     fourdgs_kd_writer_free(writer);
+ * ------------------------------------------------------------------------- */
+
+/** A sample sequence being assembled for encoding. Free with fourdgs_kd_writer_free. */
+typedef struct fourdgs_kd_writer fourdgs_kd_writer;
+
+/**
+ * Create an empty keyframe-delta writer with the reference encoder's defaults — a keyframe
+ * every 8 samples, chained deltas, the "default" bound profile, a 0.05 cutoff and deflate
+ * at level 6 — or null on allocation failure.
+ */
+fourdgs_kd_writer *fourdgs_kd_writer_new(void);
+
+/** Release a keyframe-delta writer. Null is ignored. */
+void fourdgs_kd_writer_free(fourdgs_kd_writer *writer);
+
+/**
+ * Scene length in seconds. The last sample's interval ends here, so this is what closes
+ * the tiling the model requires (spec 11.1) rather than a separate advisory field.
+ */
+int fourdgs_kd_writer_set_duration(fourdgs_kd_writer *writer, double duration_sec);
+
+/** The Header's marginal visibility threshold, as on fourdgs_writer_set_cutoff. */
+int fourdgs_kd_writer_set_cutoff(fourdgs_kd_writer *writer, double cutoff);
+
+/**
+ * Cadence and reference mode. `keyframe_every` is samples per group of pictures; 1 writes
+ * every sample as a keyframe, which is legal. `delta_mode` is 0 for keyframe-referenced
+ * and 1 for chained (spec 11.4) — any other value is FOURDGS_STATUS_INVALID_ARGUMENT
+ * rather than a file no reader would accept.
+ */
+int fourdgs_kd_writer_set_cadence(fourdgs_kd_writer *writer, uint32_t keyframe_every,
+                                  uint8_t delta_mode);
+
+/**
+ * Force a keyframe at one sample index, beyond whatever the cadence would place. Call once
+ * per index; order does not matter and a repeat is harmless.
+ */
+int fourdgs_kd_writer_add_keyframe_at(fourdgs_kd_writer *writer, uint32_t sample_index);
+
+/**
+ * The bound profile the whole sequence is quantized against, and the Header's `profile`:
+ * "fine", "default" or "coarse". A (pointer, length) UTF-8 string. Unlike the
+ * gaussian-birth writer, where the Header's `profile` is a free-form promise separate from
+ * the bounds, these are one value under this model — the grids come from it.
+ */
+int fourdgs_kd_writer_set_profile(fourdgs_kd_writer *writer, const char *data, size_t length);
+
+/** The Header's `library`. Same string convention. */
+int fourdgs_kd_writer_set_library(fourdgs_kd_writer *writer, const char *data, size_t length);
+
+/** The stream codec and its level, applied to every chunk's block. Default: deflate at 6. */
+int fourdgs_kd_writer_set_compression(fourdgs_kd_writer *writer, uint8_t codec, uint32_t level);
+
+/**
+ * Append one sample: a population, at one instant, with identity.
+ *
+ * `ids` is aligned with the gaussian columns and is what a delta names them by (spec 11.2).
+ * It is required rather than derived from row order, because the model rests on
+ * correspondence between samples and row order asserts none.
+ *
+ * The columns are copied. Widths are per gaussian, exactly as
+ * fourdgs_writer_set_gaussians: `positions`, `scales` and `motions` are three floats each,
+ * `rotations` and `colors` four, and `mu_t`, `sigma_t`, `win_lo` and `win_hi` one. A null
+ * column — or a null `ids` — is an error unless `count` is zero.
+ *
+ * Samples are appended in time order and must tile the timeline: sample i covers
+ * [t0_i, t0_{i+1}), the first starts at 0 and the last ends at the duration (spec 11.1).
+ * The encoder derives each t1 from the next sample's t0; at encode time it refuses a
+ * non-finite or out-of-order start, a first start other than 0, or a final start after the
+ * duration. A zero-width interval is accepted only for an empty sample; a populated one
+ * would be unreachable under the half-open seek rule. The failure is
+ * FOURDGS_STATUS_INVALID_ARGUMENT, and fourdgs_last_error() names the sample and the
+ * expected time relationship.
+ *
+ * Every sigma_t must be finite. The format allows +inf for a gaussian that never fades and
+ * this reference encoder does not write one; a non-finite value is refused at encode.
+ *
+ * Spherical harmonics are not carried; a file written here declares sh_degree 0.
+ */
+int fourdgs_kd_writer_add_sample(fourdgs_kd_writer *writer, double t0, uint32_t count,
+                                 const uint32_t *ids, const float *positions,
+                                 const float *scales, const float *rotations,
+                                 const float *colors, const float *motions, const float *mu_t,
+                                 const float *sigma_t, const float *win_lo,
+                                 const float *win_hi);
+
+/** How many samples have been appended. 0 for a null writer. */
+uint32_t fourdgs_kd_writer_sample_count(const fourdgs_kd_writer *writer);
+
+/**
+ * Encode the appended sequence into an owned buffer, freed with fourdgs_buffer_free.
+ *
+ * On failure `out` is untouched and fourdgs_last_error names the reason: an empty
+ * sequence, a sample whose id count does not match its gaussian count, sample times that
+ * do not tile the duration, a non-finite sigma_t, or a gaussian whose sigma_t or window
+ * changes inside a group — the last refused rather than written, because those values ARE
+ * the grid a bin difference is taken on (spec 11.5) and a file carrying one decodes
+ * silently into a wrong velocity.
+ */
+int fourdgs_kd_writer_encode(fourdgs_kd_writer *writer, fourdgs_buffer **out);
 
 #ifdef __cplusplus
 } /* extern "C" */

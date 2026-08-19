@@ -25,6 +25,27 @@ import 'package:test/test.dart';
 
 Uint8List _bytes(String b64) => base64.decode(b64);
 
+FourdgsChunkIndexEntry _copyEntry(
+  FourdgsChunkIndexEntry entry, {
+  int? deltaMode,
+  int? referenceOffset,
+  int? depth,
+}) => FourdgsChunkIndexEntry(
+  t0: entry.t0,
+  t1: entry.t1,
+  chunkOffset: entry.chunkOffset,
+  chunkLength: entry.chunkLength,
+  gaussianCount: entry.gaussianCount,
+  bands: entry.bands,
+  extended: entry.extended,
+  kind: entry.kind,
+  deltaMode: deltaMode ?? entry.deltaMode,
+  referenceOffset: referenceOffset ?? entry.referenceOffset,
+  keyframeOffset: entry.keyframeOffset,
+  depth: depth ?? entry.depth,
+  liveCount: entry.liveCount,
+);
+
 Map<String, Object?> _statesStreamed(String b64) =>
     keyframeDeltaStatesJson(decodeKeyframeDeltaStreamed(_bytes(b64)));
 
@@ -52,6 +73,118 @@ void main() {
     expect(decoded.header.temporalModel, 'keyframe-delta');
     // ids seen across the whole clip: 0, 1, 2, 3, 4.
     expect(decoded.header.gaussianCount, 5);
+  });
+
+  test(
+    'a ranged chain prices exact framing before fetching a chunk range',
+    () async {
+      final Uint8List data = _bytes(_movingChained);
+      final decoded = decodeKeyframeDeltaIndexed(data);
+      final FourdgsChunkIndexEntry chainHead =
+          chainFrom(decoded.index, decoded.index.last).first;
+      final FourdgsChunkIndexEntry widened = FourdgsChunkIndexEntry(
+        t0: chainHead.t0,
+        t1: chainHead.t1,
+        chunkOffset: chainHead.chunkOffset,
+        chunkLength: data.length - chainHead.chunkOffset,
+        gaussianCount: chainHead.gaussianCount,
+        bands: chainHead.bands,
+        extended: chainHead.extended,
+        kind: chainHead.kind,
+        deltaMode: chainHead.deltaMode,
+        referenceOffset: chainHead.referenceOffset,
+        keyframeOffset: chainHead.keyframeOffset,
+        depth: chainHead.depth,
+        liveCount: chainHead.liveCount,
+      );
+      final List<FourdgsChunkIndexEntry> index = <FourdgsChunkIndexEntry>[
+        for (final FourdgsChunkIndexEntry item in decoded.index)
+          if (item.chunkOffset == chainHead.chunkOffset) widened else item,
+      ];
+      final _ReadSizes source = _ReadSizes(data);
+
+      await expectLater(
+        readKeyframeDeltaChain(source, index, index.last),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile error) => error.message,
+            'message',
+            contains('the index must name exactly one record'),
+          ),
+        ),
+      );
+      expect(source.largestRead, recordHeaderBytes);
+    },
+  );
+
+  test(
+    'a ranged chain validates mode, selected reference, and depth',
+    () async {
+      final Uint8List data = _bytes(_movingChained);
+      final decoded = decodeKeyframeDeltaIndexed(data);
+      final FourdgsChunkIndexEntry current = decoded.index.last;
+      final FourdgsChunkIndexEntry prior =
+          decoded.index[decoded.index.length - 2];
+      expect(
+        prior.kind,
+        1,
+        reason: 'the fixture must contain a delta reference',
+      );
+
+      Future<void> refused(
+        FourdgsChunkIndexEntry replacement,
+        String fragment,
+      ) async {
+        final List<FourdgsChunkIndexEntry> index = <FourdgsChunkIndexEntry>[
+          ...decoded.index.take(decoded.index.length - 1),
+          replacement,
+        ];
+        await expectLater(
+          readKeyframeDeltaChain(FourdgsBytes(data), index, replacement),
+          throwsA(
+            isA<FourdgsMalformedFile>().having(
+              (FourdgsMalformedFile error) => error.message,
+              'message',
+              contains(fragment),
+            ),
+          ),
+        );
+      }
+
+      await refused(_copyEntry(current, deltaMode: 9), 'delta_mode 9');
+      await refused(
+        _copyEntry(
+          current,
+          deltaMode: deltaModeKeyframe,
+          referenceOffset: prior.chunkOffset,
+        ),
+        'expected its GOP keyframe',
+      );
+      await refused(
+        _copyEntry(current, depth: current.depth + 1),
+        'selected reference requires',
+      );
+    },
+  );
+
+  test('a ranged delta preserves the parsed reference level', () async {
+    final Uint8List data = Uint8List.fromList(_bytes(_movingChained));
+    final decoded = decodeKeyframeDeltaIndexed(data);
+    final FourdgsChunkIndexEntry current = decoded.index.last;
+    ByteData.sublistView(
+      data,
+    ).setUint32(current.chunkOffset + recordHeaderBytes + 16, 1, Endian.little);
+
+    await expectLater(
+      readKeyframeDeltaChain(FourdgsBytes(data), decoded.index, current),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (FourdgsMalformedFile error) => error.message,
+          'message',
+          contains('a delta preserves its reference level'),
+        ),
+      ),
+    );
   });
 
   test('a wrong temporal model is refused on the keyframe-delta path', () {
@@ -278,6 +411,13 @@ void main() {
       double.infinity,
       Endian.little,
     );
+    // The interval is duplicated in the Delta Chunk as a cheap corruption
+    // check (§5.8), so a conforming open-ended fixture changes both copies.
+    view.setFloat64(
+      result.index.last.chunkOffset + recordHeaderBytes + 8,
+      double.infinity,
+      Endian.little,
+    );
 
     final reopened = decodeKeyframeDeltaIndexed(patched);
     expect(reopened.sequence.header.durationSec, double.infinity);
@@ -356,6 +496,19 @@ void main() {
         patched,
       ).setFloat64(at + 8, double.infinity, Endian.little);
     }
+    // And the Header's duration with them, as the open-ended test above does. A
+    // scene whose last chunk runs to `+Infinity` while its Header still declares
+    // a finite end is not open-ended, it is a file whose chunks overrun the
+    // duration — `4dgs validate` says so, and so does Python's `open_indexed`.
+    // Leaving it finite was testing a file no writer produces, which is the same
+    // argument this test already makes about patching both interval copies.
+    const int durationAt = 61;
+    final ByteData view = ByteData.sublistView(patched);
+    expect(
+      view.getFloat64(durationAt, Endian.little),
+      result.sequence.header.durationSec,
+    );
+    view.setFloat64(durationAt, double.infinity, Endian.little);
 
     final reopened = decodeKeyframeDeltaIndexed(patched);
     expect(reopened.index.last.t1, double.infinity);
@@ -388,6 +541,22 @@ void main() {
     expect(result.index.length, result.sequence.chunks.length);
     expect(result.sequence.chunks.every((c) => c.state.count >= 4), isTrue);
   });
+}
+
+class _ReadSizes implements FourdgsReadable {
+  _ReadSizes(this.bytes);
+
+  final Uint8List bytes;
+  int largestRead = 0;
+
+  @override
+  Future<int> size() async => bytes.length;
+
+  @override
+  Future<Uint8List> read(int offset, int length) async {
+    if (length > largestRead) largestRead = length;
+    return Uint8List.sublistView(bytes, offset, offset + length);
+  }
 }
 
 const String _movingChained =

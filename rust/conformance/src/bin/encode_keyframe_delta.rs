@@ -16,7 +16,7 @@
 //! the Python reference decoder — the only definition of a conforming file that means
 //! anything.
 //!
-//! Usage: encode_keyframe_delta <out.4dgs> [keyframe|chained]
+//! Usage: encode_keyframe_delta <out.4dgs> [keyframe|chained|cadence-one]
 
 use std::process::ExitCode;
 
@@ -27,21 +27,35 @@ use fourdgs::records::{DELTA_MODE_CHAINED, DELTA_MODE_KEYFRAME};
 const DURATION: f64 = 2.0;
 const SAMPLES: usize = 17;
 
+/// The cadence and delta mode a shape name asks for.
+///
+/// `cadence-one` is the §11.11 shape — every chunk a keyframe, no delta chunk anywhere,
+/// which is what subsumes the reserved `frame-sequence` name. It is here because the binding
+/// runners write it and their gates compare against this writer byte for byte; without it
+/// that comparison silently skipped a shape while the gate still reported it as checked. The
+/// delta mode is left at the default for it, because with no delta in the file there is
+/// nothing for it to name — and a binding is free to leave it alone too.
+fn shape_of(name: &str) -> Option<(usize, u8)> {
+    match name {
+        "chained" => Some((8, DELTA_MODE_CHAINED)),
+        "keyframe" => Some((8, DELTA_MODE_KEYFRAME)),
+        "cadence-one" => Some((1, DELTA_MODE_CHAINED)),
+        _ => None,
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args.len() > 3 {
-        eprintln!("usage: encode_keyframe_delta <out.4dgs> [keyframe|chained]");
+        eprintln!("usage: encode_keyframe_delta <out.4dgs> [keyframe|chained|cadence-one]");
         return ExitCode::from(2);
     }
-    let delta_mode = match args.get(2).map(String::as_str) {
-        None | Some("chained") => DELTA_MODE_CHAINED,
-        Some("keyframe") => DELTA_MODE_KEYFRAME,
-        Some(other) => {
-            eprintln!("unknown delta mode {other:?}; expected 'keyframe' or 'chained'");
-            return ExitCode::from(2);
-        }
+    let shape = args.get(2).map(String::as_str).unwrap_or("chained");
+    let Some((keyframe_every, delta_mode)) = shape_of(shape) else {
+        eprintln!("unknown shape {shape:?}; expected 'keyframe', 'chained' or 'cadence-one'");
+        return ExitCode::from(2);
     };
-    match run(&args[1], delta_mode) {
+    match run(&args[1], keyframe_every, delta_mode) {
         Ok(note) => {
             println!("{note}");
             ExitCode::SUCCESS
@@ -53,10 +67,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(output: &str, delta_mode: u8) -> Result<String, String> {
+fn run(output: &str, keyframe_every: usize, delta_mode: u8) -> Result<String, String> {
     let samples = synthesize();
     let kd = KeyframeDeltaOptions {
-        keyframe_every: 8,
+        keyframe_every,
         delta_mode,
         ..Default::default()
     };
@@ -125,6 +139,16 @@ fn synthesize() -> Vec<Sample> {
             motions: Vec::with_capacity(n * 3),
             mu_t: Vec::with_capacity(n),
             sigma_t: Vec::with_capacity(n),
+            // One validity window covering the whole clip, stated per gaussian rather than
+            // left empty. Empty is not the same claim: the writer would iterate zero windows,
+            // fall back to synthesizing `(0, duration)` for the table, and give every gaussian
+            // row 0 through `window_index_of`'s `unwrap_or(0)` miss. The file comes out the
+            // same as this one, so the binding runners — which do state a window, because the
+            // C ABI has no way not to — matched by coincidence rather than by agreement, and
+            // any change to the fixture's window would have diverged the Window Table while
+            // the gate blamed the binding. Both sides now say the same thing outright.
+            win_lo: vec![0.0; n],
+            win_hi: vec![DURATION as f32; n],
             ..Default::default()
         };
         for &id in &ids {

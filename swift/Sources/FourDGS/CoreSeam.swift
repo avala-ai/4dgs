@@ -636,6 +636,82 @@ enum Core {
         return result
     }
 
+    /// Encode a sequence of samples into a `keyframe-delta` file through the core's writer.
+    ///
+    /// The whole sequence crosses before anything is encoded, because it has to: a delta is a
+    /// difference of bins and never a quantization of a difference (spec §11.7), which holds
+    /// only if every sample was quantized on grids derived from the whole sequence. So this
+    /// pushes each sample into the core's handle and encodes once at the end. Nothing here
+    /// subtracts anything — assembling deltas in Swift would be a second encoder with its own
+    /// rounding, and the point of a binding is that its bytes are the reference's bytes.
+    ///
+    /// Each sample's columns are lent for the length of one call — rule 2 — and the core
+    /// copies them in, so nothing outlives the buffer pointers. The finished bytes are copied
+    /// out before the core's buffer is freed, exactly as ``encode(_:durationSec:options:)``
+    /// does.
+    static func encodeKeyframeDelta(
+        _ samples: [KeyframeDeltaSample], durationSec: Double, options: KeyframeDeltaWriteOptions
+    ) throws -> [UInt8] {
+        guard let writer = fourdgs_kd_writer_new() else {
+            throw FourDGSError.core(
+                code: Int32(FOURDGS_STATUS_INTERNAL.rawValue),
+                message: "the core could not allocate a keyframe-delta writer")
+        }
+        defer { fourdgs_kd_writer_free(writer) }
+
+        try check(fourdgs_kd_writer_set_duration(writer, durationSec))
+        try check(fourdgs_kd_writer_set_cutoff(writer, options.cutoff))
+        try check(
+            fourdgs_kd_writer_set_cadence(writer, options.keyframeEvery, options.deltaMode.rawValue))
+        for index in options.keyframeAt {
+            try check(fourdgs_kd_writer_add_keyframe_at(writer, index))
+        }
+        try setString(options.profile) { fourdgs_kd_writer_set_profile(writer, $0, $1) }
+        if !options.library.isEmpty {
+            try setString(options.library) { fourdgs_kd_writer_set_library(writer, $0, $1) }
+        }
+        try check(
+            fourdgs_kd_writer_set_compression(writer, options.codec, options.compressionLevel))
+
+        for sample in samples {
+            let gaussians = sample.gaussians
+            guard sample.ids.count == gaussians.count else {
+                throw FourDGSError.core(
+                    code: Int32(FOURDGS_STATUS_INVALID_ARGUMENT.rawValue),
+                    message:
+                        "the sample at t0 \(sample.t0) carries \(gaussians.count) gaussians and "
+                        + "\(sample.ids.count) ids; a delta names gaussians by id, so the two are "
+                        + "one list")
+            }
+            // The ids and all nine columns have to be valid at once, because the ABI reads
+            // them in one call — hence the nest, as on the gaussian-birth side.
+            try sample.ids.withUnsafeBufferPointer { identity in
+                try withColumns(
+                    [
+                        gaussians.positions, gaussians.scales, gaussians.rotations, gaussians.colors,
+                        gaussians.motions, gaussians.muT, gaussians.sigmaT, gaussians.winLo,
+                        gaussians.winHi,
+                    ]
+                ) { column in
+                    try check(
+                        fourdgs_kd_writer_add_sample(
+                            writer, sample.t0, UInt32(gaussians.count), identity.baseAddress,
+                            column[0], column[1], column[2], column[3], column[4], column[5],
+                            column[6], column[7], column[8]))
+                }
+            }
+        }
+
+        var buffer: OpaquePointer?
+        let status = fourdgs_kd_writer_encode(writer, &buffer)
+        guard status == ok, let buffer else { throw error(status) }
+        defer { fourdgs_buffer_free(buffer) }
+
+        let length = fourdgs_buffer_len(buffer)
+        guard length > 0, let data = fourdgs_buffer_data(buffer) else { return [] }
+        return Array(UnsafeBufferPointer(start: data, count: length))
+    }
+
     // MARK: - Provenance
 
     /// Canonical provenance JSON for an opened scene (spec §5.15). Empty when the file
@@ -766,7 +842,7 @@ enum Core {
     /// Translate a status into a Swift error, carrying the core's own message.
     ///
     /// The mapping is deliberately partial. A code this binding has no case for becomes
-    /// ``FourDGSError/core(code:message:)`` with the message passed through verbatim, so a
+    /// ``FourDGSError/core(code:message:refusal:)`` with the message passed through verbatim, so a
     /// core that grows a failure mode stays diagnosable from Swift rather than being
     /// flattened into "decode failed".
     ///
@@ -774,6 +850,10 @@ enum Core {
     /// thread, so the message is copied into a Swift `String` here rather than held.
     static func error(_ status: Int32) -> FourDGSError {
         let message = String(cString: fourdgs_last_error())
+        // Read beside the message and never held: both are thread-local and both describe
+        // the same failure, so reading them together is what keeps a diagnosis from being
+        // paired with the identifier of an older one.
+        let refusal = lastRefusalCode()
         switch status {
         // The ABI conflates "not a 4dgs file" with "a version this build does not
         // implement" into one status, and from here there is no way to tell which. Rather
@@ -781,20 +861,43 @@ enum Core {
         // through. Swift's `validateMagic` distinguishes the two before the boundary, which
         // is where a caller normally meets them.
         case Int32(FOURDGS_STATUS_UNSUPPORTED_VERSION.rawValue):
-            return .core(code: status, message: message)
+            return .core(code: status, message: message, refusal: refusal)
         case Int32(FOURDGS_STATUS_TRUNCATED.rawValue):
             return .truncated(offset: 0, record: message, needed: 0, available: 0)
         case Int32(FOURDGS_STATUS_MALFORMED.rawValue):
-            return .malformed(offset: 0, record: "file", field: "", reason: message)
+            return .malformed(offset: 0, record: "file", field: "", reason: message, refusal: refusal)
         case Int32(FOURDGS_STATUS_UNSUPPORTED_CODEC.rawValue):
-            return .unsupportedCodec(offset: 0, record: "Chunk", name: message)
+            return .unsupportedCodec(offset: 0, record: "Chunk", name: message, refusal: refusal)
         case Int32(FOURDGS_STATUS_IO.rawValue):
             return .unreadableSource(description: message)
         case Int32(FOURDGS_STATUS_OUT_OF_RANGE.rawValue):
             return .invalidRange(offset: 0, count: 0)
         default:
-            return .core(code: status, message: message)
+            return .core(code: status, message: message, refusal: refusal)
         }
+    }
+
+    /// Which rule the core's last failure on this thread broke, or `nil` when the refusal
+    /// table does not name it.
+    ///
+    /// `nil` is an answer rather than a failure to ask, and the ABI says so twice: the call
+    /// returns `FOURDGS_STATUS_OK` while writing a null pointer and a zero length. A
+    /// truncated file, an I/O error and a null argument are real errors the table has no
+    /// name for, and the sentence for them is in `fourdgs_last_error`.
+    ///
+    /// The bytes are **not** NUL-terminated. They are read through ``string(_:_:)``, which
+    /// copies exactly the length the core reported — `String(cString:)` on this pointer
+    /// would run off the end of a `&'static str` that has no terminator, which is the bug
+    /// the length in this signature exists to prevent. They are static, so nothing frees
+    /// them, and copying is what keeps them from changing under the returned value.
+    private static func lastRefusalCode() -> RefusalCode? {
+        var pointer: UnsafePointer<CChar>?
+        var length = 0
+        guard fourdgs_last_refusal_code(&pointer, &length) == ok else { return nil }
+        guard pointer != nil, length > 0 else { return nil }
+        // An identifier this build has no case for is `nil` rather than a fabricated one: a
+        // core that grows a seventh refusal should look unnamed here, not misnamed.
+        return RefusalCode(rawValue: string(pointer, length))
     }
 
     /// `\x89 4 D G S 1 \r \n`. §4.1.

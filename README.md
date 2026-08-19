@@ -9,18 +9,19 @@ Documentation lives at **[4dgs.dev](https://4dgs.dev)** — the specification, p
 and the conformance story, rendered from this repository.
 
 A `.4dgs` file holds a whole moving gaussian-splat scene: gaussians whose position, opacity and
-existence vary continuously over time, plus optional spatial audio sources and a default camera, in
-a single self-contained resource you can range-request and seek like a video. Audio may contain
-multiple fixed or moving sources in the same 3D scene.
+existence vary over time, plus optional spatial audio sources and a default camera, in a single
+self-contained resource you can range-request and seek like a video. Audio may contain multiple
+fixed or moving sources in the same 3D scene.
 
 > This repository is the 4dgs format: its specification, its conformance suite, and SDKs for reading
 > and writing it. Viewers, renderers, engine integrations, and performance tooling are out of scope.
 
 ## What it is
 
-- **Continuous time, not sampled frames.** Each gaussian carries its own birth time, temporal
-  extent, motion and validity window, so the number of live gaussians varies over time with no frame
-  machinery and no fixed splat count.
+- **Time is modelled explicitly.** In `gaussian-birth`, each gaussian carries its own birth time,
+  temporal extent, motion and validity window, so state is reconstructed continuously with no frame
+  machinery. `keyframe-delta` instead tiles the timeline with state chunks and bounded reference
+  chains. Neither model requires a fixed splat count.
 - **Seekable.** A byte-range index maps time to chunks. Displaying an instant reads the index and
   then only that instant's ranges.
 - **Spatial audio is native, and its absence is free.** Each source has independent timing, gain,
@@ -34,10 +35,11 @@ multiple fixed or moving sources in the same 3D scene.
 - **Renderer/player-agnostic.** Gaussian decode ends at reconstructed gaussian state. Audio decode
   reconstructs source pose and local time; the player supplies the listener and owns HRTF, panning,
   attenuation, occlusion and mixing.
-- **One temporal model, implemented; three names reserved.** Version 1 implements `gaussian-birth`,
-  where motion and lifetime belong to each gaussian. `frame-sequence`, `keyframe-delta` and
-  `deformation-field` are reserved in the [registry](website/docs/spec/registry.md) and specified
-  far enough to say what each would need — they are not implemented, and nothing here emits them.
+- **Two temporal models, implemented.** `gaussian-birth` carries motion and lifetime on each
+  gaussian. `keyframe-delta` carries keyframes plus bounded reference chains of updates, births and
+  deaths, and both models are conformance-verified across every SDK. `frame-sequence` is a registry
+  tombstone because cadence-one `keyframe-delta` subsumes it; `deformation-field` remains reserved.
+  The [registry](website/docs/spec/registry.md) is the authoritative status for every model name.
 
 ## Specification
 
@@ -57,7 +59,7 @@ multiple fixed or moving sources in the same 3D scene.
 | TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder and encoder, conformance-verified      | not yet — see below |
 | Rust       | [rust/](rust/)             | `fourdgs`    | Decoder and encoder, conformance-verified      | [crates.io][crates] |
 | C++        | [cpp/](cpp/)               | —            | Decode and encode over Rust's C ABI, verified  | build from source   |
-| Swift      | [swift/](swift/)           | —            | Binding over Rust; decode and encode, verified | build from source   |
+| Swift      | [swift/](swift/)           | `FourDGS`    | Binding over Rust; decode and encode, verified | SwiftPM URL, partly |
 | Dart       | [dart/](dart/)             | `fourdgs`    | Decoder, conformance-verified                  | not yet — see below |
 
 **The `@4dgs` packages are not on npm yet.** They are built, conformance-verified and versioned at
@@ -73,6 +75,13 @@ will not accept an automated publish for a package that does not exist. Automate
 setting _on a package_, so the name has to be claimed by a human running `dart pub publish` once
 before any workflow can take over. The release job is written and gated `if: false` until that
 happens; [RELEASING.md](RELEASING.md) has the three steps and their order.
+
+**Swift has no registry**, so `FourDGS` is consumed from this repository's URL — which is why
+`Package.swift` is at the root here and why Swift's releases are tagged `vX.Y.Z` with no package
+name in them: those are the only tags SwiftPM reads, and **a bare tag is the Swift package's version
+and not this repository's**. It resolves today and does not yet link outside a checkout, because the
+package binds the Rust core and ships no prebuilt copy of it; [swift/README.md](swift/README.md)
+says what that costs a consumer and what fixes it.
 
 Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file
 extension are always `4dgs`. [RELEASING.md](RELEASING.md) has the constraint per registry.

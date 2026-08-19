@@ -10,6 +10,8 @@ do is something a caller can do.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import os
 import sys
@@ -114,6 +116,12 @@ def cmd_validate(args) -> int:
         report = validate(fh.read())
     for finding in report.findings:
         print(finding)
+        # Indented, and with a prefix of its own, so that a caller filtering the findings
+        # on `error:`/`warning:`/`note:` — which is how this tool and the Rust one are
+        # compared — sees exactly what it saw before. Naming which rule fired is a
+        # validator's whole job, and the vocabulary was already on the exception.
+        if finding.refusal is not None:
+            print(f"  {finding.refusal}")
     if report.ok:
         print("valid" if not report.findings else "valid (with notes)")
         return 0
@@ -373,6 +381,102 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+#: The tool could not run at all — the file was not there, or could not be read. Distinct
+#: from `1`, which is a verdict about a file this tool did read: a caller that gets the
+#: same code for "your file is invalid" and "I never opened your file" cannot tell a
+#: refusal from a typo in a path, and a pipeline gating on the exit status treats a broken
+#: mount as a fleet of malformed files. `2` is argparse's usage error, so this is `3`,
+#: which is also what the Rust tool returns for the same thing.
+EXIT_TOOL_FAILURE = 3
+
+
+class _PipeTolerantStream:
+    """A stream that stops writing once its reader has gone.
+
+    `4dgs validate big.4dgs | head -1` closes the pipe after the first line, and the
+    next `print` raises `BrokenPipeError` — an `OSError`, so the handler below would
+    call it a transport failure and return `EXIT_TOOL_FAILURE`. It is neither. Who was
+    listening is not a fact about the file, and a verdict that changes when a reader
+    leaves early is not a verdict. Dropping the rest of the writes keeps the command's
+    own return value, which is what the Swift tool does with the same shape of failure.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self.broken = False
+
+    def write(self, text: str) -> int:
+        if self.broken:
+            return len(text)
+        try:
+            return self._stream.write(text)
+        except OSError as exc:
+            if not _is_departed_reader(exc):
+                raise
+            self.broken = True
+            return len(text)
+
+    def flush(self) -> None:
+        if self.broken:
+            return
+        try:
+            self._stream.flush()
+        except OSError as exc:
+            if not _is_departed_reader(exc):
+                raise
+            self.broken = True
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
+def _is_departed_reader(exc: OSError) -> bool:
+    """Whether this write failed because nobody is reading any more.
+
+    POSIX says `EPIPE` and Python raises `BrokenPipeError` for it. Windows reports the
+    same situation as `EINVAL` on the flush that follows the failed write, which is why
+    that errno is admitted there and only there: on Windows a write to stdout has no
+    other plausible way to be handed an invalid argument, and the alternative is the
+    interpreter exiting 120 with a traceback in place of the tool's verdict.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return sys.platform == "win32" and exc.errno == errno.EINVAL
+
+
+def _silence(stream) -> None:
+    """Point the descriptor *this* stream failed on at the void.
+
+    The interpreter flushes the standard streams again on the way out, and a flush that
+    fails there raises where nothing can catch it: Python prints `Exception ignored` and
+    exits 120, losing the code the command chose. Redirecting the descriptor is the
+    documented way to let that last flush succeed silently.
+
+    It asks the stream which descriptor that is rather than assuming 1 and 2. `main` is a
+    callable API, and a caller that runs it under `redirect_stdout` to a pipe of its own
+    has a broken descriptor that is not this process's stdout — the earlier spelling
+    pointed the *host's* stdout at the void instead, so every later `print` in that caller
+    succeeded and wrote nothing.
+    """
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        # A stream with no descriptor cannot be flushed by the interpreter at exit
+        # either — `io.StringIO` under a test harness, most often — so there is nothing
+        # here to protect against.
+        return
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(null, fd)
+    except OSError:
+        pass
+    finally:
+        os.close(null)
+
+
 def main(argv: list[str] | None = None) -> int:
     # The tool's output is UTF-8 wherever it goes. Unpiped, Python already does
     # this; piped on Windows it falls back to the locale encoding, so the same
@@ -382,7 +486,45 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    out, err = _PipeTolerantStream(sys.stdout), _PipeTolerantStream(sys.stderr)
+    sys.stdout, sys.stderr = out, err
+    problem: OSError | None = None
+    try:
+        code = args.func(args)
+    except OSError as exc:
+        # Narrow on purpose: a transport that would not answer, and nothing else. A
+        # malformed file is a verdict and stays exit 1; a bug in this package should still
+        # come out as a traceback, because a tool that reports its own defects as though
+        # they were the file's is worse than one that crashes.
+        print(f"4dgs: {exc.filename or ''}: {exc.strerror or exc}".replace(": : ", ": "), file=sys.stderr)
+        code = EXIT_TOOL_FAILURE
+    finally:
+        # Draining belongs here, because it has to happen on every way out — including an
+        # exception on its way past. Moving it below the `try` meant a defect in this
+        # package raised through an unflushed broken stream, and the interpreter's own
+        # flush at exit then printed `Exception ignored` and returned 120 in place of the
+        # traceback's 1: the same lost exit code as before, in the one case nobody looks at.
+        #
+        # What it must not do here is *raise*. A `finally` that raises replaces whatever
+        # was on its way out, which is how a full disk came to discard the exit code the
+        # command had already chosen. So a failure is remembered and answered below, on the
+        # path where there is still an exit code to answer with.
+        for wrapper in (out, err):
+            try:
+                wrapper.flush()
+            except OSError as exc:
+                problem = problem or exc
+            if wrapper.broken:
+                _silence(wrapper)
+        sys.stdout, sys.stderr = out._stream, err._stream
+    if problem is not None:
+        # The report did not reach where it was going, which is a failure of this tool and
+        # not a verdict about the file. Exit 3 says so; exit 1 would have claimed the file
+        # was invalid, and a traceback would have claimed this package was broken.
+        with contextlib.suppress(OSError):
+            print(f"4dgs: could not write the report: {problem.strerror or problem}", file=sys.stderr)
+        return EXIT_TOOL_FAILURE
+    return code
 
 
 if __name__ == "__main__":

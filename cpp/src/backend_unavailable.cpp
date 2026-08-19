@@ -31,6 +31,11 @@ StateHandle::~StateHandle() { closeState(*this); }
 Result<void> openPath(Handle&, const std::string&, int) { return notImplemented(); }
 Result<void> openMemory(Handle&, Span<const std::uint8_t>, int) { return notImplemented(); }
 Result<void> openReadable(Handle&, Readable&, int) { return notImplemented(); }
+Result<std::uint64_t> validateKeyframeDelta(
+    Readable&, int, const std::function<Result<void>(std::uint64_t, std::uint32_t)>&,
+    std::optional<std::uint64_t>*) {
+  return notImplemented();
+}
 
 double durationSec(const Handle&) { return 0.0; }
 double cutoff(const Handle&) { return 0.0; }
@@ -87,6 +92,11 @@ std::vector<SummaryOffset> summaryOffsets(const Handle&) { return std::vector<Su
 int summaryCrcState(const Handle&) { return -1; }
 
 Result<std::vector<std::uint8_t>> encodeScene(const GaussianView&, double, const WriteOptions&) {
+  return notImplemented();
+}
+
+Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(Span<const KeyframeDeltaSample>,
+                                                              double, const KeyframeDeltaOptions&) {
   return notImplemented();
 }
 

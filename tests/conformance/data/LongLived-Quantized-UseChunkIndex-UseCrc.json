@@ -1,10 +1,10 @@
 {
   "aggregate": {
     "neverFadesCount": "256",
-    "opacitySum": 130.423532,
+    "opacitySum": 130.423531,
     "positionSum": [
-      -4.233975,
-      0.372082,
+      -4.233982,
+      0.372077,
       8.739014
     ],
     "zeroMotionCount": "128"

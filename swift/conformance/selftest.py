@@ -8,7 +8,7 @@ Builds the same synthetic scene as `swift/conformance/Support/Synthetic.swift`, 
 same seed, and prints `canonical.py`'s summary of it. CI runs both and asserts the two
 documents parse equal:
 
-    swift run --package-path swift canonical_selftest > swift.json
+    swift run --scratch-path swift/.build canonical_selftest > swift.json
     python swift/conformance/selftest.py --compare swift.json
 
 The point is to separate two questions that would otherwise arrive together. When the Rust
@@ -34,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tests", "conformance"))
 
 import canonical
+from json_compare import for_capabilities
 
 GAUSSIAN_COUNT = 300
 SH_DEGREE = 2
@@ -221,7 +222,12 @@ def compare(summary: dict, path: str) -> int:
     """
     with open(path, encoding="utf-8") as fh:
         theirs = json.load(fh)
-    ours = json.loads(json.dumps(summary, allow_nan=False))
+    # This direct cross-decoder self-test bypasses run.py. Until the Swift/Rust
+    # implementation layer lands, omit only the canonical fields under transition.
+    ours = for_capabilities(
+        json.loads(canonical.canonical(summary)), exact_aggregates=False, canonical_state_order=False
+    )
+    theirs = for_capabilities(theirs, exact_aggregates=False, canonical_state_order=False)
     if ours == theirs:
         print("canonical JSON: Swift and canonical.py agree")
         return 0

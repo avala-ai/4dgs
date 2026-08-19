@@ -36,7 +36,10 @@ public enum JSON {
     /// goes the other way about once in a few thousand gaussians.
     public static func number(_ value: Double?) -> JSON {
         guard let value, value.isFinite else { return .null }
-        return .number(String(format: "%.6f", value))
+        let rounded = String(format: "%.6f", value)
+        // Signed zero is not a distinct canonical value. Normalize after formatting so
+        // small negative values that round to zero follow the same rule as authored -0.
+        return .number(rounded == "-0.000000" ? "0.000000" : rounded)
     }
 
     public static func number(_ value: Float?) -> JSON {

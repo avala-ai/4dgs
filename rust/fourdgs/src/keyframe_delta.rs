@@ -125,8 +125,11 @@ pub fn keyframe_state(ids: Vec<i64>, bins: BTreeMap<u8, BinArray>) -> Result<Sta
                 ),
             );
         }
+        check_absolute_bins(*attribute, values, "a keyframe")?;
     }
-    Ok(State { ids, bins })
+    let state = State { ids, bins };
+    check_rotation_indexes(&state)?;
+    Ok(state)
 }
 
 /// Compose one delta onto the state it references.
@@ -146,6 +149,24 @@ pub fn apply_delta(
     check_unique(update_ids, "an update group")?;
     check_unique(birth_ids, "a birth group")?;
     check_unique(death_ids, "a death group")?;
+
+    let has_rotation_index = update_bins.contains_key(&op::A_ROTATION_INDEX);
+    let has_rotation = update_bins.contains_key(&op::A_ROTATION);
+    if has_rotation_index != has_rotation {
+        return refuse(
+            "incomplete-rotation-update",
+            "an update must carry rotation_index and rotation together; smallest-three rotation restates the pair absolutely"
+                .into(),
+        );
+    }
+    for attribute in ABSOLUTE_IN_UPDATE {
+        if let Some(values) = update_bins.get(&attribute) {
+            check_absolute_bins(attribute, values, "an absolute update")?;
+        }
+    }
+    for (attribute, values) in birth_bins {
+        check_absolute_bins(*attribute, values, "a birth group")?;
+    }
 
     for attribute in update_bins.keys() {
         if is_gop_invariant(*attribute) {
@@ -201,6 +222,15 @@ pub fn apply_delta(
                     ),
                 );
             };
+            if delta.channels != base.channels {
+                return refuse(
+                    "stream-channel-count-mismatch",
+                    format!(
+                        "attribute {attribute} carries {} channels in the update and {} in the referenced state",
+                        delta.channels, base.channels
+                    ),
+                );
+            }
             let channels = base.channels;
             if is_absolute_in_update(*attribute) {
                 for (k, &row) in rows.iter().enumerate() {
@@ -278,6 +308,17 @@ pub fn apply_delta(
             let birth = birth_bins.get(&attribute);
             match state.bins.get(&attribute) {
                 Some(base) => {
+                    if let Some(b) = birth {
+                        if b.channels != base.channels {
+                            return refuse(
+                                "stream-channel-count-mismatch",
+                                format!(
+                                    "attribute {attribute} carries {} channels in the birth and {} in the referenced state",
+                                    b.channels, base.channels
+                                ),
+                            );
+                        }
+                    }
                     let mut values = base.values.clone();
                     if let Some(b) = birth {
                         values.extend_from_slice(&b.values);
@@ -293,7 +334,43 @@ pub fn apply_delta(
         state.bins = merged;
     }
 
+    check_rotation_indexes(&state)?;
     Ok(state)
+}
+
+fn check_absolute_bins(attribute: u8, values: &BinArray, what: &str) -> Result<(), Refusal> {
+    if let Some(value) = values
+        .values
+        .iter()
+        .find(|value| !(BIN_MIN..=BIN_MAX).contains(value))
+    {
+        return refuse(
+            "bin-overflow",
+            format!(
+                "{what} carries absolute attribute {attribute} bin {value}, outside the signed 32-bit range"
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn check_rotation_indexes(state: &State) -> Result<(), Refusal> {
+    let Some(indexes) = state.bins.get(&op::A_ROTATION_INDEX) else {
+        return Ok(());
+    };
+    if let Some(row) = indexes
+        .values
+        .iter()
+        .position(|index| !(0..=3).contains(index))
+    {
+        let index = indexes.values[row];
+        let identity = state.ids.get(row).copied().unwrap_or(row as i64);
+        return refuse(
+            "rotation-index-out-of-range",
+            format!("gaussian id {identity} carries rotation_index {index}; expected 0..3"),
+        );
+    }
+    Ok(())
 }
 
 /// A new state holding only the named rows of `state`, in `keep` order.
@@ -406,19 +483,76 @@ pub fn check_tiling(index: &[ChunkIndexEntry]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// The two ends of that tiling, which the index alone cannot answer for.
+///
+/// Spec §11.1 is one sentence with three clauses: sorted by `t0`, each chunk's `t1` equals
+/// the next chunk's `t0`, **the first `t0` is `0`, and the last `t1` is the Header's
+/// `duration_sec`**. [`check_tiling`] compares neighbours, which is a complete check of the
+/// interior and says nothing about either end — an index whose entries run `[0.4, 0.6)` and
+/// `[0.6, 0.9)` is internally adjacent and tiles none of a one-second clip. A reader that
+/// accepted it would answer a seek to `t=0.1` with "no state chunk covers t=0.1" on a file
+/// it had already called conforming.
+///
+/// Separate from `check_tiling` only because the duration comes from the Header and that
+/// function is handed the index by itself.
+pub fn check_timeline_endpoints(
+    index: &[ChunkIndexEntry],
+    duration_sec: f64,
+) -> Result<(), Refusal> {
+    let mut ordered: Vec<&ChunkIndexEntry> = index.iter().collect();
+    ordered.sort_by(|a, b| a.t0.partial_cmp(&b.t0).unwrap_or(std::cmp::Ordering::Equal));
+    // No entries is no index, which is a different file — one read front to back — and not
+    // a timeline with the wrong ends.
+    let (Some(first), Some(last)) = (ordered.first(), ordered.last()) else {
+        return Ok(());
+    };
+    if first.t0 != 0.0 {
+        return refuse(
+            "non-tiling-chunks",
+            format!(
+                "the state chunks start at {}; they tile the timeline from 0 (section 11.1)",
+                first.t0
+            ),
+        );
+    }
+    if last.t1 != duration_sec {
+        return refuse(
+            "non-tiling-chunks",
+            format!(
+                "the state chunks end at {}; the Header declares a duration of {duration_sec}, \
+                 and they tile the whole of it (section 11.1)",
+                last.t1
+            ),
+        );
+    }
+    Ok(())
+}
+
 /// The keyframe and deltas a reader must read to reconstruct instant `t`.
 ///
 /// Answered from the index alone — no chunk is fetched to learn what another references —
 /// and returned oldest first, which is the order [`apply_delta`] composes in.
 pub fn chain_for(index: &[ChunkIndexEntry], t: f64) -> Result<Vec<ChunkIndexEntry>, Refusal> {
+    let current = match index.iter().find(|e| e.t0 <= t && t < e.t1) {
+        Some(e) => e,
+        None => return refuse("non-tiling-chunks", format!("no state chunk covers t={t}")),
+    };
+    chain_ending_at(index, current)
+}
+
+/// The chain ending at one particular index entry.
+///
+/// Full-file validation has an entry already, so it must not recover that entry through a
+/// representative instant: a valid empty `[t, t)` state has no such instant. Instant seeks
+/// still select their entry through [`chain_for`] and then share this reference walk.
+pub(crate) fn chain_ending_at(
+    index: &[ChunkIndexEntry],
+    current: &ChunkIndexEntry,
+) -> Result<Vec<ChunkIndexEntry>, Refusal> {
     let mut by_offset: BTreeMap<u64, &ChunkIndexEntry> = BTreeMap::new();
     for entry in index {
         by_offset.insert(entry.chunk_offset, entry);
     }
-    let current = match index.iter().find(|e| e.t0 <= t && t < e.t1) {
-        Some(e) => e.clone(),
-        None => return refuse("non-tiling-chunks", format!("no state chunk covers t={t}")),
-    };
 
     let mut chain: Vec<ChunkIndexEntry> = vec![current.clone()];
     while chain[0].kind != 0 {

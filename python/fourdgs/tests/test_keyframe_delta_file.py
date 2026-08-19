@@ -16,6 +16,7 @@ import fourdgs
 import numpy as np
 import pytest
 from fourdgs import keyframe_delta_file as kdf
+from fourdgs import opcode as op
 from fourdgs import records as rec
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 
@@ -86,6 +87,137 @@ def test_a_keyframe_only_file_is_the_frame_sequence_shape():
     assert all(c.kind == 0 for c in decoded.chunks)  # every chunk a keyframe, no deltas
     summary = kdf.states_json(decoded)
     assert all(row["kind"] == "keyframe" for row in summary["chunks"])
+
+
+def test_each_keyframe_states_mu_t_at_its_chunk_start():
+    samples, duration = _moving_sequence(steps=4)
+    decoded = kdf.decode_streamed(write_ok(samples, duration, rec.DELTA_MODE_CHAINED, keyframe_every=2))
+    keyframes = [chunk for chunk in decoded.chunks if chunk.kind == 0]
+    assert [chunk.t0 for chunk in keyframes] == [0.0, 4.0]
+    for chunk in keyframes:
+        sigma = chunk.state.bins[op.A_SIGMA_T].reshape(-1)
+        never_fades = (chunk.state.bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
+        expected = np.rint(chunk.t0 / decoded.grids.mu_step(sigma, never_fades)).astype(np.int64)
+        assert chunk.state.bins[op.A_MU_T].reshape(-1).tolist() == expected.tolist()
+
+
+@pytest.mark.parametrize("mode", [rec.DELTA_MODE_CHAINED, rec.DELTA_MODE_KEYFRAME])
+def test_a_delta_subtracts_from_the_serialized_keyframe_birth_time(mode):
+    samples, duration = _moving_sequence(steps=4)
+    for sample in samples:
+        sample.gaussians.motions[:, 0] = 0.25
+
+    decoded = kdf.decode_streamed(write_ok(samples, duration, mode, keyframe_every=2))
+    later_keyframe = decoded.chunks[2]
+    following_delta = decoded.chunks[3]
+    assert later_keyframe.t0 == 4.0
+    assert following_delta.reference_offset == later_keyframe.offset
+
+    # The input authors mu_t=0 for every sample.  The keyframe correctly writes
+    # t0=4, and the following delta must calculate against that serialized bin while
+    # stating every updated gaussian at the delta's own t0=6.
+    assert np.all(later_keyframe.state.bins[op.A_MU_T] != 0)
+    sigma = following_delta.state.bins[op.A_SIGMA_T].reshape(-1)
+    never_fades = (following_delta.state.bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
+    expected = np.rint(following_delta.t0 / decoded.grids.mu_step(sigma, never_fades)).astype(np.int64)
+    actual_by_id = dict(
+        zip(
+            following_delta.state.ids.tolist(),
+            following_delta.state.bins[op.A_MU_T].reshape(-1).tolist(),
+            strict=True,
+        )
+    )
+    expected_by_id = dict(zip(following_delta.state.ids.tolist(), expected.tolist(), strict=True))
+    assert all(actual_by_id[gaussian_id] == expected_by_id[gaussian_id] for gaussian_id in [0, 1, 4])
+    keyframe_by_id = dict(
+        zip(
+            later_keyframe.state.ids.tolist(),
+            later_keyframe.state.bins[op.A_MU_T].reshape(-1).tolist(),
+            strict=True,
+        )
+    )
+    assert all(actual_by_id[gaussian_id] == keyframe_by_id[gaussian_id] for gaussian_id in [2, 3])
+
+
+@pytest.mark.parametrize("mode", [rec.DELTA_MODE_CHAINED, rec.DELTA_MODE_KEYFRAME])
+def test_a_delta_reanchors_only_the_gaussians_it_updates(mode):
+    samples, duration = _moving_sequence(steps=2, duration=2.0)
+    samples[1].gaussians.positions[:] = samples[0].gaussians.positions
+    samples[1].gaussians.positions[0, 0] += 0.25
+
+    decoded = kdf.decode_streamed(write_ok(samples, duration, mode, keyframe_every=2))
+    keyframe, delta = decoded.chunks
+    assert delta.update_count == 1
+
+    keyframe_mu = dict(
+        zip(keyframe.state.ids.tolist(), keyframe.state.bins[op.A_MU_T].reshape(-1).tolist(), strict=True)
+    )
+    delta_mu = dict(zip(delta.state.ids.tolist(), delta.state.bins[op.A_MU_T].reshape(-1).tolist(), strict=True))
+    assert delta_mu[0] != keyframe_mu[0]
+    assert all(delta_mu[gaussian_id] == keyframe_mu[gaussian_id] for gaussian_id in [1, 2, 3])
+
+
+def test_reanchoring_mu_t_preserves_a_later_keyframes_moving_centres():
+    samples, duration = _moving_sequence(steps=2, duration=4.0)
+    samples[1].gaussians.positions[:] = 0.0
+    samples[1].gaussians.motions[:] = [1.0, 0.0, 0.0]
+    samples[1].gaussians.mu_t[:] = 0.0
+
+    decoded = kdf.decode_streamed(write_ok(samples, duration, rec.DELTA_MODE_CHAINED, keyframe_every=1))
+    later = decoded.chunks[1]
+    state = kdf.reconstruct_at(later.state, decoded.grids, later.t0)
+    np.testing.assert_allclose(state["centers"][:, 0], 2.0, atol=decoded.grids.steps.pos)
+
+
+def test_reanchor_uses_the_serialized_time_and_bounds_its_rest_position():
+    """An off-grid chunk start cannot be amplified into a position error by motion."""
+    t0 = 0.12345
+    motion = [[1_000_000.0, 0.0, 0.0]]
+    samples = [
+        Sample(t0=0.0, ids=np.array([0]), gaussians=_gaussians([[0.0, 0.0, 0.0]], motions=motion, win_hi=1.0)),
+        Sample(t0=t0, ids=np.array([0]), gaussians=_gaussians([[0.0, 0.0, 0.0]], motions=motion, win_hi=1.0)),
+    ]
+    data = write_ok(samples, 1.0, rec.DELTA_MODE_CHAINED, keyframe_every=1)
+    decoded = kdf.decode_streamed(data)
+    later = decoded.chunks[1]
+
+    sigma = later.state.bins[op.A_SIGMA_T].reshape(-1)
+    never_fades = (later.state.bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
+    time_step = decoded.grids.mu_step(sigma, never_fades)
+    serialized_mu = float(later.state.bins[op.A_MU_T][0, 0]) * float(time_step[0])
+    assert serialized_mu != t0  # this is the rounding error the old path amplified
+
+    window_index = later.state.bins[op.A_WINDOW_INDEX].reshape(-1)
+    motion_step = decoded.grids.motion_step(sigma, never_fades, window_index)
+    decoded_motion = float(later.state.bins[op.A_MOTION][0, 0]) * float(motion_step[0])
+    state = kdf.reconstruct_at(later.state, decoded.grids, t0)
+    assert abs(float(state["centers"][0, 0]) - decoded_motion * t0) <= decoded.grids.steps.pos
+
+    rest_position = kdf.dequantize(later.state.bins[op.A_POSITION], decoded.grids.steps.pos, decoded.grids.origin)[0]
+    assert decoded.header.aabb[0] <= rest_position[0] <= decoded.header.aabb[3]
+
+    statistics = next(
+        rec.Statistics.parse(record.content)
+        for record in kdf.iter_records(data, len(kdf.MAGIC))
+        if record.opcode == op.STATISTICS
+    )
+    assert statistics.aabb[0] <= rest_position[0] <= statistics.aabb[3]
+
+
+@pytest.mark.parametrize("mode", [rec.DELTA_MODE_CHAINED, rec.DELTA_MODE_KEYFRAME])
+def test_delta_updates_and_births_reanchor_position_with_mu_t(mode):
+    samples, duration = _moving_sequence(steps=3, duration=6.0)
+    target = samples[2]
+    target.gaussians.positions[:] = 10.0
+    target.gaussians.motions[:] = [1.0, 0.0, 0.0]
+    target.gaussians.mu_t[:] = 0.0
+
+    # ID 4 is born in the third sample; the other rows are updates. Both groups
+    # must preserve the centre authored by the old anchor when restated at t0=4.
+    decoded = kdf.decode_streamed(write_ok(samples, duration, mode, keyframe_every=3))
+    delta = decoded.chunks[2]
+    state = kdf.reconstruct_at(delta.state, decoded.grids, delta.t0)
+    np.testing.assert_allclose(state["centers"][:, 0], 14.0, atol=decoded.grids.steps.pos)
 
 
 def test_composition_reconstructs_each_source_sample():

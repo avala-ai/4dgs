@@ -37,7 +37,8 @@ from fourdgs.indexed_reader import (
 from fourdgs.opcode import HEADER
 from fourdgs.readable import FileReadable
 from fourdgs.records import Header
-from fourdgs.serialization import MAGIC, check_magic, iter_records
+from fourdgs.serialization import MAGIC, iter_records
+from refusal import refusal_answer
 
 UNSUPPORTED: frozenset[str] = frozenset()
 
@@ -49,8 +50,17 @@ def supports_variant(name: str) -> bool:
 
 
 def _temporal_model(data: bytes) -> str | None:
-    """The Header's temporal model, read without decoding the gaussians."""
-    check_magic(data)
+    """The Header's temporal model, read only to choose the indexed decoder.
+
+    This is dispatch, not validation. In particular it must not check the magic: the
+    selected indexed decoder owns that rule, so the invalid corpus can prove that the
+    indexed path enforces it independently of the streamed path.
+    """
+    # Only a known version-1 file is safe to parse with the version-1 record and Header
+    # layouts. Every other prefix goes straight to the indexed opener, which diagnoses a
+    # foreign magic separately from a future major version before it touches any record.
+    if data[: len(MAGIC)] != MAGIC:
+        return None
     for record in iter_records(data, len(MAGIC)):
         if record.opcode == HEADER:
             return Header.parse(record.content).temporal_model
@@ -141,8 +151,11 @@ def run(path: str) -> str:
             motions=np.concatenate([c["motions"] for c in chunks]).astype(np.float32),
             mu_t=np.concatenate([c["mu_t"] for c in chunks]).astype(np.float32),
             sigma_t=np.concatenate([c["sigma_t"] for c in chunks]).astype(np.float32),
-            win_lo=table[idx, 0].astype(np.float32),
-            win_hi=table[idx, 1].astype(np.float32),
+            # Window Table endpoints are f64 on the wire. Match streamed assembly:
+            # narrowing a large finite endpoint to f32 infinity changes `[lo, hi)`
+            # membership and makes the two read paths reconstruct different states.
+            win_lo=np.asarray(table[idx, 0], dtype=np.float64),
+            win_hi=np.asarray(table[idx, 1], dtype=np.float64),
             sh=sh,
             sh_degree=scene.header.sh_degree,
             object_id=object_id,
@@ -157,8 +170,8 @@ def run(path: str) -> str:
             motions=z3,
             mu_t=np.zeros(0, dtype=np.float32),
             sigma_t=np.zeros(0, dtype=np.float32),
-            win_lo=np.zeros(0, dtype=np.float32),
-            win_hi=np.zeros(0, dtype=np.float32),
+            win_lo=np.zeros(0, dtype=np.float64),
+            win_hi=np.zeros(0, dtype=np.float64),
             sh_degree=scene.header.sh_degree,
         )
 
@@ -189,21 +202,6 @@ def _merge_sh(chunks, degree: int):
     return merge_chunk_bands([len(c["mu_t"]) for c in chunks], [c.get("sh", {}) for c in chunks])
 
 
-def _refusal(exc) -> str:
-    """The canonical answer for a file this reader refused.
-
-    A refusal is a result, not a crash: the runner prints it on stdout and exits 0, and
-    the harness diffs it against the expectation like any other answer. Exiting non-zero
-    instead would collapse "refused correctly" and "fell over" into one outcome, and the
-    whole point of the invalid corpus is that those are different.
-
-    An exception carrying no identifier prints an empty one, which matches no expectation
-    and fails with a readable diff. That is deliberate: a refusal the library cannot name
-    is a refusal the suite cannot check, and it should look like a gap rather than a pass.
-    """
-    return canonical({"refused": getattr(exc, "code", "")})
-
-
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: decode_indexed.py <file.4dgs>", file=sys.stderr)
@@ -211,7 +209,16 @@ def main(argv: list[str]) -> int:
     try:
         print(run(argv[1]))
     except fourdgs.FourdgsError as exc:
-        print(_refusal(exc))
+        # A refusal is a result, not a crash: it goes to stdout and the process exits 0,
+        # so the harness diffs it against the expectation like any other answer. An error
+        # the refusal vocabulary does not name is not that result. It goes to stderr with
+        # a non-zero exit, because a runner that answered it with an unnamed refusal would
+        # be claiming a valid answer for a failure nobody can check — see `refusal.py`.
+        answer = refusal_answer(exc)
+        if answer is None:
+            print(f"{argv[1]}: {exc}", file=sys.stderr)
+            return 1
+        print(answer)
     return 0
 
 

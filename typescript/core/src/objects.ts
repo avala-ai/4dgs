@@ -122,8 +122,8 @@ export class ObjectLayer {
    * O(gaussians + tracks), not O(gaussians × tracks).
    */
   apply(
-    centers: Float32Array,
-    orientations: Float32Array,
+    centers: Float32Array | Float64Array,
+    orientations: Float32Array | Float64Array,
     objectIds: ArrayLike<number>,
     t: number,
   ): void {

@@ -2,7 +2,7 @@ name: fourdgs
 description: >-
   A decoder for the 4dgs container format: 4D gaussian splat scenes with native
   audio in a single seekable file. Streamed and indexed read paths, pure Dart.
-version: 0.1.0
+version: 0.2.0
 homepage: https://4dgs.dev
 repository: https://github.com/avala-ai/4dgs
 issue_tracker: https://github.com/avala-ai/4dgs/issues
@@ -15,6 +15,14 @@ topics:
 
 environment:
   sdk: ^3.7.0
+
+# `dart pub global activate fourdgs` then puts `fourdgs inspect` and
+# `fourdgs validate` on the PATH. The tool is part of the package rather than a
+# second one because it is a few lines over the decoder: someone holding a file
+# a Flutter application will not open should not have to install a second
+# language to find out which byte it stops being a 4dgs file at.
+executables:
+  fourdgs:
 
 dependencies:
   # The format's default stream codec is deflate, wrapped in a zlib frame. `archive`

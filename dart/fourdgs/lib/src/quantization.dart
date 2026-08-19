@@ -27,6 +27,13 @@ import 'exceptions.dart';
 import 'records.dart';
 
 /// The Header's default marginal visibility threshold.
+///
+/// `DEFAULT_CUTOFF` in Python, Rust and TypeScript, and the same number here on
+/// purpose: it is the threshold a decoder applies when the Header does not
+/// usefully supply one, and a decoder that defaulted to something else would
+/// keep a different set of gaussians from the file than every other SDK reading
+/// it. Every default cutoff in this package comes from this constant rather
+/// than from a repeated literal, so there is one place to be wrong.
 const double fourdgsDefaultCutoff = 0.05;
 
 /// `marginal >= cutoff` <=> `|t - mu| <= K * sigma`, for the default cutoff.
@@ -45,13 +52,29 @@ final double kSupport = supportK(fourdgsDefaultCutoff);
 /// A threshold outside `(0, 1]` is not a threshold. It comes from a corrupt
 /// header, and it is refused here rather than allowed to become a domain error
 /// inside a logarithm.
-double supportK(double cutoff) {
+double supportK(double cutoff, {String what = "the Header's cutoff"}) {
+  checkCutoff(cutoff, what: what);
+  return math.sqrt(-2.0 * math.log(cutoff));
+}
+
+/// Refuses a marginal threshold outside `(0, 1]`, naming it.
+///
+/// Split out of [supportK] because two callers need the rule without needing
+/// the square root: [FourdgsGaussianSet.stateAt] compares against the threshold
+/// directly, and `NaN` loses that comparison for every gaussian — the whole
+/// scene comes back visible, with nothing raised anywhere. A threshold of zero
+/// is the other half: `sqrt(-2 * log(0))` is `+Infinity`, so a support interval
+/// derived from it covers the timeline and a chunker built on it cannot
+/// partition anything.
+///
+/// [what] names the source, because a threshold reaches this from two places
+/// with different fixes: the Header carries one, and a caller may pass its own.
+void checkCutoff(double cutoff, {String what = "the Header's cutoff"}) {
   if (cutoff.isNaN || !(cutoff > 0.0 && cutoff <= 1.0)) {
     throw FourdgsMalformedFile(
-      "the Header's cutoff is $cutoff; a marginal threshold must be in (0, 1]",
+      '$what is $cutoff; a marginal threshold must be in (0, 1]',
     );
   }
-  return math.sqrt(-2.0 * math.log(cutoff));
 }
 
 // Velocity precision classes.
@@ -128,7 +151,12 @@ int lifeClass(
   double? k,
 }) {
   final sigma = math.exp(sigmaBin * sigmaLogStep);
-  double half = neverFades ? windowLength : (k ?? kSupport) * sigma;
+  // Equal infinite endpoints are a legal empty validity window. Their
+  // subtraction is NaN, but the lifetime they describe is zero, not an
+  // implementation-defined clamp result. Normalize it before deriving a grid
+  // so every SDK assigns the same velocity pitch.
+  final finiteWindowLength = windowLength.isNaN ? 0.0 : windowLength;
+  double half = neverFades ? finiteWindowLength : (k ?? kSupport) * sigma;
   half = half.clamp(_lifeHalfMin, _lifeHalfMax);
   return _log2(half / _lifeRef).ceil().clamp(_lifeMinClass, _lifeMaxClass);
 }
@@ -147,7 +175,32 @@ double muStep(
 ) {
   final sigma = math.exp(sigmaBin * sigmaLogStep);
   final target = neverFades ? stepRef : math.min(stepRef, _muRel * sigma);
-  final cls = _log2(target / stepRef).floor().clamp(_muMinClass, 0);
+  final lg = _log2(target / stepRef);
+  // `-Infinity` when the sigma bin and step drive `exp()` all the way to zero.
+  // That is a legal file describing a gaussian with a vanishingly short life,
+  // not a corrupt one, and the clamp below already has an answer for it: the
+  // floor class. Dart's `floor()` throws `UnsupportedError` on a non-finite
+  // double BEFORE the clamp can run, so this decoder crashed on a file the
+  // reference decodes — `mu_steps` in `quantization.py` floors to `-inf` in
+  // numpy and clips, returning `stepRef * 2^_muMinClass`. Clamped first here so
+  // the two agree; verified numerically against the reference at
+  // `muStep(-100000, 1.0, false, 0.004)`, which is 3.90625e-06 in both.
+  //
+  // `NaN` is deliberately not handled here. It arises when `stepRef` is zero or
+  // negative, which is a degenerate Quantization record rather than a small
+  // gaussian, and what a reader owes such a file is an open question — the
+  // reference propagates `NaN` into every decoded birth time. Left throwing as
+  // it did, and tracked on avala-ai/4dgs#286 rather than settled by a side
+  // effect of this fix.
+  //
+  // Guarded on `stepRef` being finite and positive so that an INFINITE step
+  // keeps crashing rather than quietly returning infinity: §5.3 forbids it, the
+  // Quantization parse refuses it before a file can reach here, and the crash is
+  // what a direct caller gets instead of a silent non-finite pitch.
+  final cls =
+      (lg == double.negativeInfinity && stepRef.isFinite && stepRef > 0)
+          ? _muMinClass
+          : lg.floor().clamp(_muMinClass, 0);
   return stepRef * math.pow(2.0, cls).toDouble();
 }
 

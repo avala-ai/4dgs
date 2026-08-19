@@ -244,6 +244,109 @@ fn rotation_is_restated_absolutely_in_an_update() {
     assert_eq!(out.bins[&op::A_ROTATION_INDEX].values, vec![2]);
 }
 
+#[test]
+fn absolute_state_bins_and_rotation_pairs_are_complete_and_i32_bounded() {
+    let empty = BTreeMap::new();
+    let overflow = BIN_MAX + 1;
+    assert_eq!(
+        keyframe_state(
+            vec![1],
+            bins(&[
+                (op::A_ROTATION_INDEX, &[4], 1),
+                (op::A_ROTATION, &[0, 0, 0], 3)
+            ]),
+        )
+        .unwrap_err()
+        .code,
+        "rotation-index-out-of-range"
+    );
+    assert_eq!(
+        keyframe_state(vec![1], bins(&[(op::A_POSITION, &[overflow, 0, 0], 3)]))
+            .unwrap_err()
+            .code,
+        "bin-overflow"
+    );
+
+    let state = keyframe_state(
+        vec![1],
+        bins(&[
+            (op::A_POSITION, &[0, 0, 0], 3),
+            (op::A_ROTATION_INDEX, &[3], 1),
+            (op::A_ROTATION, &[0, 0, 0], 3),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[1],
+            &bins(&[(op::A_ROTATION_INDEX, &[2], 1)]),
+            &[],
+            &empty,
+            &[],
+        ),
+        "incomplete-rotation-update"
+    );
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[1],
+            &bins(&[
+                (op::A_ROTATION_INDEX, &[2], 1),
+                (op::A_ROTATION, &[overflow, 0, 0], 3),
+            ]),
+            &[],
+            &empty,
+            &[],
+        ),
+        "bin-overflow"
+    );
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[1],
+            &bins(&[
+                (op::A_ROTATION_INDEX, &[4], 1),
+                (op::A_ROTATION, &[0, 0, 0], 3),
+            ]),
+            &[],
+            &empty,
+            &[],
+        ),
+        "rotation-index-out-of-range"
+    );
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[],
+            &empty,
+            &[2],
+            &bins(&[
+                (op::A_POSITION, &[overflow, 0, 0], 3),
+                (op::A_ROTATION_INDEX, &[3], 1),
+                (op::A_ROTATION, &[0, 0, 0], 3),
+            ]),
+            &[],
+        ),
+        "bin-overflow"
+    );
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[],
+            &empty,
+            &[2],
+            &bins(&[
+                (op::A_POSITION, &[0, 0, 0], 3),
+                (op::A_ROTATION_INDEX, &[4], 1),
+                (op::A_ROTATION, &[0, 0, 0], 3),
+            ]),
+            &[],
+        ),
+        "rotation-index-out-of-range"
+    );
+}
+
 // --- the chain a seek walks --------------------------------------------------
 
 fn entry(t0: f64, t1: f64, offset: u64, kind: u8, reference: u64, depth: u16) -> ChunkIndexEntry {
@@ -326,6 +429,167 @@ fn tiling_is_enforced() {
 
     let clean = vec![entry(0.0, 1.0, 100, 0, 0, 0), entry(1.0, 2.0, 200, 0, 0, 0)];
     assert!(check_tiling(&clean).is_ok());
+}
+
+fn sample_at(t0: f64) -> fourdgs::keyframe_delta_file::Sample {
+    fourdgs::keyframe_delta_file::Sample {
+        t0,
+        ids: Vec::new(),
+        gaussians: fourdgs::model::GaussianSet::default(),
+    }
+}
+
+fn populated_sample_at(t0: f64) -> fourdgs::keyframe_delta_file::Sample {
+    fourdgs::keyframe_delta_file::Sample {
+        t0,
+        ids: vec![7],
+        gaussians: fourdgs::model::GaussianSet {
+            positions: vec![0.0, 0.0, 0.0],
+            scales: vec![0.1, 0.1, 0.1],
+            rotations: vec![0.0, 0.0, 0.0, 1.0],
+            colors: vec![0.5, 0.5, 0.5, 1.0],
+            motions: vec![0.0, 0.0, 0.0],
+            mu_t: vec![0.0],
+            sigma_t: vec![100.0],
+            win_lo: vec![0.0],
+            win_hi: vec![2.0],
+            ..Default::default()
+        },
+    }
+}
+
+fn writer_timeline_error(t0s: &[f64], duration_sec: f64) -> String {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions};
+
+    let samples: Vec<_> = t0s.iter().copied().map(sample_at).collect();
+    write_sequence(&samples, duration_sec, &KeyframeDeltaOptions::default())
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn the_writer_refuses_a_gap_before_the_first_sample() {
+    let message = writer_timeline_error(&[0.25, 1.0], 2.0);
+    assert!(message.contains("sample 0"), "{message}");
+    assert!(message.contains("t0=0.25"), "{message}");
+    assert!(message.contains("expected t0=0"), "{message}");
+    assert!(message.contains("gap at the start"), "{message}");
+}
+
+#[test]
+fn the_writer_refuses_a_sample_before_the_declared_timeline() {
+    let message = writer_timeline_error(&[-0.25, 1.0], 2.0);
+    assert!(message.contains("sample 0"), "{message}");
+    assert!(message.contains("t0=-0.25"), "{message}");
+    assert!(message.contains("expected t0=0"), "{message}");
+    assert!(message.contains("overlaps time before"), "{message}");
+}
+
+#[test]
+fn the_writer_refuses_an_out_of_order_sample_as_an_overlap() {
+    let message = writer_timeline_error(&[0.0, 1.5, 1.0], 2.0);
+    assert!(message.contains("sample 2"), "{message}");
+    assert!(message.contains("t0=1"), "{message}");
+    assert!(message.contains("sample 1 at t0=1.5"), "{message}");
+    assert!(message.contains("expected sample times"), "{message}");
+    assert!(message.contains("overlap"), "{message}");
+}
+
+#[test]
+fn the_writer_refuses_a_populated_zero_width_interval() {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions};
+
+    let samples = [
+        populated_sample_at(0.0),
+        populated_sample_at(1.0),
+        populated_sample_at(1.0),
+    ];
+    let message = write_sequence(&samples, 2.0, &KeyframeDeltaOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("sample 1"), "{message}");
+    assert!(message.contains("population of 1"), "{message}");
+    assert!(message.contains("zero-width interval [1, 1)"), "{message}");
+    assert!(message.contains("expected 0"), "{message}");
+    assert!(message.contains("half-open seek rule"), "{message}");
+}
+
+#[test]
+fn an_empty_zero_width_interval_is_still_a_valid_tiling() {
+    use fourdgs::keyframe_delta_file::{decode_indexed, write_sequence, KeyframeDeltaOptions};
+
+    let samples = [sample_at(0.0), sample_at(1.0), sample_at(1.0)];
+    let bytes = write_sequence(&samples, 2.0, &KeyframeDeltaOptions::default()).unwrap();
+    let decoded = decode_indexed(&bytes).expect("an empty zero-width state is harmless");
+    let intervals: Vec<_> = decoded.1.iter().map(|entry| (entry.t0, entry.t1)).collect();
+    assert_eq!(intervals, [(0.0, 1.0), (1.0, 1.0), (1.0, 2.0)]);
+    assert_eq!(decoded.1[1].live_count, 0);
+}
+
+#[test]
+fn a_final_empty_zero_width_interval_round_trips_through_indexed_decode() {
+    use fourdgs::keyframe_delta_file::{decode_indexed, write_sequence, KeyframeDeltaOptions};
+
+    for (samples, duration_sec, expected) in [
+        (
+            vec![sample_at(0.0), sample_at(1.0)],
+            1.0,
+            vec![(0.0, 1.0), (1.0, 1.0)],
+        ),
+        (vec![sample_at(0.0)], 0.0, vec![(0.0, 0.0)]),
+    ] {
+        let bytes = write_sequence(&samples, duration_sec, &KeyframeDeltaOptions::default())
+            .expect("an empty zero-width terminal state is authorable");
+        let decoded = decode_indexed(&bytes)
+            .expect("the indexed decoder can compose the writer's zero-width terminal state");
+        let intervals: Vec<_> = decoded
+            .0
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.t0, chunk.t1))
+            .collect();
+        assert_eq!(intervals, expected);
+        assert_eq!(decoded.0.chunks.last().unwrap().state.count(), 0);
+    }
+}
+
+#[test]
+fn the_writer_refuses_non_finite_timeline_values() {
+    let sample = writer_timeline_error(&[0.0, f64::NAN], 2.0);
+    assert!(sample.contains("sample 1"), "{sample}");
+    assert!(sample.contains("t0=NaN"), "{sample}");
+    assert!(sample.contains("expected a finite sample time"), "{sample}");
+
+    let duration = writer_timeline_error(&[0.0], f64::NAN);
+    assert!(duration.contains("duration_sec is NaN"), "{duration}");
+    assert!(
+        duration.contains("expected a finite timeline end or +inf"),
+        "{duration}"
+    );
+}
+
+#[test]
+fn the_writer_refuses_a_final_interval_past_the_declared_end() {
+    let message = writer_timeline_error(&[0.0, 4.0], 3.0);
+    assert!(message.contains("sample 1"), "{message}");
+    assert!(message.contains("t0=4"), "{message}");
+    assert!(message.contains("duration_sec=3"), "{message}");
+    assert!(
+        message.contains("expected its start at or before"),
+        "{message}"
+    );
+    assert!(message.contains("inverted"), "{message}");
+}
+
+#[test]
+fn irregular_sample_cadence_still_tiles_the_duration() {
+    use fourdgs::keyframe_delta_file::{decode_indexed, write_sequence, KeyframeDeltaOptions};
+
+    let samples = [sample_at(0.0), sample_at(0.25), sample_at(9.0)];
+    let bytes = write_sequence(&samples, 10.0, &KeyframeDeltaOptions::default()).unwrap();
+    let decoded = decode_indexed(&bytes).expect("the writer produced a readable tiling");
+    let intervals: Vec<_> = decoded.1.iter().map(|entry| (entry.t0, entry.t1)).collect();
+    assert_eq!(intervals, [(0.0, 0.25), (0.25, 9.0), (9.0, 10.0)]);
 }
 
 // --- the byte-compatibility promise -----------------------------------------
@@ -501,4 +765,47 @@ fn a_rust_written_multi_window_sequence_round_trips() {
     // motion assertion through `write_sequence` passes whichever window the encoder
     // quantized against — it would be a test that cannot fail. The grid's dependence on
     // the window is covered directly in `keyframe_delta_file`'s own unit test.
+}
+
+#[test]
+fn a_delta_after_a_nonzero_keyframe_uses_the_serialized_keyframe_bins() {
+    use fourdgs::keyframe_delta_file::{
+        decode_streamed, write_sequence, KeyframeDeltaOptions, Sample,
+    };
+    use fourdgs::model::GaussianSet;
+
+    let gaussian = GaussianSet {
+        positions: vec![0.0, 0.0, 0.0],
+        scales: vec![0.1, 0.1, 0.1],
+        rotations: vec![0.0, 0.0, 0.0, 1.0],
+        colors: vec![0.5, 0.5, 0.5, 1.0],
+        motions: vec![0.0, 0.0, 0.0],
+        mu_t: vec![0.0],
+        sigma_t: vec![0.2],
+        win_lo: vec![0.0],
+        win_hi: vec![4.0],
+        ..Default::default()
+    };
+    let samples: Vec<Sample> = (0..4)
+        .map(|i| Sample {
+            t0: i as f64,
+            ids: vec![7],
+            gaussians: gaussian.clone(),
+        })
+        .collect();
+    let options = KeyframeDeltaOptions {
+        keyframe_every: 2,
+        ..Default::default()
+    };
+
+    let bytes = write_sequence(&samples, 4.0, &options).unwrap();
+    let sequence = decode_streamed(&bytes).unwrap();
+    let mu = |chunk: usize| &sequence.chunks[chunk].state.bins[&op::A_MU_T].values;
+
+    assert_ne!(mu(2), mu(0), "the keyframe at t=2 must restate mu_t at t0");
+    assert_eq!(
+        mu(3),
+        mu(0),
+        "the next delta must return to the sample's mu_t=0 from the serialized keyframe"
+    );
 }

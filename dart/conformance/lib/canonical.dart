@@ -13,9 +13,10 @@
 ///
 /// **Nothing here may depend on decoded order.** Gaussians may be reordered
 /// freely by an encoder and readers must not rely on their order, so a summary
-/// that did would be asking two correct decoders to disagree. Everything
-/// per-gaussian is taken in the content order defined by [_stableOrder], which
-/// is derived from decoded values alone.
+/// that did would be asking two correct decoders to disagree. Emitted rows use
+/// the content order defined by [_stableOrder], which is derived from decoded
+/// values alone. Aggregates round addends to canonical decimal units and add
+/// those units exactly, so even their arithmetic is independent of order.
 library;
 
 import 'dart:collection';
@@ -43,10 +44,145 @@ const int rigSamples = 4;
 
 /// Rounds for comparison; a non-finite value becomes `null`, which is the only
 /// thing JSON can say about one.
+///
+/// Rounding is half-to-even on the value's exact binary expansion, and a value
+/// that rounds to zero comes back unsigned.
+///
+/// Neither is a detail. `toStringAsFixed` — the obvious spelling, and the one
+/// this used — rounds a half *away from zero*, while Python's `round`, Rust's
+/// and C++'s `%.6f`, Swift's `String(format:)` and this file's own [exactSum]
+/// all round it to even. The two disagree on every odd multiple of 2^-7, and
+/// every value a decoder produces is a float32, whose exact six-decimal ties are
+/// precisely those numbers: `num6(0.0078125)` said `0.007813` where the
+/// reference said `0.007812`, and [exactSum] over the same column said
+/// `0.007812` in the same document. Sharing [_canonicalUnits] with [exactSum] is
+/// what makes one value round one way here.
+///
+/// The sign of a zero is the canonical form's first rule — it records which side
+/// of zero the arithmetic landed on, which is a property of the platform and not
+/// of the scene. It is erased for free by going through [BigInt], which has no
+/// signed zero, and it has to be erased somewhere: `jsonEncode(-0.0)` is
+/// `-0.0`, and Dart's `compareTo` orders `-0.0` before `0.0` even though `==`
+/// calls them equal, so a surviving sign both changed the emitted text and
+/// reordered the rows it appeared in.
 double? num6(double? value) {
   if (value == null) return null;
   if (!value.isFinite) return null;
-  return double.parse(value.toStringAsFixed(floatDecimals));
+  final units = _canonicalUnits(value, _roundingScratch);
+  return double.parse(_unitsToken(units!));
+}
+
+/// One eight-byte view for every [num6] and [_sortable] call in the process.
+///
+/// [exactSum] keeps its own for the same reason it exists at all: rounding is
+/// per decoded field per gaussian, so a view allocated per value would turn a
+/// constant-space summary into millions of short-lived objects. Nothing here
+/// runs on a second isolate, and the view is dead between calls — its contents
+/// are written before they are read every time.
+final ByteData _roundingScratch = ByteData(8);
+
+/// A canonical JSON number token that must never pass through binary64 again.
+///
+/// Aggregates can exceed the finite `double` range even when every addend is
+/// finite. Keeping the token distinct lets [canonical] emit it as a number,
+/// rather than narrowing it or accidentally quoting it as a string.
+final class ExactNumber {
+  const ExactNumber(this.token);
+
+  final String token;
+
+  @override
+  bool operator ==(Object other) =>
+      other is ExactNumber && token == other.token;
+
+  @override
+  int get hashCode => token.hashCode;
+
+  @override
+  String toString() => token;
+}
+
+final BigInt _canonicalScale = BigInt.from(1000000);
+
+/// Sums independently rounded 10^-6 units as signed arbitrary-precision
+/// integers. A non-finite addend makes the aggregate `null`.
+///
+/// Conversion starts from the IEEE-754 bits. `toStringAsFixed` is not suitable
+/// here: fixed formatting may switch representation for large magnitudes, and
+/// no intermediate decimal or binary float may narrow the exact unit count.
+ExactNumber? exactSum(Iterable<double> values) {
+  // One scratch view per aggregate, not per addend. Large object scenes visit
+  // every live gaussian at four aggregate columns and three state probes, so a
+  // per-value ByteData allocation would turn a constant-space sum into millions
+  // of short-lived objects and corresponding GC pressure.
+  final bits = ByteData(8);
+  var total = BigInt.zero;
+  for (final value in values) {
+    final units = _canonicalUnits(value, bits);
+    if (units == null) return null;
+    total += units;
+  }
+  return ExactNumber(_unitsToken(total));
+}
+
+/// The nearest integer count of 10^-6 units, ties to even.
+BigInt? _canonicalUnits(double value, ByteData bits) {
+  bits.setFloat64(0, value, Endian.big);
+  final high = bits.getUint32(0, Endian.big);
+  final low = bits.getUint32(4, Endian.big);
+  final negative = high & 0x80000000 != 0;
+  final exponentBits = (high >> 20) & 0x7ff;
+  var significand = (BigInt.from(high & 0xfffff) << 32) | BigInt.from(low);
+
+  if (exponentBits == 0x7ff) return null;
+  if (exponentBits == 0 && significand == BigInt.zero) {
+    return BigInt.zero;
+  }
+
+  late final int exponent;
+  if (exponentBits == 0) {
+    // Subnormal: no implicit leading bit, value = significand * 2^-1074.
+    exponent = -1074;
+  } else {
+    significand |= BigInt.one << 52;
+    exponent = exponentBits - 1023 - 52;
+  }
+
+  var magnitude = significand * _canonicalScale;
+  if (exponent >= 0) {
+    magnitude <<= exponent;
+  } else {
+    final denominator = BigInt.one << -exponent;
+    final quotient = magnitude ~/ denominator;
+    final remainder = magnitude.remainder(denominator);
+    final twiceRemainder = remainder << 1;
+    magnitude = quotient;
+    if (twiceRemainder > denominator ||
+        (twiceRemainder == denominator && quotient.isOdd)) {
+      magnitude += BigInt.one;
+    }
+  }
+  return negative ? -magnitude : magnitude;
+}
+
+String _unitsToken(BigInt units) {
+  final negative = units.isNegative;
+  final magnitude = units.abs();
+  final whole = magnitude ~/ _canonicalScale;
+  var fraction = magnitude
+      .remainder(_canonicalScale)
+      .toString()
+      .padLeft(floatDecimals, '0');
+  fraction = fraction.replaceFirst(RegExp(r'0+$'), '');
+  if (fraction.isEmpty) fraction = '0';
+  return '${negative ? '-' : ''}$whole.$fraction';
+}
+
+/// One packed column without allocating a second population-sized list.
+Iterable<double> _strided(List<double> values, int width, int column) sync* {
+  for (int i = column; i < values.length; i += width) {
+    yield values[i];
+  }
 }
 
 /// CRC-32 of a byte payload, as a string. Used where a summary needs to prove it
@@ -55,8 +191,79 @@ String crcOf(List<int> data) =>
     fourdgsCrc32(Uint8List.fromList(data)).toString();
 
 /// Serializes a summary with its keys sorted, at two-space indent.
-String canonical(Map<String, Object?> summary) =>
-    const JsonEncoder.withIndent('  ').convert(_sorted(summary));
+///
+/// [ExactNumber] values take a collision-proof trip through marker strings so
+/// `JsonEncoder` still owns escaping and layout, then become raw number tokens.
+String canonical(Map<String, Object?> summary) {
+  final sorted = _sorted(summary);
+  final strings = <String>{};
+
+  void collectStrings(Object? value) {
+    if (value is Map) {
+      for (final entry in value.entries) {
+        strings.add(entry.key.toString());
+        collectStrings(entry.value);
+      }
+    } else if (value is List) {
+      for (final item in value) collectStrings(item);
+    } else if (value is String) {
+      strings.add(value);
+    }
+  }
+
+  collectStrings(sorted);
+  var markerPrefix = '\u0000fourdgs-exact-number\u0000';
+  while (strings.any((value) => value.contains(markerPrefix))) {
+    markerPrefix += '#';
+  }
+
+  final replacements = <String, String>{};
+  Object? markExact(Object? value) {
+    if (value is ExactNumber) {
+      final marker = '$markerPrefix${replacements.length}';
+      replacements[jsonEncode(marker)] = value.token;
+      return marker;
+    }
+    if (value is Map<String, Object?>) {
+      return value.map(
+        (key, item) => MapEntry<String, Object?>(key, markExact(item)),
+      );
+    }
+    if (value is List) return value.map(markExact).toList();
+    return value;
+  }
+
+  var text = const JsonEncoder.withIndent('  ').convert(markExact(sorted));
+  for (final replacement in replacements.entries) {
+    text = text.replaceAll(replacement.key, replacement.value);
+  }
+  return text;
+}
+
+/// The canonical answer for a file this reader refused, or `null` when it is
+/// not one.
+///
+/// A refusal is a result, not a crash: the runner prints this on stdout and
+/// exits 0, and the harness diffs it against the expectation like any other
+/// answer. Exiting non-zero instead would collapse "refused for the right
+/// reason" and "fell over" into one outcome, and telling those two apart is the
+/// whole point of the invalid corpus.
+///
+/// An error the refusal table does not name is not that result, and `null` says
+/// so. The caller turns it into a failed invocation — a diagnosis on stderr, a
+/// non-zero exit — which is the split the Rust and C++ runners already keep
+/// through the same optional identifier. Printing the missing identifier as `''`
+/// instead exits 0 and so claims a valid answer, even though the empty string is
+/// not an identifier the format defines: the harness could no longer tell
+/// "refused for a reason nobody named" from "refused for the wrong reason", and
+/// `run.py --update` — which writes whatever a runner prints, without parsing it
+/// — could commit the empty identifier as the expectation every other SDK is
+/// then scored against.
+String? refusalAnswer(FourdgsException error) {
+  final String? code = error.refusalCode;
+  if (code == null) return null;
+  return canonical(<String, Object?>{'refused': code});
+}
 
 Object? _sorted(Object? value) {
   if (value is Map<String, Object?>) {
@@ -85,21 +292,13 @@ Map<String, Object?> summarize({
   FourdgsProvenance? provenance,
   FourdgsObjectLayer? objects,
 }) {
-  final order = _stableOrder(gaussians);
+  final contentKeys = _stableKeys(gaussians);
+  final order = _stableOrder(contentKeys);
   final sample = order.take(sampleSize).toList();
 
-  final positionSum = <double>[0, 0, 0];
-  double opacitySum = 0;
   int neverFades = 0;
   int zeroMotion = 0;
-  // Summed in content order, not index order: two decoders that visit gaussians
-  // differently must reach the same total, and floating-point addition is not
-  // associative enough to leave that to chance.
   for (final i in order) {
-    for (int k = 0; k < 3; k++) {
-      positionSum[k] += gaussians.positions[i * 3 + k];
-    }
-    opacitySum += gaussians.colors[i * 4 + 3];
     if (!gaussians.sigmaT[i].isFinite) neverFades++;
     final m = gaussians.motions;
     if (m[i * 3].abs() + m[i * 3 + 1].abs() + m[i * 3 + 2].abs() == 0.0)
@@ -190,8 +389,14 @@ Map<String, Object?> summarize({
         ],
     },
     'aggregate': <String, Object?>{
-      'positionSum': <Object?>[for (final v in positionSum) num6(v)],
-      'opacitySum': num6(opacitySum),
+      // Round every addend to canonical units before exact integer addition.
+      // The aggregate is therefore a function of the emitted multiset, not
+      // resident order or non-associative binary floating-point addition.
+      'positionSum': <Object?>[
+        for (int axis = 0; axis < 3; axis++)
+          exactSum(_strided(gaussians.positions, 3, axis)),
+      ],
+      'opacitySum': exactSum(_strided(gaussians.colors, 4, 3)),
       'neverFadesCount': neverFades.toString(),
       'zeroMotionCount': zeroMotion.toString(),
     },
@@ -209,7 +414,9 @@ Map<String, Object?> summarize({
   // as it did before the layer existed. Membership alone is enough to report —
   // a scene can carry ids and no table.
   if ((objects != null && !objects.isEmpty) || gaussians.objectId != null) {
-    out.addAll(_objectsAndStates(header, gaussians, objects, order));
+    out.addAll(
+      _objectsAndStates(header, gaussians, objects, order, contentKeys),
+    );
   }
   return out;
 }
@@ -220,13 +427,14 @@ Map<String, Object?> summarize({
 /// agree on every entry in the table and every sample in a track and still
 /// disagree about where a gaussian ends up, because the layer's one rule is an
 /// order — base first, track second. The states make that order visible,
-/// including orientation, and the canonical gaussian order keeps the result
-/// independent of chunk and decoder order.
+/// including orientation, and the rounded emitted state row breaks rounded
+/// stored-key ties so the result stays independent of chunk and decoder order.
 Map<String, Object?> _objectsAndStates(
   FourdgsHeader header,
   FourdgsGaussianSet gaussians,
   FourdgsObjectLayer? objects,
   List<int> order,
+  List<List<double>> contentKeys,
 ) {
   final layer = objects ?? FourdgsObjectLayer();
 
@@ -298,13 +506,13 @@ Map<String, Object?> _objectsAndStates(
     for (int row = 0; row < base.count; row++) {
       rowForIndex[base.indices[row]] = row;
     }
-    final sampleRows = <int>[];
-    for (final index in order) {
-      final row = rowForIndex[index];
-      if (row != null) sampleRows.add(row);
-      if (sampleRows.length == sampleSize) break;
-    }
-
+    final sampleRows = _stateSampleRows(
+      base,
+      ids,
+      order,
+      contentKeys,
+      rowForIndex,
+    );
     List<Object?> rows(Float64List values, int width) => <Object?>[
       for (final row in sampleRows)
         <Object?>[
@@ -312,22 +520,6 @@ Map<String, Object?> _objectsAndStates(
             num6(values[row * width + axis]),
         ],
     ];
-
-    // Accumulated in scalars rather than through a live-count-sized list per
-    // axis: a large object scene would otherwise pay peak memory proportional to
-    // the decoded state purely to report a sum. Summed in row order, which is
-    // the canonical gaussian order these rows were built in.
-    final totals = <double>[0.0, 0.0, 0.0];
-    for (int row = 0; row < base.count; row++) {
-      for (int axis = 0; axis < 3; axis++) {
-        totals[axis] += base.centers[row * 3 + axis];
-      }
-    }
-    final positionSum = <Object?>[for (final total in totals) num6(total)];
-    double opacitySum = 0.0;
-    for (final value in base.opacity) {
-      opacitySum += value;
-    }
 
     states.add(<String, Object?>{
       't': num6(t),
@@ -340,8 +532,14 @@ Map<String, Object?> _objectsAndStates(
         ],
       },
       'aggregate': <String, Object?>{
-        'positionSum': positionSum,
-        'opacitySum': num6(opacitySum),
+        // State ordering governs the sample. Aggregates need no order: each
+        // emitted addend becomes an exact fixed-six unit count before summing,
+        // directly from the decoded columns without a population-sized row list.
+        'positionSum': <Object?>[
+          for (int axis = 0; axis < 3; axis++)
+            exactSum(_strided(base.centers, 3, axis)),
+        ],
+        'opacitySum': exactSum(base.opacity),
       },
     });
   }
@@ -354,6 +552,77 @@ Map<String, Object?> _objectsAndStates(
     },
     'states': states,
   };
+}
+
+/// Selects the first canonical state rows with memory bounded by [sampleSize].
+///
+/// [order] is already sorted by rounded content key. Only rows tied on that key
+/// need the emitted-state secondary order, so each consecutive tie group keeps
+/// at most the number of sample slots still unfilled. A group may contain every
+/// gaussian in the scene; the retained candidate list still never exceeds 16.
+List<int> _stateSampleRows(
+  FourdgsState state,
+  Uint32List objectIds,
+  List<int> order,
+  List<List<double>> contentKeys,
+  Map<int, int> rowForIndex,
+) {
+  final sampleRows = <int>[];
+  int at = 0;
+  while (at < order.length && sampleRows.length < sampleSize) {
+    final groupKey = contentKeys[order[at]];
+    final remaining = sampleSize - sampleRows.length;
+    final groupRows = <int>[];
+
+    while (at < order.length &&
+        _compareRows(contentKeys[order[at]], groupKey) == 0) {
+      final row = rowForIndex[order[at]];
+      at++;
+      if (row == null) continue;
+
+      int lo = 0;
+      int hi = groupRows.length;
+      while (lo < hi) {
+        final mid = lo + ((hi - lo) >> 1);
+        if (_compareStateRows(state, objectIds, row, groupRows[mid]) < 0) {
+          hi = mid;
+        } else {
+          lo = mid + 1;
+        }
+      }
+      if (lo < remaining) {
+        groupRows.insert(lo, row);
+        if (groupRows.length > remaining) groupRows.removeLast();
+      }
+    }
+    sampleRows.addAll(groupRows);
+  }
+  return sampleRows;
+}
+
+/// Portable secondary order over exactly the rounded values a state emits.
+int _compareStateRows(FourdgsState state, Uint32List objectIds, int a, int b) {
+  for (final (values, width) in <(Float64List, int)>[
+    (state.centers, 3),
+    (state.orientations, 4),
+  ]) {
+    for (int axis = 0; axis < width; axis++) {
+      final compared = _compareEmittedStateValues(
+        values[a * width + axis],
+        values[b * width + axis],
+      );
+      if (compared != 0) return compared;
+    }
+  }
+  return objectIds[a].compareTo(objectIds[b]);
+}
+
+int _compareEmittedStateValues(double a, double b) {
+  final x = num6(a);
+  final y = num6(b);
+  if (x == null) return y == null ? 0 : 1;
+  if (y == null) return -1;
+  return x.compareTo(y);
 }
 
 /// Times a summary evaluates an object track at, derived from the track
@@ -601,24 +870,36 @@ Map<String, Object?>? _sphericalHarmonics(
 /// Chunking and Morton ordering are encoder choices, so decoded order is not
 /// part of the contract — but a comparison needs *some* order. The key is the
 /// gaussian's whole decoded state, rounded exactly as the summary rounds it,
-/// with its spherical harmonic coefficients last. Two gaussians that tie on all
-/// of it are identical in every value this summary emits, so their relative
-/// order cannot change the output.
-List<int> _stableOrder(FourdgsGaussianSet g) {
+/// with spherical harmonic coefficients and object membership last. Exact
+/// decoded values are deliberately not a tiebreaker: independently implemented
+/// decoders may differ in their last bits.
+List<List<double>> _stableKeys(FourdgsGaussianSet g) {
   final sh = g.sh;
   final shWidth = sh == null ? 0 : g.shCoefficients * 3;
-  final keys = <(List<double>, int)>[];
+  final keys = <List<double>>[];
   for (int i = 0; i < g.count; i++) {
-    final row = <double>[
-      for (int k = 0; k < 3; k++) _sortable(g.positions[i * 3 + k]),
-      for (int k = 0; k < 3; k++) _sortable(g.scales[i * 3 + k]),
-      for (int k = 0; k < 4; k++) _sortable(g.rotations[i * 4 + k]),
-      for (int k = 0; k < 4; k++) _sortable(g.colors[i * 4 + k]),
-      for (int k = 0; k < 3; k++) _sortable(g.motions[i * 3 + k]),
-      _sortable(g.muT[i]),
-      _sortable(g.sigmaT[i]),
-      _sortable(g.winLo[i]),
-      _sortable(g.winHi[i]),
+    final row = <double>[];
+    for (final (array, width) in <(Float32List, int)>[
+      (g.positions, 3),
+      (g.scales, 3),
+      (g.rotations, 4),
+      (g.colors, 4),
+      (g.motions, 3),
+    ]) {
+      for (int k = 0; k < width; k++) {
+        final value = array[i * width + k];
+        row.add(_sortable(value));
+      }
+    }
+    for (final value in <double>[
+      g.muT[i],
+      g.sigmaT[i],
+      g.winLo[i],
+      g.winHi[i],
+    ]) {
+      row.add(_sortable(value));
+    }
+    row.addAll(<double>[
       if (sh != null)
         for (int k = 0; k < shWidth; k++) sh[i * shWidth + k].toDouble(),
       // Membership joins the key, after the harmonics and before the index
@@ -628,26 +909,40 @@ List<int> _stableOrder(FourdgsGaussianSet g) {
       // it, would be ordered by decode order, which differs between two correct
       // readers that chunked the scene differently.
       if (g.objectId != null) g.objectId![i].toDouble(),
-    ];
-    keys.add((row, i));
+    ]);
+    keys.add(row);
   }
+  return keys;
+}
+
+List<int> _stableOrder(List<List<double>> keys) {
+  final order = <int>[for (int i = 0; i < keys.length; i++) i];
   // Ties broken by original index. Dart's sort is not stable and Python's is;
   // the tie-break makes the difference invisible rather than relying on it.
-  keys.sort(((List<double>, int) a, (List<double>, int) b) {
-    for (int k = 0; k < a.$1.length; k++) {
-      final x = a.$1[k];
-      final y = b.$1[k];
-      if (x != y) return x < y ? -1 : 1;
-    }
-    return a.$2.compareTo(b.$2);
+  order.sort((int a, int b) {
+    final compared = _compareRows(keys[a], keys[b]);
+    return compared != 0 ? compared : a.compareTo(b);
   });
-  return <int>[for (final k in keys) k.$2];
+  return order;
+}
+
+int _compareRows(List<double> a, List<double> b) {
+  for (int k = 0; k < a.length; k++) {
+    final x = a[k];
+    final y = b[k];
+    if (x != y) return x < y ? -1 : 1;
+  }
+  return 0;
 }
 
 /// A comparison key: rounded like the summary, with infinity kept as infinity so
 /// two languages order never-fading gaussians identically.
+///
+/// "Rounded like the summary" is the whole contract, so this rounds through
+/// [num6] rather than repeating a rule beside it. It used to repeat it and get
+/// it wrong in the same two ways — see [num6].
 double _sortable(double value) {
   if (value.isNaN) return double.infinity;
   if (value.isInfinite) return value;
-  return double.parse(value.toStringAsFixed(floatDecimals));
+  return num6(value)!;
 }

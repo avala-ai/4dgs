@@ -1,11 +1,11 @@
 {
   "aggregate": {
     "neverFadesCount": "0",
-    "opacitySum": 341.725497,
+    "opacitySum": 341.725496,
     "positionSum": [
-      -22.562271,
-      2.422212,
-      -5.492638
+      -22.56228,
+      2.422213,
+      -5.492625
     ],
     "zeroMotionCount": "0"
   },
@@ -726,7 +726,7 @@
     {
       "groupLength": "2135",
       "groupOpcode": "8",
-      "groupStart": "30493"
+      "groupStart": "30488"
     }
   ],
   "temporalModel": "gaussian-birth"

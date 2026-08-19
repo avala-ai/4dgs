@@ -3,8 +3,9 @@
 A decoder for the **4dgs** container: 4D gaussian splat video with native audio, in one
 self-contained file you can range-request and seek.
 
-Pure Dart, no Flutter dependency — the same code runs on the Dart VM, inside a Flutter app, and
-compiled to JavaScript or Wasm.
+Pure Dart, no Flutter dependency — the same **decoder** runs on the Dart VM, inside a Flutter app,
+and compiled to JavaScript or Wasm. The encoder is a separate import and does not compile for the
+web; see [Writing](#writing) below.
 
 The format's specification, the feature matrix and the guides live at
 **[4dgs.dev](https://4dgs.dev)**.
@@ -133,6 +134,94 @@ Everything this package throws is a `FourdgsException`, which extends `FormatExc
 subtypes separate the cases worth telling apart: `FourdgsTruncatedFile`,
 `FourdgsUnsupportedVersion`, `FourdgsUnsupportedCodec` and `FourdgsMalformedFile`.
 
+## Inspect and validate from a shell
+
+`dart pub global activate fourdgs` puts a `fourdgs` command on the PATH, so a file a Flutter
+application will not open can be diagnosed without leaving the toolchain that application is built
+in.
+
+```console
+$ fourdgs inspect scene.4dgs
+      offset  record                    content           total  crc
+           0  (magic)                                         8  -
+           8  Header                        137             146  -
+         154  Quantization                  324             333  -
+         487  WindowTable                    20              29  -
+         516  Chunk                       1,849           1,858  -
+       2,374  ChunkIndex                     40              49  ok
+       2,423  Footer                         20              29  -
+       2,452  (magic)                                         8  -
+
+6 records, 2,460 bytes
+crc: the Footer's summary checksum covers bytes 2,374..2,423; `-` is a record it does not cover
+
+$ fourdgs validate broken.4dgs
+error: a chunk does not decode: gaussian 0 of the chunk at byte 2506 names window index 1, which
+is outside the 1-entry window table
+  refusal window-index-out-of-range at byte 2506 (the Chunk record at index entry 1)
+INVALID
+```
+
+Exit codes, because they are the only part of a tool another program reads: `0` fine, `1` refused or
+invalid, `2` valid with warnings, `3` the tool itself could not run — a usage error, an unreadable
+path. A tool that exits `1` both for "I read the file and it is not conforming" and for "I fell
+over" is indistinguishable from a broken one.
+
+`validate` decodes every chunk and every declared spherical-harmonic band, one at a time, because a
+framing walk steps _over_ a chunk by its declared length and an unimplemented stream codec or an
+out-of-range window index lives inside one. `inspect` reads nine bytes per record and never touches
+a record's content, so it costs the same on a file with an embedded audio track as on one without. A
+truncated file is walked as far as it goes and then says where it was cut and how much of it a
+streamed reader still recovers.
+
+The same answers are available without the shell: `inspectFourdgs`, `validateFourdgs`,
+`walkFourdgsFraming` and `describeFourdgsRefusal` are exported from `package:fourdgs/fourdgs.dart`,
+and take a `FourdgsReadable` rather than a path.
+
+### Where this reports less than the Python validator
+
+The findings, their severities and their order are
+[`python/fourdgs/fourdgs/validate.py`](https://github.com/avala-ai/4dgs/blob/main/python/fourdgs/fourdgs/validate.py)'s,
+and the refusal identifiers and byte offsets are the same in every SDK. Two places where this one
+says less, deliberately, rather than saying something different:
+
+- **Non-finite quantization parameters, inverted chunk intervals and malformed Audio Source fields**
+  are refused by this package's record parsers rather than reported field by field, because Dart's
+  `double.floor()` on a NaN throws from inside arithmetic three call levels below the reader. So a
+  file Python reports five findings about arrives here as one `does not parse` error naming the
+  record. Same verdict, fewer sentences.
+- **The provenance registry checks** — a `metres_per_unit` that disagrees with its declared unit, a
+  principal point outside its image — need the parsed provenance records, and are not ported here,
+  exactly as they are not ported to the Rust, TypeScript or C++ validators.
+
+## Writing
+
+Encoding lives in its own library:
+
+```dart
+import 'package:fourdgs/writer.dart';
+```
+
+**It does not compile for the web, and that is deliberate.** The chunk orderer spreads coordinates
+into a Morton code using 64-bit masks — `0x1249249249249249` and two neighbours. On the web a Dart
+`int` _is_ a JavaScript number, so those literals are past `2^53` and dart2js rejects them where
+they are written rather than where they are used.
+
+Keeping the encoder in the umbrella library therefore made the whole package impossible to build for
+the web, including for consumers that only ever read. That is not hypothetical: version 0.1.0
+shipped that way, and a Flutter web app which never encoded anything could not be built at all.
+`flutter build web --wasm` does not avoid it either — Flutter still emits a dart2js fallback bundle
+for browsers without wasm.
+
+The masks are **not** the thing to change. The values genuinely exceed `2^53`; a JavaScript number
+cannot hold them however they are spelled, so computing them at runtime would silence the compiler
+and make the codes quietly wrong on the web — a build failure traded for corrupt output. The encoder
+is correct wherever a Dart `int` is a real 64-bit integer, which is every native target and wasm,
+and it is honest about being unavailable where one is not.
+
+If you are moving an app off a vendored copy of this decoder, check what that copy left out before
+treating its absences as staleness. A fork with no `writer.dart` is not behind; it is web-safe.
+
 ## Scope
 
 Decoding ends at reconstructed gaussian state and reconstructed audio-source state at time `t`.
@@ -141,9 +230,10 @@ and mixing—belong to the renderer/player.
 
 ## Conformance
 
-Checked against the same generated corpus every other 4dgs SDK is, on both read paths: 105 checks.
-See the [feature matrix](https://4dgs.dev/reference/) for what this SDK implements and what it
-declines.
+Checked against the same generated corpus every other 4dgs SDK is, on both read paths: 119 checks,
+the seven invalid variants included now that a refusal here carries the identifier the suite
+compares. See the [feature matrix](https://4dgs.dev/reference/) for what this SDK implements and
+what it declines.
 
 ## License
 

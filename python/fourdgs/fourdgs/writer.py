@@ -33,6 +33,7 @@ from .quantization import (
     SH_MIN_BITS,
     Bounds,
     Steps,
+    coarsen_sh,
     dequantize,
     dequantize_rotation,
     life_class,
@@ -127,6 +128,63 @@ def _sh_depths(requested, bands: list[int]) -> dict[int, int]:
     return {band: depths[i] for i, band in enumerate(bands)}
 
 
+def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, windows, win_index, cutoff):
+    """Containment bounds for the temporal state the file reconstructs.
+
+    Chunk membership is an indexed-read promise, so it must cover the values a decoder
+    sees rather than the unquantized values the caller supplied. The marginal comparison
+    is inclusive and computed in floating point, while chunk ``t1`` is exclusive, so the
+    bounds include the complete rounded-visible plateau and are directed away from it.
+    Validity-window ``win_hi`` is already exclusive and remains unchanged.
+    """
+    # GaussianSet is the decoded public state and stores temporal values as f32. Plan
+    # against that representation, then widen for the support arithmetic, exactly as the
+    # encoder geometry gate and state_at do.
+    sigma = np.exp(np.asarray(q_sigma, dtype=np.float64) * sigma_log_step).astype(np.float32).astype(np.float64)
+    effective_sigma = np.maximum(sigma, 1e-30)
+    mu = (
+        (np.asarray(q_mu, dtype=np.float64) * np.asarray(t_step, dtype=np.float64))
+        .astype(np.float32)
+        .astype(np.float64)
+    )
+    # state_at compares the rounded result of exp() with the Header cutoff. Its complete
+    # visible plateau is therefore bounded by the inverse image of the next smaller
+    # marginal, not by advancing the mathematical time endpoint an arbitrary number of
+    # ULPs. This also covers cutoff=1, where the mathematical half-width is zero but the
+    # rounded plateau is not. At the smallest positive cutoff the predecessor is zero and
+    # the only finite conservative inverse is the whole timeline.
+    marginal_floor = np.nextafter(float(cutoff), 0.0)
+    half = (
+        np.full_like(effective_sigma, np.inf)
+        if marginal_floor == 0.0
+        else support_k(float(marginal_floor)) * effective_sigma
+    )
+    # The inverse above bounds the mathematical ratio. state_at obtains that ratio by a
+    # rounded subtraction and division; gamma(2) is the standard forward-error bound for
+    # those two binary64 operations. Inflate once in ratio space so their result cannot
+    # round back inside the visible plateau at large, cancellation-prone scene times.
+    unit_roundoff = np.finfo(np.float64).eps / 2.0
+    arithmetic_guard = 2.0 * unit_roundoff / (1.0 - 2.0 * unit_roundoff)
+    half *= 1.0 + arithmetic_guard
+    half = np.where(never_fades, np.inf, half)
+    # Window Table records and GaussianSet's public validity-window lanes are both f64.
+    # Keep that exact representation: narrowing here can move a window edge across a tree
+    # split and assign a gaussian to an interval where state_at says it is not yet valid.
+    decoded_windows = np.asarray(windows, dtype=np.float64)
+    window_lo = decoded_windows[win_index, 0]
+    window_hi = decoded_windows[win_index, 1]
+    # Round every derived time away from the support before comparing it with a split.
+    # That accounts for the inverse arithmetic and makes the upper bound strictly outside
+    # the inclusive marginal endpoint while retaining the validity window's own [lo, hi)
+    # semantics. It is fixed work per gaussian; no representable-time scan is involved.
+    half = np.nextafter(half, np.inf)
+    marginal_lo = np.nextafter(mu - half, -np.inf)
+    marginal_hi = np.nextafter(mu + half, np.inf)
+    lo = np.maximum(marginal_lo, window_lo)
+    hi = np.minimum(marginal_hi, window_hi)
+    return lo, hi
+
+
 def _plan_chunks(lo, hi, tops, max_depth, min_gaussians):
     """Assign gaussians to nodes of a temporal interval tree.
 
@@ -159,7 +217,7 @@ def _plan_chunks(lo, hi, tops, max_depth, min_gaussians):
 
     for i in range(len(tops) - 1):
         a, b = tops[i], tops[i + 1]
-        pool = np.flatnonzero((lo >= a - 1e-9) & (hi <= b + 1e-9) & (assigned < 0))
+        pool = np.flatnonzero((lo >= a) & (hi <= b) & (assigned < 0))
         kept = recurse(a, b, 0, pool)
         if kept.size:
             nodes.append((a, b, 0))
@@ -406,7 +464,11 @@ def _encode(g: GaussianSet, duration_sec, opts, audio_sources, camera) -> bytes:
     tops = sorted({0.0, duration_sec} | {float(v) for w in table for v in w if 0.0 < v < duration_sec})
     if len(tops) < 2:
         tops = [0.0, max(duration_sec, 1e-9)]
-    lo, hi = g.support() if n else (np.zeros(0), np.zeros(0))
+    lo, hi = (
+        _planning_support(q_mu, q_sigma, t_step, steps.sigma_log, never_fades, table, win_index, opts.cutoff)
+        if n
+        else (np.zeros(0), np.zeros(0))
+    )
     plans = _plan_chunks(lo, hi, tops, opts.max_depth, opts.min_chunk_gaussians) if n else []
     if n and not plans:
         plans = [(tops[0], tops[-1], 0, np.arange(n))]
@@ -450,7 +512,14 @@ def _encode(g: GaussianSet, duration_sec, opts, audio_sources, camera) -> bytes:
             library=opts.library,
             temporal_model=opts.temporal_model,
             cutoff=opts.cutoff,
-            sh_degree=g.sh_degree if sh_cols else 0,
+            # The degree the file actually carries, which is the highest band written and
+            # not the degree the input happened to hold. `sh_bands` caps what is emitted,
+            # so a degree-3 scene written with `sh_bands=1` carries band 1 alone — three
+            # coefficients per component — and declaring 3 there would promise fifteen to
+            # a reader that sizes its buffers from the Header. Bands are whole and a
+            # reader takes them whole (spec section 6.5), so bands 1..D are exactly a
+            # degree-D scene and D is a count of what is present (issue #190).
+            sh_degree=max(sh_cols) if sh_cols else 0,
             flags=header_flags,
             attributes=opts.metadata or {},
         ).encode(trailer=opts.record_trailers.get(op.HEADER, b""))
@@ -609,10 +678,11 @@ def _encode(g: GaussianSet, duration_sec, opts, audio_sources, camera) -> bytes:
             original = g.sh[np.ix_(members, cols)].astype(np.int64)
             if band in depths:
                 vals = quantize_sh(original, depths[band])
-            elif steps.sh > 1:
-                vals = (original // steps.sh) * steps.sh + steps.sh // 2
             else:
-                vals = original
+                # The profile's own pitch, through the same centring-and-clamping the
+                # per-band depths use. Writing the arithmetic out here a second time is
+                # how it came to lack the clamp that `coarsen_sh` documents.
+                vals = coarsen_sh(original, steps.sh)
             # Each band is its own record, so a reader that has capped its SH degree
             # skips the higher ones by byte range and never transfers them.
             payload = put_u8(band) + encode_stream(

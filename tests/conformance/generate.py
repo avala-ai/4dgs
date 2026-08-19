@@ -10,12 +10,14 @@
 `--verify` is the gate that keeps the corpus honest. It asserts three things:
 
 1. every generated file matches its committed SHA-256;
-2. every committed expectation matches a fresh decode;
+2. every committed expectation matches, character for character, a fresh decode;
 3. two consecutive generator runs are byte-identical.
 
-The third is the one that earns its keep: accidental nondeterminism in an encoder —
-iteration order, a hash seed, a timestamp — is invisible locally and shows up as somebody
-else's failing CI.
+The second and third are the ones that earn their keep, and they catch different things.
+Accidental nondeterminism in an encoder — iteration order, a hash seed, a timestamp — is
+invisible locally and shows up as somebody else's failing CI. A canonical form that varies
+by machine is quieter still: the bytes are identical, so every checksum passes, and only
+the expectations move (issue #153).
 """
 
 from __future__ import annotations
@@ -23,8 +25,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import math
 import os
 import sys
+from decimal import Decimal
+from itertools import zip_longest
+from typing import NamedTuple
 
 import numpy as np
 
@@ -38,12 +44,14 @@ sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python", "fourdgs"))
 
+import canonical as canonical_module
 import fourdgs
 import invalid
 import scenarios
 from canonical import canonical, summarize
 from fourdgs import keyframe_delta_file as kdf
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
+from fourdgs.model import DEFAULT_CUTOFF
 from fourdgs.object_layer import ObjectLayer
 from fourdgs.opcode import (
     COORDINATE_FRAME,
@@ -74,6 +82,28 @@ from fourdgs.serialization import put_record
 MAX_DATA_BYTES = 2_500_000
 
 
+def _sh_coefficients(n: int, coeffs: int, flags) -> np.ndarray | None:
+    """The spherical-harmonic coefficient block for a variant, or `None` at degree 0.
+
+    The default fill is `% 251`, and the modulus is load-bearing in a way nobody intended:
+    it is coprime with the 45-column stride, so consecutive gaussians get different
+    coefficients rather than the same ones repeating — but it also keeps **251..255 out of
+    the entire corpus**. At the `coarse` profile's `step_sh = 3` exactly one input value
+    overflows its own encoding: 255 rounds to the bin centre 256, which no `u8` holds. So a
+    coarse-profile file with spherical harmonics already existed and still could not reach
+    the bug (issues #181, #190).
+
+    `SHTopCoefficients` fills `% 256` instead, which reaches 255 and keeps the same
+    stride-coprimality property only incidentally — what matters is that the extreme value
+    is present. Changing the default here instead would move every existing SH fixture's
+    checksum for a property only one variant needs.
+    """
+    if not coeffs:
+        return None
+    modulus = 256 if "SHTopCoefficients" in flags else 251
+    return (np.arange(n * coeffs, dtype=np.int64) % modulus).astype(np.uint8).reshape(n, coeffs)
+
+
 def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[bytes, str]:
     """Encode one variant and produce its expectation."""
     raw = scenarios.build_gaussians(scenario)
@@ -100,8 +130,19 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         sigma_t=np.asarray(raw["sigma_t"], dtype=np.float32),
         win_lo=np.asarray(raw["win_lo"], dtype=np.float32),
         win_hi=np.asarray(raw["win_hi"], dtype=np.float32),
-        sh=(np.arange(n * coeffs, dtype=np.int64) % 251).astype(np.uint8).reshape(n, coeffs) if coeffs else None,
+        sh=_sh_coefficients(n, coeffs, flags),
         sh_degree=sh_degree,
+        # The one object-bearing top-level variant also carries both exact
+        # producer-side identity lanes. Distinct nontrivial values make a
+        # decode/re-encode loss or substitution observable in the Dart encode
+        # gate rather than merely proving that all readers agree on the
+        # degraded file.
+        source_group=(
+            (np.arange(n, dtype=np.int64) * np.int64(31) - np.int64(1009)) if "WithObjects" in flags else None
+        ),
+        source_index=(
+            (np.arange(n, dtype=np.uint32) * np.uint32(104729) + np.uint32(17)) if "WithObjects" in flags else None
+        ),
         object_id=(np.where(np.arange(n) % 3 == 0, 7, 0).astype(np.uint32) if "WithObjects" in flags else None),
     )
 
@@ -216,6 +257,7 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         write_statistics="UseStatistics" in flags,
         write_summary_offsets="UseSummaryOffset" in flags,
         write_crc="UseCrc" in flags,
+        preserve_source_ids="WithObjects" in flags,
         library="4dgs conformance generator",
         scene_profile="objects" if "WithObjects" in flags else ("baked" if scenario.long_lived else "capture"),
         metadata={"scenario": scenario.name} if "WithMetadata" in flags else None,
@@ -225,6 +267,9 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         record_trailers=trailers,
         cutoff=0.2 if "CustomCutoff" in flags else 0.05,
         sh_bit_depths=sh_bit_depths,
+        # Bands 1..3 unless a variant asks for fewer. Capping is what makes the degree the
+        # file carries differ from the degree the scene holds.
+        sh_bands=1 if "SHBandsCapped" in flags else 3,
         **overrides,
     )
 
@@ -347,6 +392,96 @@ def _kd_drift_sequence() -> list[Sample]:
     return samples
 
 
+#: The validity windows the multi-window sequence declares, in Window Table order: one
+#: that spans the clip, one that closes at 2s, and one that does not open until 4s. Two
+#: gaussians sit in each.
+#:
+#: Every other keyframe-delta variant carries a single window `[0, 8)`, so a gaussian's
+#: window never closes before the scene does and section 3's visibility rule has nothing
+#: to decide. That gap hid three defects: `a4b1efa`, where every gaussian was given the
+#: *first* window's motion grid and reconstructed positions moved in three SDKs at once;
+#: issue #185, the same rule applied on one implementation's reconstruction path and not
+#: another's; and a third sighting while the TypeScript keyframe-delta encoder was written.
+#: All three were invisible because no fixture could express a window that shuts.
+_KD_WINDOWS = ((0.0, _KD_DURATION), (0.0, 2.0), (4.0, _KD_DURATION))
+
+
+#: Gaussians in the multi-window sequence. Two per window.
+_KD_MULTI_WINDOW_COUNT = 6
+
+
+def _kd_multi_window_gaussians(step: int) -> fourdgs.GaussianSet:
+    """The multi-window population at one sample, every attribute distinct per gaussian.
+
+    Uniform attributes would make this variant prove less than it looks like it proves: if
+    every row carried the same scale, rotation and colour, a decoder that kept the *wrong*
+    two rows at 3s would still emit the right numbers, and only the count and the ids could
+    ever disagree. So scale, rotation, colour, velocity, birth time and sigma all differ per
+    gaussian, and position and rotation drift as the clip runs.
+
+    `sigma_t`, `flags` and `window_index` are GOP-invariant (spec section 11.5), so they are
+    a function of the gaussian alone and never of the step; everything that drifts is what
+    the delta chunks carry. `mu_t` sits inside each gaussian's own window, because a birth
+    time outside the window it belongs to would leave the marginal doing the work the window
+    is supposed to do.
+
+    `sigma_t` is finite on every row: this reference writer requires it and writes
+    `never_fades = 0` throughout, which is also why this variant cannot reach the one place
+    a window's *length* changes a grid (the velocity precision class reads the window length
+    only for a never-fading gaussian, spec section 6.3). What it does reach is the
+    visibility rule and `window_index` naming the right row of a three-row table.
+    """
+    n = _KD_MULTI_WINDOW_COUNT
+    windows = [_KD_WINDOWS[i % len(_KD_WINDOWS)] for i in range(n)]
+    positions, scales, rotations, colors, motions = [], [], [], [], []
+    for i in range(n):
+        positions.append([0.3 * i + 0.11 * step, -0.7 + 0.05 * i * step, 0.25 * step - 0.4 * i])
+        scales.append([0.02 + 0.013 * i + 0.004 * a for a in range(3)])
+        # A rotation about a tilted axis, turning as the clip runs, so the smallest-three
+        # coding has a different largest component on different rows.
+        angle = 0.21 * i + 0.37 * step
+        axis = (0.3, 0.6, math.sqrt(1.0 - 0.09 - 0.36))
+        s = math.sin(angle / 2.0)
+        rotations.append([axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2.0)])
+        colors.append([0.1 + 0.14 * i, 0.9 - 0.11 * i, 0.33 + 0.07 * i, 0.4 + 0.09 * i])
+        motions.append([0.13 * (i - 2), -0.06 * i, 0.21])
+    return fourdgs.GaussianSet(
+        positions=np.asarray(positions, dtype=np.float32).reshape(n, 3),
+        scales=np.asarray(scales, dtype=np.float32).reshape(n, 3),
+        rotations=np.asarray(rotations, dtype=np.float32).reshape(n, 4),
+        colors=np.asarray(colors, dtype=np.float32).reshape(n, 4),
+        motions=np.asarray(motions, dtype=np.float32).reshape(n, 3),
+        mu_t=np.asarray([0.5 * (lo + hi) for lo, hi in windows], dtype=np.float32),
+        # Keep every in-window row comfortably above the Header's temporal cutoff for the
+        # full window. This scenario isolates the hard validity-window gate; a narrow sigma
+        # would also test the independent marginal gate and change the intended 4/2/4 count.
+        sigma_t=np.asarray([2.0 + 0.35 * i for i in range(n)], dtype=np.float32),
+        win_lo=np.asarray([lo for lo, _ in windows], dtype=np.float32),
+        win_hi=np.asarray([hi for _, hi in windows], dtype=np.float32),
+    )
+
+
+def _kd_multi_window_sequence() -> list[Sample]:
+    """A drifting population of six gaussians spread across three validity windows.
+
+    No births and no deaths: every id is live in every chunk, so the composed population is
+    the same six rows throughout and the only thing that can remove a row from a
+    reconstructed instant is its own validity window. That is the point — a decoder that
+    skips the gate reports six gaussians at every probe, while one that applies it reports
+    four before 2s (window 2 has not opened), two from 2s to 4s (window 1 has shut and
+    window 2 is still closed) and four from 4s on.
+    """
+    ids = np.arange(_KD_MULTI_WINDOW_COUNT)
+    return [
+        Sample(
+            t0=float(i) * (_KD_DURATION / _KD_STEPS),
+            ids=ids,
+            gaussians=_kd_multi_window_gaussians(i),
+        )
+        for i in range(_KD_STEPS)
+    ]
+
+
 def _kd_churn_sequence() -> list[Sample]:
     """A drifting population with one birth (id 4) and one death (id 2), so deltas carry
     birth and death groups, not only updates."""
@@ -366,6 +501,60 @@ def _kd_churn_sequence() -> list[Sample]:
     return samples
 
 
+_KD_ROW_LANES = (
+    "positions",
+    "scales",
+    "rotations",
+    "colors",
+    "motions",
+    "sigma_t",
+    "win_lo",
+    "win_hi",
+    "sh",
+    "source_group",
+    "source_index",
+    "object_id",
+)
+
+
+def _kd_state_temporal_origins(samples: list[Sample], keyframe_every: int, delta_mode: int) -> None:
+    """State `mu_t` at the Chunk that actually restates each row.
+
+    A keyframe states every live gaussian. A delta states births and rows whose
+    other authored lanes changed; an omitted row must retain the temporal origin
+    from its reference state. Keeping one such row is itself a conformance claim:
+    a decoder that drops untouched identities can no longer pass this corpus.
+    """
+    last_keyframe = 0
+    for index, sample in enumerate(samples):
+        keyframe = index == 0 or (keyframe_every > 0 and index % keyframe_every == 0)
+        if keyframe:
+            sample.gaussians.mu_t.fill(sample.t0)
+            last_keyframe = index
+            continue
+
+        reference = samples[index - 1 if delta_mode == DELTA_MODE_CHAINED else last_keyframe]
+        reference_rows = {int(identity): row for row, identity in enumerate(reference.ids)}
+        for row, identity_value in enumerate(sample.ids):
+            identity = int(identity_value)
+            reference_row = reference_rows.get(identity)
+            if reference_row is None:
+                sample.gaussians.mu_t[row] = sample.t0
+                continue
+
+            changed = False
+            for lane in _KD_ROW_LANES:
+                current_values = getattr(sample.gaussians, lane)
+                reference_values = getattr(reference.gaussians, lane)
+                if current_values is None or reference_values is None:
+                    changed = current_values is not reference_values
+                else:
+                    changed = not np.array_equal(current_values[row], reference_values[reference_row])
+                if changed:
+                    break
+            sample.gaussians.mu_t[row] = sample.t0 if changed else reference.gaussians.mu_t[reference_row]
+
+
 #: (name, sequence-builder, cadence, delta-mode). Four variants, each a distinct decode:
 #: every chunk a keyframe; chained pure-update deltas; chained deltas carrying births and
 #: deaths; and keyframe-referenced deltas.
@@ -374,6 +563,12 @@ KEYFRAME_DELTA_VARIANTS = (
     ("KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics", _kd_drift_sequence, 4, DELTA_MODE_CHAINED),
     ("KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics", _kd_churn_sequence, 4, DELTA_MODE_CHAINED),
     ("KeyframeDeltaModesMixed-UseChunkIndex-UseCrc-UseStatistics", _kd_churn_sequence, 4, DELTA_MODE_KEYFRAME),
+    (
+        "KeyframeDeltaMultiWindow-UseChunkIndex-UseCrc-UseStatistics",
+        _kd_multi_window_sequence,
+        4,
+        DELTA_MODE_CHAINED,
+    ),
 )
 
 
@@ -387,8 +582,12 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
     """
     out: list[tuple[str, bytes, str]] = []
     for name, sequence_of, keyframe_every, delta_mode in KEYFRAME_DELTA_VARIANTS:
+        samples = sequence_of()
+        # §11.3: a row that is stated uses that Chunk's t0 as its temporal origin;
+        # a row omitted from a delta retains the origin from its reference state.
+        _kd_state_temporal_origins(samples, keyframe_every, delta_mode)
         data = kdf.write_sequence(
-            sequence_of(),
+            samples,
             _KD_DURATION,
             kd=KeyframeDeltaOptions(keyframe_every=keyframe_every, delta_mode=delta_mode),
             library="4dgs conformance generator",
@@ -423,6 +622,14 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
 #: Seconds of the synthetic object scenes. Short — the poses are what matter, not a long
 #: clip — and every file stays well under the corpus size cap.
 _OBJ_DURATION = 4.0
+_OBJ_OPACITY_DURATION = 4.000000021908035
+_OBJ_NONFINITE_MOTIONS = (
+    np.float32(1.0),
+    np.nextafter(np.float32(1.0), np.float32(np.inf)),
+)
+_OBJ_NONFINITE_DURATION = float(
+    np.finfo(np.float64).max / ((float(_OBJ_NONFINITE_MOTIONS[0]) + float(_OBJ_NONFINITE_MOTIONS[1])) / 2)
+)
 
 
 def _obj_gaussians(
@@ -609,14 +816,196 @@ def _obj_track_composed() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
     return gaussians, layer
 
 
-#: (name, builder). Three variants, each a distinct decode-and-compose: a single tracked
-#: object over a static base, a multi-object table with tracked/untracked/background objects,
-#: and a track composed over a base that moves and turns.
+def _obj_fixture_layer(label: str) -> ObjectLayer:
+    """One fixed half-turn track that opposes stored and emitted tie order."""
+    return ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label=label, anchor=(0.0, 0.0, 0.0))],
+        ),
+        tracks=[
+            ObjectTrack(
+                object_id=7,
+                times=[0.0, _OBJ_DURATION],
+                # A half-turn around Z reverses X.  Exact ascending motion order is
+                # therefore the opposite of the rounded composed-state order.
+                rotations=[[0.0, 0.0, 1.0, 0.0]] * 2,
+                translations=[[0.0, 0.0, 0.0]] * 2,
+            )
+        ],
+    )
+
+
+def _obj_tied_gaussians() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Two primary-key ties whose motion becomes visible only after composition."""
+    gaussians = _obj_gaussians(
+        positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        object_ids=[7, 7],
+        # Descending emitted-state order on purpose.  The paired encoding reverses it.
+        motions=[[4e-7, 0.0, 0.0], [1e-7, 0.0, 0.0]],
+    )
+    # The position and motion pitches are derived from median scale.  This makes the two
+    # decoded motions adjacent representable bins which round to the same six-decimal
+    # primary key, rather than relying on a hand-written unencodable float.
+    gaussians.scales[:] = 2e-6
+    return gaussians, _obj_fixture_layer("tied gaussians")
+
+
+def _obj_tied_gaussians_reordered() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    gaussians, layer = _obj_tied_gaussians()
+    order = np.array([1, 0], dtype=np.intp)
+    return _permute_gaussians(gaussians, order), layer
+
+
+def _permute_gaussians(gaussians: fourdgs.GaussianSet, order: np.ndarray) -> fourdgs.GaussianSet:
+    """Copy one fixture in a different physical order, preserving every decoded field."""
+    return fourdgs.GaussianSet(
+        positions=gaussians.positions[order],
+        scales=gaussians.scales[order],
+        rotations=gaussians.rotations[order],
+        colors=gaussians.colors[order],
+        motions=gaussians.motions[order],
+        mu_t=gaussians.mu_t[order],
+        sigma_t=gaussians.sigma_t[order],
+        win_lo=gaussians.win_lo[order],
+        win_hi=gaussians.win_hi[order],
+        object_id=gaussians.object_id[order],
+    )
+
+
+def _obj_content_order_sum() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Resident and content orders land on opposite sides of cancellation."""
+    gaussians = _obj_gaussians(
+        positions=[[0.0, 0.0, 0.0]] * 3,
+        # Resident order 3,1,2 sums small,+large,-large.  Content order is 1,2,3.
+        object_ids=[3, 1, 2],
+    )
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[
+                ObjectTableEntry(object_id=1, label="positive", anchor=(0.0, 0.0, 0.0)),
+                ObjectTableEntry(object_id=2, label="negative", anchor=(0.0, 0.0, 0.0)),
+                ObjectTableEntry(object_id=3, label="small", anchor=(0.0, 0.0, 0.0)),
+            ],
+        ),
+        tracks=[
+            ObjectTrack(
+                object_id=object_id,
+                times=[0.0, _OBJ_DURATION],
+                rotations=[[0.0, 0.0, 0.0, 1.0]] * 2,
+                translations=[translation] * 2,
+            )
+            for object_id, translation in (
+                (1, [1e20, 0.0, 0.0]),
+                (2, [-1e20, 0.0, 0.0]),
+                (3, [3.25, 0.0, 0.0]),
+            )
+        ],
+    )
+    return gaussians, layer
+
+
+def _obj_opacity_order() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Resident and content opacity sums straddle a six-decimal boundary."""
+    count = 64
+    gaussians = _obj_gaussians(
+        positions=[[0.0, 0.0, 0.0]] * count,
+        object_ids=[7] * count,
+    )
+    gaussians.colors[:, 3] = 1.0
+    # Physical order groups permanent, medium and boundary marginals. The portable key
+    # orders the finite sigma values first and never-fading values last.
+    gaussians.sigma_t[:32] = np.inf
+    gaussians.sigma_t[32:63] = 3.0311653
+    gaussians.sigma_t[63] = 1.0
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label="opacity order", anchor=(0.0, 0.0, 0.0))],
+        )
+    )
+    return gaussians, layer
+
+
+def _obj_wide_unit_aggregate() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """A finite f32 whose canonical units exceed every signed 128-bit accumulator."""
+
+    wide_rows = canonical_module.SAMPLE + 1
+    gaussians = _obj_gaussians(
+        # Sixteen portable zero rows fill the root/state samples. The wide rows are still
+        # live and included in each aggregate, so the fixture tests accumulator width
+        # without making ordinary sampled-f32 spelling part of this contract.
+        positions=[[0.0, 0.0, 0.0]] * canonical_module.SAMPLE
+        + [[float(np.finfo(np.float32).max), 0.0, 0.0]] * wide_rows,
+        object_ids=[7] * (canonical_module.SAMPLE + wide_rows),
+    )
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label="wide units", anchor=(0.0, 0.0, 0.0))],
+        )
+    )
+    # A majority of large, unsampled scales makes the global position pitch wide enough
+    # to encode zero and max-f32 in one Quantization grid. The 16 sampled zero rows keep
+    # their ordinary, small scale values.
+    gaussians.scales[canonical_module.SAMPLE :] = np.float32(1.6e30)
+    return gaussians, layer
+
+
+def _obj_tied_nonfinite_rows() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Rounded motion ties that become one finite and one null center at the last probe."""
+
+    gaussians = _obj_gaussians(
+        positions=[[0.0, 0.0, 0.0]] * 2,
+        object_ids=[7, 7],
+        motions=[
+            [float(_OBJ_NONFINITE_MOTIONS[0]), 0.0, 0.0],
+            [float(_OBJ_NONFINITE_MOTIONS[1]), 0.0, 0.0],
+        ],
+    )
+    # A fine pitch preserves the adjacent f32 motions; both still round to 1.000000 in
+    # the primary content key. Infinite sigma/window keeps them live at the huge f64 probe.
+    gaussians.scales[:] = 2e-6
+    gaussians.sigma_t[:] = np.inf
+    gaussians.win_hi[:] = np.inf
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label="non-finite rows", anchor=(0.0, 0.0, 0.0))],
+        )
+    )
+    return gaussians, layer
+
+
+def _obj_tied_nonfinite_rows_reordered() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    gaussians, layer = _obj_tied_nonfinite_rows()
+    return _permute_gaussians(gaussians, np.array([1, 0], dtype=np.intp)), layer
+
+
+#: (name, builder). The ordinary decode-and-compose cases are followed by canonical-order,
+#: exact-sum and accumulator-width adversaries.
 OBJECT_VARIANTS = (
     ("SingleObject-UseChunkIndex-UseCrc", _obj_single),
     ("MultiObject-UseChunkIndex-UseCrc", _obj_multi),
     ("ObjectTrackComposed-UseChunkIndex-UseCrc", _obj_track_composed),
+    ("ObjectTiedGaussians-UseChunkIndex-UseCrc", _obj_tied_gaussians),
+    ("ObjectTiedGaussiansReordered-UseChunkIndex-UseCrc", _obj_tied_gaussians_reordered),
+    ("ObjectContentOrderSum-UseChunkIndex-UseCrc", _obj_content_order_sum),
+    ("ObjectOpacityOrder-UseChunkIndex-UseCrc", _obj_opacity_order),
+    ("ObjectWideUnitAggregate-UseChunkIndex-UseCrc", _obj_wide_unit_aggregate),
+    ("ObjectTiedNonFiniteRows-UseChunkIndex-UseCrc", _obj_tied_nonfinite_rows),
+    (
+        "ObjectTiedNonFiniteRowsReordered-UseChunkIndex-UseCrc",
+        _obj_tied_nonfinite_rows_reordered,
+    ),
 )
+
+
+def _same_canonical_decimal(rounded: float, exact: canonical_module.ExactNumber) -> bool:
+    """Compare rounded and exact JSON numbers without either type's equality rules."""
+
+    return Decimal(str(rounded)) == Decimal(exact.token)
 
 
 def build_object_corpus() -> list[tuple[str, bytes, str]]:
@@ -628,10 +1017,20 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
     to make, and the statement every SDK that decodes objects is diffed against.
     """
     out: list[tuple[str, bytes, str]] = []
+    summaries: dict[str, dict] = {}
+    resident_tie_rows: dict[str, list] = {}
+    resident_nonfinite_rows: dict[str, list] = {}
     for name, builder in OBJECT_VARIANTS:
         gaussians, layer = builder()
+        if name.startswith("ObjectOpacityOrder"):
+            duration = _OBJ_OPACITY_DURATION
+        elif name.startswith("ObjectTiedNonFiniteRows"):
+            duration = _OBJ_NONFINITE_DURATION
+        else:
+            duration = _OBJ_DURATION
         options = fourdgs.WriteOptions(
             profile="default",
+            cutoff=1e-20 if name.startswith("ObjectOpacityOrder") else DEFAULT_CUTOFF,
             min_chunk_gaussians=10**9,
             max_depth=0,
             write_index=True,
@@ -641,29 +1040,133 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
             objects=layer,
         )
         buf = io.BytesIO()
-        fourdgs.write(buf, gaussians, _OBJ_DURATION, options=options)
+        fourdgs.write(buf, gaussians, duration, options=options)
         data = buf.getvalue()
         scene = fourdgs.read(data)
+        if name.startswith("ObjectTiedGaussians"):
+            keys = canonical_module._stable_keys(scene.gaussians)
+            if len(keys) != 2 or keys[0] != keys[1]:
+                raise AssertionError(f"{name}: the adversarial primary keys do not tie")
+            state = scene.gaussians.state_at(0.5 * _OBJ_DURATION, scene.header.cutoff)
+            centers, _ = scene.objects.apply(
+                centers=state["centers"],
+                orientations=state["orientations"],
+                object_ids=state["object_id"],
+                t=0.5 * _OBJ_DURATION,
+            )
+            resident_tie_rows[name] = [[canonical_module.num(v) for v in row] for row in centers]
+        if name.startswith("ObjectTiedNonFiniteRows"):
+            keys = canonical_module._stable_keys(scene.gaussians)
+            if len(keys) != 2 or keys[0] != keys[1]:
+                raise AssertionError(f"{name}: the finite/null primary keys do not tie")
+            state = scene.gaussians.state_at(duration, scene.header.cutoff)
+            centers, _ = scene.objects.apply(
+                centers=state["centers"],
+                orientations=state["orientations"],
+                object_ids=state["object_id"],
+                t=duration,
+            )
+            rows = [[canonical_module.num(v) for v in row] for row in centers]
+            if [row[0] is None for row in rows].count(False) != 1 or [row[0] is None for row in rows].count(True) != 1:
+                raise AssertionError(f"{name}: expected one finite and one null row, got {rows!r}")
+            resident_nonfinite_rows[name] = rows
         # The same full summarize the runners call, so the committed expectation matches what
         # a decoder prints — a file written with a CRC and an index reports `summaryCrcOk`
         # and chunk intervals, and omitting those here would diff against every runner.
-        expectation = canonical(
-            summarize(
-                scene.header,
-                scene.gaussians,
-                scene.audio_sources,
-                [(e.t0, e.t1) for e in scene.chunk_index],
-                camera=scene.camera,
-                metadata=scene.metadata,
-                attachments=scene.attachments,
-                statistics=scene.statistics,
-                summary_offsets=scene.summary_offsets,
-                summary_crc_ok=scene.summary_crc_ok,
-                provenance=scene.provenance,
-                objects=scene.objects,
-            )
+        summary = summarize(
+            scene.header,
+            scene.gaussians,
+            scene.audio_sources,
+            [(e.t0, e.t1) for e in scene.chunk_index],
+            camera=scene.camera,
+            metadata=scene.metadata,
+            attachments=scene.attachments,
+            statistics=scene.statistics,
+            summary_offsets=scene.summary_offsets,
+            summary_crc_ok=scene.summary_crc_ok,
+            provenance=scene.provenance,
+            objects=scene.objects,
         )
+        summaries[name] = summary
+        if name == "ObjectContentOrderSum-UseChunkIndex-UseCrc":
+            state = scene.gaussians.state_at(0.5 * _OBJ_DURATION, scene.header.cutoff)
+            centers, _ = scene.objects.apply(
+                centers=state["centers"],
+                orientations=state["orientations"],
+                object_ids=state["object_id"],
+                t=0.5 * _OBJ_DURATION,
+            )
+            resident_raw = 0.0
+            for row in centers:
+                resident_raw += float(row[0])
+            resident = canonical_module.num(resident_raw)
+            emitted = summary["states"][1]["aggregate"]["positionSum"][0]
+            if not isinstance(emitted, canonical_module.ExactNumber):
+                raise AssertionError(f"{name}: exact-unit position witness is not exact: {emitted!r}")
+            # Compare the rounded resident sum and exact-unit result in one decimal
+            # domain. ExactNumber deliberately does not compare equal to a float, so a
+            # direct comparison here could never detect a fixture that had drifted until
+            # the two strategies produced the same number.
+            if _same_canonical_decimal(resident, emitted):
+                raise AssertionError(f"{name}: resident and content-order sums no longer differ")
+        if name == "ObjectOpacityOrder-UseChunkIndex-UseCrc":
+            state = scene.gaussians.state_at(0.5 * duration, scene.header.cutoff)
+            row_for_index = {int(index): row for row, index in enumerate(state["indices"])}
+            resident_raw = 0.0
+            for value in state["opacity"]:
+                resident_raw += float(value)
+            keys = canonical_module._stable_keys(scene.gaussians)
+            content_raw = 0.0
+            for index in sorted(range(scene.gaussians.count), key=keys.__getitem__):
+                content_raw += float(state["opacity"][row_for_index[index]])
+            exact = summary["states"][1]["aggregate"]["opacitySum"]
+            if canonical_module.num(resident_raw) != 57.0713:
+                raise AssertionError(f"{name}: resident opacity witness moved to {resident_raw!r}")
+            if canonical_module.num(content_raw) != 57.071299:
+                raise AssertionError(f"{name}: content opacity witness moved to {content_raw!r}")
+            if not isinstance(exact, canonical_module.ExactNumber) or exact.token != "57.071301":
+                raise AssertionError(f"{name}: exact-unit opacity witness moved to {exact!r}")
+        if name == "ObjectWideUnitAggregate-UseChunkIndex-UseCrc":
+            expected = "5784799892854990616798971119236787732480.0"
+            order = canonical_module._stable_order(scene.gaussians)
+            wide_index = int(np.argmax(scene.gaussians.positions[:, 0]))
+            if wide_index in order[: canonical_module.SAMPLE]:
+                raise AssertionError(f"{name}: wide row leaked into the ordinary root sample")
+            decoded = float(scene.gaussians.positions[wide_index, 0])
+            if not math.isfinite(decoded) or decoded != float(np.finfo(np.float32).max):
+                raise AssertionError(f"{name}: max-f32 encoded row moved to {decoded!r}")
+            if any(position[0] != 0.0 for position in summary["sample"]["positions"]):
+                raise AssertionError(f"{name}: wide row leaked into the ordinary root sample")
+            if any(scale[0] > 1.0 for scale in summary["sample"]["scales"]):
+                raise AssertionError(f"{name}: wide quantization scale leaked into the root sample")
+            totals = [summary["aggregate"]["positionSum"][0]] + [
+                state["aggregate"]["positionSum"][0] for state in summary["states"]
+            ]
+            if any(not isinstance(total, canonical_module.ExactNumber) or total.token != expected for total in totals):
+                raise AssertionError(f"{name}: wide root/state totals moved to {totals!r}")
+            units = int(Decimal(expected) * (10**canonical_module.FLOAT_DECIMALS))
+            if units <= 2**127 - 1:
+                raise AssertionError(f"{name}: scaled total no longer exceeds signed 128-bit")
+            expected_live = 2 * canonical_module.SAMPLE + 1
+            if any(state["liveCount"] != str(expected_live) for state in summary["states"]):
+                raise AssertionError(f"{name}: wide row is not live in every state aggregate")
+            if any(any(position[0] != 0.0 for position in state["sample"]["positions"]) for state in summary["states"]):
+                raise AssertionError(f"{name}: wide row leaked into an ordinary state sample")
+        expectation = canonical(summary)
         out.append((name, data, expectation))
+
+    tied = "ObjectTiedGaussians-UseChunkIndex-UseCrc"
+    reordered = "ObjectTiedGaussiansReordered-UseChunkIndex-UseCrc"
+    if resident_tie_rows[tied] == resident_tie_rows[reordered]:
+        raise AssertionError("the tied pair's resident-order state rows do not differ")
+    if canonical(summaries[tied]) != canonical(summaries[reordered]):
+        raise AssertionError("the tied pair does not share one order-independent canonical summary")
+    nonfinite = "ObjectTiedNonFiniteRows-UseChunkIndex-UseCrc"
+    nonfinite_reordered = "ObjectTiedNonFiniteRowsReordered-UseChunkIndex-UseCrc"
+    if resident_nonfinite_rows[nonfinite] == resident_nonfinite_rows[nonfinite_reordered]:
+        raise AssertionError("the finite/null pair's resident-order state rows do not differ")
+    if canonical(summaries[nonfinite]) != canonical(summaries[nonfinite_reordered]):
+        raise AssertionError("the finite/null pair does not share one canonical summary")
     return out
 
 
@@ -712,17 +1215,27 @@ def _objects(duration_sec: float) -> ObjectLayer:
     )
 
 
-def write_corpus(target: str) -> dict[str, str]:
+class Corpus(NamedTuple):
+    """One generator run, including fresh expectations that cannot include stale files."""
+
+    checksums: dict[str, str]
+    expectations: dict[str, str]
+
+
+def write_corpus(target: str) -> Corpus:
     os.makedirs(target, exist_ok=True)
     checksums: dict[str, str] = {}
+    expectations: dict[str, str] = {}
     for scenario, flags in scenarios.variants():
         name = scenarios.variant_name(scenario, flags)
         data, expectation = build(scenario, flags)
         with open(os.path.join(target, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[name] = hashlib.sha256(data).hexdigest()
+        checksums[f"{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[name] = expectation + "\n"
 
     # keyframe-delta variants live in their own subdirectory, exactly as the invalid
     # corpus does, and for the same structural reason: every whole-corpus consumer that
@@ -736,9 +1249,11 @@ def write_corpus(target: str) -> dict[str, str]:
     for name, data, expectation in build_keyframe_delta_corpus():
         with open(os.path.join(keyframe_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
+        checksums[f"keyframe/{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"keyframe/{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[f"keyframe/{name}"] = expectation + "\n"
 
     # Object-layer variants live in their own subdirectory too, for the same gathering
     # reason as keyframe/: run.py is the one consumer that reaches into it. Unlike a
@@ -751,29 +1266,46 @@ def write_corpus(target: str) -> dict[str, str]:
     for name, data, expectation in build_object_corpus():
         with open(os.path.join(object_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(object_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(object_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[f"object/{name}"] = hashlib.sha256(data).hexdigest()
+        checksums[f"object/{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"object/{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[f"object/{name}"] = expectation + "\n"
 
     invalid_dir = os.path.join(target, "invalid")
     os.makedirs(invalid_dir, exist_ok=True)
     for name, data, expectation in build_invalid():
         with open(os.path.join(invalid_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
-    return checksums
+        checksums[f"invalid/{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"invalid/{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[f"invalid/{name}"] = expectation + "\n"
+    return Corpus(checksums, expectations)
 
 
 def write_checksums(checksums: dict[str, str]) -> None:
     lines = [
-        "# SHA-256 of each generated .4dgs variant, asserted by `generate.py --verify`.",
+        "# SHA-256 of each generated variant and expectation, asserted by `generate.py --verify`.",
         "# Written by the generator; do not edit by hand.",
     ]
-    lines += [f"{digest}  {name}.4dgs" for name, digest in sorted(checksums.items())]
-    with open(CHECKSUMS, "w", encoding="utf-8") as fh:
+    lines += [f"{digest}  {name}" for name, digest in sorted(checksums.items())]
+    with open(CHECKSUMS, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
+
+
+def read_expectations() -> dict[str, str]:
+    """Read committed expectations before regeneration overwrites their files."""
+    out: dict[str, str] = {}
+    for root, prefix in ((DATA, ""), (INVALID, "invalid/"), (KEYFRAME, "keyframe/"), (OBJECT, "object/")):
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            if name.endswith(".json"):
+                with open(os.path.join(root, name), encoding="utf-8") as fh:
+                    out[prefix + name[: -len(".json")]] = fh.read()
+    return out
 
 
 def read_checksums() -> dict[str, str]:
@@ -785,7 +1317,7 @@ def read_checksums() -> dict[str, str]:
             if line.startswith("#") or not line.strip():
                 continue
             digest, name = line.split()
-            out[name[: -len(".4dgs")]] = digest
+            out[name] = digest
     return out
 
 
@@ -794,14 +1326,17 @@ def main(argv=None) -> int:
     parser.add_argument("--verify", action="store_true", help="regenerate and assert nothing moved")
     args = parser.parse_args(argv)
 
-    checksums = write_corpus(DATA)
+    committed_expectations = read_expectations() if args.verify else {}
+    corpus = write_corpus(DATA)
+    checksums = corpus.checksums
     total = sum(
         os.path.getsize(os.path.join(root, f))
         for root in (DATA, INVALID, KEYFRAME, OBJECT)
         for f in os.listdir(root)
         if os.path.isfile(os.path.join(root, f))
     )
-    print(f"{len(checksums)} variants, {total / 1024:.0f} KiB in {DATA}")
+    variants = sum(name.endswith(".4dgs") for name in checksums)
+    print(f"{variants} variants, {total / 1024:.0f} KiB in {DATA}")
 
     if total > MAX_DATA_BYTES:
         print(f"error: corpus is {total} bytes, over the {MAX_DATA_BYTES} cap — prune variants", file=sys.stderr)
@@ -812,11 +1347,12 @@ def main(argv=None) -> int:
         print(f"wrote {CHECKSUMS}")
         return 0
 
-    return 0 if _verify(checksums) else 1
+    return 0 if _verify(corpus, committed_expectations) else 1
 
 
-def _verify(checksums: dict[str, str]) -> bool:
+def _verify(corpus: Corpus, committed_expectations: dict[str, str]) -> bool:
     """Assert the corpus matches what is committed and that the encoder is stable."""
+    checksums = corpus.checksums
     committed = read_checksums()
     failures = []
     if not committed:
@@ -830,17 +1366,32 @@ def _verify(checksums: dict[str, str]) -> bool:
         if name not in checksums:
             failures.append(f"{name}: committed checksum has no variant")
 
+    fresh_expectations = corpus.expectations
+    for name, text in sorted(fresh_expectations.items()):
+        if name not in committed_expectations:
+            failures.append(f"{name}.json: no committed expectation")
+        elif committed_expectations[name] != text:
+            failures.append(f"{name}.json: {_first_difference(committed_expectations[name], text)}")
+    for name in committed_expectations:
+        if name not in fresh_expectations:
+            failures.append(f"{name}.json: committed expectation has no variant")
+
     # Determinism: a second run must produce the same bytes.
-    second = {}
+    second: dict[str, str] = {}
+
+    def record(name: str, data: bytes, expectation: str) -> None:
+        second[f"{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        second[f"{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+
     for scenario, flags in scenarios.variants():
-        data, _ = build(scenario, flags)
-        second[scenarios.variant_name(scenario, flags)] = hashlib.sha256(data).hexdigest()
-    for name, data, _ in build_invalid():
-        second[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
-    for name, data, _ in build_keyframe_delta_corpus():
-        second[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
-    for name, data, _ in build_object_corpus():
-        second[f"object/{name}"] = hashlib.sha256(data).hexdigest()
+        data, expectation = build(scenario, flags)
+        record(scenarios.variant_name(scenario, flags), data, expectation)
+    for name, data, expectation in build_invalid():
+        record(f"invalid/{name}", data, expectation)
+    for name, data, expectation in build_keyframe_delta_corpus():
+        record(f"keyframe/{name}", data, expectation)
+    for name, data, expectation in build_object_corpus():
+        record(f"object/{name}", data, expectation)
     for name, digest in checksums.items():
         if second.get(name) != digest:
             failures.append(f"{name}: encoder is not deterministic between runs")
@@ -852,8 +1403,24 @@ def _verify(checksums: dict[str, str]) -> bool:
         print("\nif the change was intended, rerun without --verify and commit the result", file=sys.stderr)
         return False
 
-    print(f"verified {len(checksums)} variants: checksums match and the encoder is deterministic")
+    variants = sum(name.endswith(".4dgs") for name in checksums)
+    print(f"verified {variants} variants: checksums and expectations match, and the encoder is deterministic")
     return True
+
+
+def _first_difference(committed: str, fresh: str) -> str:
+    """Name the first character-level expectation difference."""
+    old, new = committed.splitlines(keepends=True), fresh.splitlines(keepends=True)
+    for i, (a, b) in enumerate(zip(old, new, strict=False), start=1):
+        if a != b:
+            column = next(j for j, (x, y) in enumerate(zip_longest(a, b), start=1) if x != y)
+            return f"line {i}, column {column}: committed {a!r}, fresh decode {b!r}"
+    shared = min(len(old), len(new))
+    extra, side = (new, "a fresh decode") if len(new) > len(old) else (old, "the committed file")
+    return (
+        f"{len(old)} committed lines against {len(new)} from a fresh decode; "
+        f"line {shared + 1} is in {side} only: {extra[shared]!r}"
+    )
 
 
 if __name__ == "__main__":

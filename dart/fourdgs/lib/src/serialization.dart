@@ -21,6 +21,7 @@ import 'package:archive/archive.dart';
 
 import 'exceptions.dart';
 import 'opcode.dart';
+import 'readable.dart';
 
 /// `0x89 4 D G S 1 CR LF`.
 ///
@@ -174,12 +175,22 @@ class FourdgsCursor {
   /// a reader that refuses a record says which byte is wrong (AGENTS.md §6),
   /// and pointing four bytes upstream at a length that decoded fine sends
   /// whoever is holding the file to the wrong place in it.
+  ///
+  /// A leading U+FEFF is put back after decoding. `utf8.decode` skips one, which
+  /// is right for reading a text *file*, where a byte-order mark is a preamble;
+  /// every string here is length-prefixed UTF-8 inside a binary record, where
+  /// U+FEFF is a character the writer wrote. Skipping it made this reader return
+  /// a different string from the Python and Rust readers for the same bytes — a
+  /// `bounds` value, a metadata key or an `object_id` silently changed.
   String string() {
     final length = u32();
     final at = pos;
     final raw = take(length);
     try {
-      return utf8.decode(raw);
+      final String decoded = utf8.decode(raw);
+      final bool hadMark =
+          raw.length >= 3 && raw[0] == 0xef && raw[1] == 0xbb && raw[2] == 0xbf;
+      return hadMark ? '\u{feff}$decoded' : decoded;
     } on FormatException catch (error) {
       final offset = error.offset;
       final where = offset == null ? '' : ': byte ${at + offset}';
@@ -323,34 +334,52 @@ Iterable<FourdgsRecordSpan> scanRecordSpans(
   }
 }
 
+/// Where the major version sits in the magic. Every other byte is a fixed
+/// sentinel.
+const int _magicVersionAt = 5;
+
 /// Refuses a file this reader must not try to interpret.
 ///
 /// A wrong major version is refused rather than guessed at: the version byte
 /// gates the whole file, so pressing on would mean reading unknown bytes as
 /// known ones.
+///
+/// The two refusals are told apart by whether the version byte is the **only**
+/// byte that differs. Every other byte of the magic is a fixed sentinel, so a
+/// file that differs elsewhere is not a 4dgs file whatever its version byte
+/// happens to say. Testing only that bytes 1-4 read `4DGS` — as this did —
+/// reported a file whose leading `0x89` had been corrupted as "4dgs major
+/// version 1 is not supported by this reader", which sends its holder looking
+/// for a newer reader that would not have helped. Nothing in the valid corpus
+/// can reach either branch, which is why it survived until the invalid corpus
+/// asked the two branches to say different names.
 void checkMagic(Uint8List head) {
   if (head.length < fourdgsMagic.length) {
     throw const FourdgsTruncatedFile('file is shorter than the magic');
   }
   for (int i = 0; i < fourdgsMagic.length; i++) {
+    if (i == _magicVersionAt) continue;
     if (head[i] != fourdgsMagic[i]) {
-      if (head.length >= 5 &&
-          head[1] == 0x34 &&
-          head[2] == 0x44 &&
-          head[3] == 0x47 &&
-          head[4] == 0x53) {
-        // The version is the ASCII digit in the magic, so it is reported as the
-        // character a reader would see in a hex dump. Printing its ordinal
-        // instead turns "version 9" into "version 57", which sends whoever is
-        // holding the file looking for a version that does not exist.
-        throw FourdgsUnsupportedVersion(
-          '4dgs major version ${_versionLabel(head)} is not supported by this reader',
-        );
-      }
-      throw const FourdgsUnsupportedVersion('not a 4dgs file (bad magic)');
+      throw FourdgsUnsupportedVersion(
+        'not a 4dgs file: bad magic at byte $i; found '
+        '${_hexByte(head[i])}, expected ${_hexByte(fourdgsMagic[i])}',
+        refusalCode: refusalMagicMismatch,
+      );
     }
   }
+  if (head[_magicVersionAt] != fourdgsMagic[_magicVersionAt]) {
+    // The version is the ASCII digit in the magic, so it is reported as the
+    // character a reader would see in a hex dump. Printing its ordinal
+    // instead turns "version 9" into "version 57", which sends whoever is
+    // holding the file looking for a version that does not exist.
+    throw FourdgsUnsupportedVersion(
+      '4dgs major version ${_versionLabel(head)} is not supported by this reader',
+      refusalCode: refusalUnsupportedMajorVersion,
+    );
+  }
 }
+
+String _hexByte(int byte) => '0x${byte.toRadixString(16).padLeft(2, '0')}';
 
 /// The version byte as a reader would see it: the digit when it is one, and the
 /// raw byte in hex when the file is corrupt enough that it is not.
@@ -434,14 +463,22 @@ void skipStreamPayload(FourdgsCursor cursor, FourdgsStreamHeader header) =>
     cursor.skip(header.payloadLength);
 
 /// Reads one attribute stream from [cursor].
-FourdgsAttributeStream decodeAttributeStream(FourdgsCursor cursor) =>
-    decodeAttributeStreamBody(cursor, readStreamHeader(cursor));
+FourdgsAttributeStream decodeAttributeStream(FourdgsCursor cursor) {
+  final streamOffset = cursor.pos;
+  return decodeAttributeStreamBody(
+    cursor,
+    readStreamHeader(cursor),
+    streamOffset: streamOffset,
+  );
+}
 
 /// Decodes the payload of a stream whose header has already been read.
 FourdgsAttributeStream decodeAttributeStreamBody(
   FourdgsCursor cursor,
-  FourdgsStreamHeader header,
-) {
+  FourdgsStreamHeader header, {
+  int streamOffset = 0,
+  int? chunkOffset,
+}) {
   final attributeId = header.attributeId;
   final width = header.width;
   final mode = header.mode;
@@ -486,7 +523,10 @@ FourdgsAttributeStream decodeAttributeStreamBody(
     );
   }
 
-  final raw = _decompress(cursor.take(payloadLength), codec, expected);
+  final context =
+      'attribute $attributeId stream header at byte $streamOffset'
+      '${chunkOffset == null ? '' : ' in the Chunk at byte $chunkOffset'}';
+  final raw = _decompress(cursor.take(payloadLength), codec, expected, context);
   final sym = _unshuffle(raw, width, symbols);
 
   final values = Int32List(count * channels);
@@ -563,17 +603,29 @@ FourdgsAttributeStream decodeAttributeStreamBody(
 /// checksum is worth the four bytes it costs to read: the container's own CRC
 /// covers the index and nothing else, so without it a payload that happens to
 /// inflate to the declared length hands back wrong bins with nothing to say so.
-Uint8List _decompress(Uint8List body, int codec, int expected) {
+Uint8List _decompress(Uint8List body, int codec, int expected, String context) {
   if (codec == codecZstd) {
     // Legal per the specification and appropriate for archival encodes, but it
     // needs a binding this decoder deliberately does not have. Writers default
     // to deflate precisely so that no platform needs one.
-    throw const FourdgsUnsupportedCodec(
-      'this stream is zstd-coded; re-encode with the default deflate codec',
+    // Named with the same identifier the unknown-id arm below carries. This is
+    // the default build's answer to a legal zstd file, so leaving it unnamed
+    // would mean the codec this reader refuses most often is the one it cannot
+    // name; and from the file's side both are "this reader does not implement
+    // my stream codec". Which of the two it is belongs in the message, not in
+    // the identifier.
+    throw FourdgsUnsupportedCodec(
+      '$context declares zstd codec $codecZstd, which this build does not '
+      'implement; expected deflate codec $codecDeflate for this build',
+      refusalCode: refusalUnknownStreamCodec,
     );
   }
   if (codec != codecDeflate) {
-    throw FourdgsUnsupportedCodec('unknown stream codec $codec');
+    throw FourdgsUnsupportedCodec(
+      '$context declares codec $codec; expected a registered stream codec: '
+      'deflate ($codecDeflate) or zstd ($codecZstd)',
+      refusalCode: refusalUnknownStreamCodec,
+    );
   }
   if (body.length < 2) {
     throw const FourdgsTruncatedFile(
@@ -694,4 +746,37 @@ Uint32List _unshuffle(Uint8List raw, int width, int symbols) {
 int _unzigzag(int u) => (u >> 1) ^ -(u & 1);
 
 /// CRC-32 (IEEE) over [data], as the Footer's `summary_crc` declares it.
-int fourdgsCrc32(Uint8List data) => getCrc32(data);
+///
+/// Pass the previous result as [crc] to continue over another bounded block;
+/// this lets a writer checksum summary records without retaining the summary.
+int fourdgsCrc32(Uint8List data, [int crc = 0]) => getCrc32(data, crc);
+
+/// How much of a checksummed region is read at a time.
+///
+/// A megabyte: large enough that the per-read overhead of an HTTP transport
+/// disappears, small enough that a checksum over a gigabyte of summary costs a
+/// megabyte of memory rather than a gigabyte.
+const int fourdgsCrcBlockBytes = 1 << 20;
+
+/// The checksum of `[start, start + length)` of [source], a block at a time.
+///
+/// The Footer names a byte *range*, and a caller that has to hold the whole
+/// range to check it is a caller that reads a file to check a file (AGENTS.md
+/// §1). CRC-32 is a running state, so a region is checked block by block with
+/// nothing but a 32-bit accumulator resident.
+Future<int> fourdgsCrc32Range(
+  FourdgsReadable source,
+  int start,
+  int length,
+) async {
+  int crc = 0;
+  int at = start;
+  final int end = start + length;
+  while (at < end) {
+    final int take =
+        end - at < fourdgsCrcBlockBytes ? end - at : fourdgsCrcBlockBytes;
+    crc = fourdgsCrc32(await source.read(at, take), crc);
+    at += take;
+  }
+  return crc;
+}

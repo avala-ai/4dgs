@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use fourdgs::error::Error;
 use fourdgs::opcode as op;
 use fourdgs::quantization::{life_class, mu_step, rint, support_k, Bounds, Profile, Steps};
-use fourdgs::records::{Header, Quantization, RigTrajectory, WindowTable};
+use fourdgs::records::{ChunkIndexEntry, Header, Quantization, RigTrajectory, WindowTable};
 use fourdgs::serialization::{put_record, MAGIC};
 use fourdgs::stream::{unzigzag, zigzag};
 
@@ -109,6 +109,35 @@ fn the_minimal_file_decodes() {
 }
 
 #[test]
+fn a_cut_oversized_summary_record_remains_recoverable_truncation() {
+    let mut data = minimal_file();
+    data.truncate(data.len() - MAGIC.len() - fourdgs::records::Footer::default().encode().len());
+    data.push(op::CHUNK_INDEX);
+    data.extend_from_slice(&(fourdgs::indexed_reader::MAX_FRONT_MATTER_BYTES + 1).to_le_bytes());
+
+    let scene = fourdgs::read_bytes(&data).expect("the complete prefix before the cut is usable");
+    assert!(scene.truncated);
+    assert_eq!(scene.gaussians.count(), 0);
+}
+
+#[test]
+fn streamed_chunk_indexes_reject_more_than_three_band_ranges() {
+    let mut data = minimal_file();
+    let footer_at = data.len() - MAGIC.len() - fourdgs::records::Footer::default().encode().len();
+    let index = ChunkIndexEntry {
+        bands: vec![(1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
+        ..Default::default()
+    }
+    .encode();
+    data.splice(footer_at..footer_at, index);
+
+    let error = fourdgs::read_bytes(&data).unwrap_err();
+    assert!(matches!(error, Error::Malformed(_)), "{error}");
+    assert!(error.to_string().contains("at most 3"), "{error}");
+    assert!(error.to_string().contains("at byte"), "{error}");
+}
+
+#[test]
 fn unknown_and_private_records_are_stepped_over() {
     let mut data = minimal_file();
     // Splice two records a version-1 reader has never seen in front of the Footer: one
@@ -148,6 +177,32 @@ fn a_record_that_grew_fields_is_still_read() {
 
     let scene = fourdgs::read_bytes(&out).expect("appended fields are stepped over");
     assert_eq!(scene.header.duration_sec, 2.5);
+}
+
+#[test]
+fn streamed_decode_steps_over_a_large_header_suffix() {
+    let trailer = vec![0x5a; fourdgs::indexed_reader::HEAD_PROBE as usize * 128];
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(
+        &Header {
+            duration_sec: 2.5,
+            gaussian_count: 0,
+            aabb: vec![0.0; 6],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            ..Default::default()
+        }
+        .encode(&trailer),
+    );
+    let base = minimal_file();
+    let header_end =
+        8 + 9 + u64::from_le_bytes(base[9..17].try_into().expect("eight bytes")) as usize;
+    out.extend_from_slice(&base[header_end..]);
+
+    let scene = fourdgs::read_bytes(&out).expect("the large extension suffix stays non-resident");
+    assert_eq!(scene.header.duration_sec, 2.5);
+    assert!(!scene.truncated);
 }
 
 #[test]
@@ -275,6 +330,137 @@ fn an_out_of_range_window_index_is_refused_rather_than_clamped() {
     assert_eq!(fourdgs::chunk::check_window_index(1, 2).unwrap(), 1);
 }
 
+/// A file with two validity windows, one gaussian in each, so the Window Table it carries
+/// has two rows and the Chunk references row 1.
+fn two_window_file() -> Vec<u8> {
+    let mut g = fourdgs::model::GaussianSet::default();
+    for (index, window) in [(0.0f32, 1.0f32), (1.0, 2.0)].into_iter().enumerate() {
+        g.positions.extend_from_slice(&[index as f32, 0.0, 0.0]);
+        g.scales.extend_from_slice(&[0.01, 0.01, 0.01]);
+        g.rotations.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+        g.colors.extend_from_slice(&[0.5, 0.5, 0.5, 1.0]);
+        g.motions.extend_from_slice(&[0.0, 0.0, 0.0]);
+        g.mu_t.push(window.0 + 0.5);
+        g.sigma_t.push(0.25);
+        g.win_lo.push(window.0);
+        g.win_hi.push(window.1);
+    }
+    let options = fourdgs::writer::WriteOptions {
+        min_chunk_gaussians: 8,
+        max_depth: 0,
+        ..Default::default()
+    };
+    fourdgs::write_to_vec(&g, 2.0, &options, &Default::default()).expect("the fixture encodes")
+}
+
+/// The byte just past the last Chunk record, so nothing spliced there can be caught by a
+/// later Chunk decoding against it.
+fn after_last_chunk(bytes: &[u8]) -> usize {
+    let mut at = MAGIC.len();
+    let mut last = None;
+    while at + 9 <= bytes.len() {
+        let opcode = bytes[at];
+        let length = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().unwrap()) as usize;
+        let end = at + 9 + length;
+        if opcode == op::CHUNK {
+            last = Some(end);
+        }
+        at = end;
+    }
+    last.expect("the fixture carries a Chunk record")
+}
+
+/// A window index is checked against the table in force when its Chunk is decoded. A
+/// second, shorter Window Table spliced in after that Chunk leaves indices already
+/// accepted pointing outside the table the assembler is handed — which used to index a
+/// `Vec` out of bounds and panic. A panic is not a refusal: across the C ABI it is
+/// undefined behaviour in the caller's runtime rather than a status code, and under
+/// `panic=abort` it takes the process with it. A malformed file has to be refused.
+#[test]
+fn a_window_table_spliced_in_after_a_chunk_is_refused_rather_than_panicking() {
+    let mut bytes = two_window_file();
+    let splice_at = after_last_chunk(&bytes);
+    let shorter = WindowTable {
+        windows: vec![(0.0, 1.0)],
+    }
+    .encode();
+    bytes.splice(splice_at..splice_at, shorter);
+
+    let error = fourdgs::read_bytes(&bytes)
+        .expect_err("a Window Table that cannot apply to the Chunks before it is malformed");
+    assert!(matches!(error, Error::Malformed(_)), "{error}");
+    assert!(error.to_string().contains("Window Table"), "{error}");
+
+    // The same bytes through the automatic open, which is what a consumer calls.
+    let mut source = fourdgs::readable::BytesReadable::new(&bytes);
+    if let Ok(mut reader) = fourdgs::SceneReader::open(&mut source) {
+        let _ = reader.state_at(0.5, 0);
+    }
+}
+
+/// The assembler is a second caller with its own window table, and it must not trust that
+/// an index which fit the decoder's table fits this one.
+#[test]
+fn assembly_refuses_a_window_index_outside_the_table_it_was_handed() {
+    let chunk = fourdgs::chunk::DecodedChunk {
+        count: 1,
+        positions: vec![0.0; 3],
+        scales: vec![0.0; 3],
+        rotations: vec![0.0; 4],
+        colors: vec![0.0; 4],
+        motions: vec![0.0; 3],
+        mu_t: vec![0.0],
+        sigma_t: vec![1.0],
+        window_index: vec![1],
+        ..Default::default()
+    };
+    let error = fourdgs::stream_reader::assemble(
+        std::slice::from_ref(&chunk),
+        &[BTreeMap::new()],
+        &[(0.0, 1.0)],
+        &Header::default(),
+    )
+    .expect_err("index 1 is outside a one-entry table");
+    assert_eq!(
+        error.refusal_code(),
+        Some(fourdgs::error::refusal::WINDOW_INDEX_OUT_OF_RANGE),
+        "{error}"
+    );
+}
+
+/// The indexed ceiling has to be cumulative, not per-call. A caller that keeps what it
+/// reads — which is every caller that assembles a scene, including this repository's own
+/// indexed conformance runner — reads N chunks and holds N of them; a bound that resets on
+/// each call bounds nothing about that caller's memory.
+#[test]
+fn indexed_chunk_reads_charge_one_shared_ceiling() {
+    use fourdgs::indexed_reader::{open_indexed, read_chunk_within, ResidentBudget};
+
+    let bytes = two_window_file();
+    let mut source = fourdgs::readable::BytesReadable::new(&bytes);
+    let scene = open_indexed(&mut source).expect("the fixture is indexed");
+    let entry = scene.index.first().expect("the fixture carries an index");
+
+    let mut budget = ResidentBudget::for_scene(&scene).expect("the opened scene fits its ceiling");
+    let start = budget.remaining();
+    let first = read_chunk_within(&mut source, &scene, entry, 3, &mut budget).expect("first read");
+    let after_one = budget.remaining();
+    let second =
+        read_chunk_within(&mut source, &scene, entry, 3, &mut budget).expect("second read");
+    let after_two = budget.remaining();
+
+    assert_eq!(first.count, second.count, "the same entry, read twice");
+    assert!(
+        after_one < start,
+        "a chunk the caller still holds has to be charged"
+    );
+    assert_eq!(
+        start - after_one,
+        after_one - after_two,
+        "the second copy costs what the first did; the ceiling accumulates rather than resetting"
+    );
+}
+
 #[test]
 fn an_unimplemented_codec_is_refused_by_name() {
     // A different failure from a corrupt file: the file is fine, this build cannot read
@@ -395,4 +581,68 @@ fn a_zero_sample_trajectory_is_read_as_absent_rather_than_refused() {
         translations: vec![[0.0; 3]],
     };
     assert!(written.check().is_err());
+}
+
+/// Returns `data` with its first record of `opcode` spliced in a second time.
+///
+/// The copy is byte-identical and sits directly after the original, so the file stays
+/// well-framed. What is wrong with it is only that the record appears twice — which is
+/// the point: nothing about the bytes looks damaged, and a reader that overwrites the
+/// first from the second, or stops at the first, returns a scene that looks sound.
+fn with_duplicate_record(data: &[u8], opcode: u8) -> Vec<u8> {
+    let mut at = MAGIC.len();
+    while at < data.len() {
+        let length =
+            u64::from_le_bytes(data[at + 1..at + 9].try_into().expect("eight length bytes"))
+                as usize;
+        let end = at + 9 + length;
+        if data[at] == opcode {
+            let mut out = Vec::with_capacity(data.len() + (end - at));
+            out.extend_from_slice(&data[..end]);
+            out.extend_from_slice(&data[at..end]);
+            out.extend_from_slice(&data[end..]);
+            return out;
+        }
+        at = end;
+    }
+    panic!("no record with opcode {opcode:#x} in the fixture");
+}
+
+#[test]
+fn a_second_once_only_record_is_refused() {
+    // Spec §4: the records drawn without a repetition marker — Header, Quantization,
+    // Window Table — appear exactly once.
+    //
+    // Not pedantry about a wasted record. These three are what the rest of the file is
+    // interpreted against, nothing in the format says which of two copies wins, and this
+    // crate's own two readers would not have agreed: the streamed reader replaced its
+    // retained value as each copy arrived, while the indexed opener walks the front
+    // matter and would keep the first. A file with two Quantization records declaring
+    // different steps therefore decoded to two different scenes depending on which
+    // reader opened it, with nothing raised on either.
+    let base = minimal_file();
+    assert!(
+        fourdgs::read_bytes(&base).is_ok(),
+        "the control must be readable, or a refusal below proves nothing"
+    );
+
+    for (opcode, name) in [
+        (op::HEADER, "Header"),
+        (op::QUANTIZATION, "Quantization"),
+        (op::WINDOW_TABLE, "Window Table"),
+    ] {
+        let broken = with_duplicate_record(&base, opcode);
+        let err = fourdgs::read_bytes(&broken)
+            .expect_err("a second {name} record must be refused, not resolved by guessing");
+        assert!(matches!(err, Error::Malformed(_)), "{name}: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("a second {name} record")),
+            "{message}"
+        );
+        assert!(
+            message.contains("byte"),
+            "the refusal must say where the copy is: {message}"
+        );
+    }
 }

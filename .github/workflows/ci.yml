@@ -12,12 +12,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Total tree size under 8 MB
+      - name: Total tree size under 10 MB
+        # Raised from 8192 once the inspect-and-validate tools landed: #191 brought the
+        # Dart validator and #188 the Swift one, and the tree they leave measures 8696 KiB.
+        # The gate went red on the merge itself rather than on either pull request, because
+        # each was measured against a main that did not yet have the other. 9216 is the step
+        # that holds the merged tree with room, and this is the whole-tree gate — the
+        # per-language sub-budgets below are still what say which language grew.
+        #
+        # Raised again to 9728 after the canonical-order round: making the composed-state
+        # summaries order-independent touched five SDKs at once, and the conformance
+        # variants that pin the property — non-finite ordering, wide units, the exact
+        # cancellation witness — are corpus expectations rather than code. The tree
+        # measured 9296 with both this gate and the Rust one already red on `main`; the
+        # tree check runs first and fails the job, so the Rust overrun was invisible until
+        # this gate was moved. Both are raised here for that reason, together.
+        #
+        # 10240 rather than a number that fits `main` today, because the number that fits
+        # today is what put this gate in the state it is in. Each open branch is green
+        # measured against a `main` that lacks the others; test-merging the queue gives
+        # 9408, and adding the bounded-validation branch gives 9772. A budget sized to
+        # `main` alone would go red on the second merge, which is precisely how the 8192
+        # and 9216 steps were each discovered — after the fact, by a red `main`.
         run: |
           size_kb=$(du -s --exclude=.git . | cut -f1)
           echo "tree: ${size_kb} KiB"
-          if [ "$size_kb" -gt 8192 ]; then
-            echo "::error::tree is ${size_kb} KiB, over the 8192 KiB budget"
+          if [ "$size_kb" -gt 10240 ]; then
+            echo "::error::tree is ${size_kb} KiB, over the 10240 KiB budget"
             exit 1
           fi
       - name: Conformance data under 2.5 MB
@@ -27,7 +48,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1100 KB
+      - name: Rust sources under 2 MB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -41,23 +62,67 @@ jobs:
         # layer's records, composition module, indexed sampling, and conformance coverage
         # landed together; 1000 after the keyframe-delta model (composition, whole-file
         # write/decode, both read paths, and its encode-roundtrip runners) landed; 1100 after
-        # the object layer's composed-state entry point and its test. A budget
-        # that tight stops being a budget and starts being a tax
-        # on the next feature, so each raise leaves a little headroom. The number moves
-        # when the tree grows deliberately, which is the one thing it is not meant to
-        # catch — it exists so that a vendored dependency, which arrives in hundreds of
+        # the object layer's composed-state entry point and its test; 1200 after the `4dgs`
+        # validator learned to place a refusal — the refusal-placement walk and the
+        # chunk-decode scan are new files beside the tool's own, and the CLI tests that read
+        # their expectations out of the invalid corpus are another; 1280 after the review
+        # round that put a named regression test behind each of those behaviours, which is
+        # most of a hostile-fixture builder and ten tests; 1360 after the indexed-open and
+        # keyframe-reference regressions; 1376 after the bounded keyframe-delta validator
+        # added fixed-header resource checks, exact record attribution, cross-delta lifetime
+        # invariants, and their adversarial regressions; 1392 after its state-stream
+        # preflight, chunk-compression, identity-domain, and signed-bin regressions; 1600
+        # after bounded
+        # indexed/streamed prefix reads, decoded working-set accounting, exact range framing,
+        # lazy Audio Source validation, and their hostile reader/C-ABI regressions made the
+        # clean combined Rust tree 1528 KiB; 1664 after the final review pass made
+        # retained prefix values and their collection backing share the decoded-state
+        # envelope, streamed excluded SH bands without buffering, and preflighted indexed
+        # SH reads, taking the final clean tree to 1624 KiB after indexed front-matter,
+        # Attachment, audio, and Delta working-set accounting; 1728 after the exact-review
+        # follow-ups made Delta groups/composition, indexed summary/Metadata/provenance and
+        # streamed decoded collections share those same bounds, preflighted compact Object
+        # Tables, and charged the indexed scene through replacement loads, taking the
+        # measured tree to 1692 KiB; 1792 after the final indexed lazy-family, Audio Source,
+        # Object Layer, and retained-cache aggregation pass took the clean tree to 1732 KiB;
+        # 1856 after exact-review follow-ups preflighted Header/Quantization/Metadata maps,
+        # Window Table and indexed range collections, and completed streamed audio and assembly
+        # scratch accounting, taking the clean tree to 1780 KiB.
+        # A margin smaller
+        # than one deliberate review round is not headroom, it is the next source change
+        # failing a gate about vendored dependencies.
+        # A budget that tight stops being a budget and starts being a tax
+        # on the next feature, so each raise leaves a little headroom. The number moves when
+        # the tree grows deliberately, which is the one thing it is not meant to catch — it
+        # exists so that a vendored dependency, which arrives in hundreds of
         # KiB, fails loudly.
         #
         # Worth knowing when it next trips: `du` rounds every file to a 4 KiB block, so a
         # crate of forty small source files carries roughly 150 KiB of slack and a single
         # new file costs 4 KiB whatever it contains. Trimming prose does not move this
         # number; adding or removing files does.
+        #
+        # 2048 because 1856 was chosen the way every number before it was chosen — to fit
+        # the tree in front of me — and `main` crossed it four KiB later, one `du` block,
+        # on the merge after the one that set it. This is the fourth time this gate has
+        # gone red for that reason. The budget exists to catch a vendored dependency
+        # arriving in hundreds of KiB, not to fail on the next source file, so it is set
+        # with room to be wrong about the next few files rather than exactly right about
+        # today's.
+        #
+        # 1856 after the canonical-state work and the bounded-validation branch: `keyframe_delta_states_json` and the
+        # order-independent summary it now produces, the exact-aggregate arithmetic that
+        # replaced summation order as a source of divergence, and two test files
+        # (`tests/encode.rs`, `tests/keyframe_delta.rs`) that pin them. `main` alone measures
+        # 1412 and the open queue merged measures 1468; #270's bounded indexed validation
+        # takes it to 1832, and that branch sets this same number, so they agree here rather
+        # than conflicting on one line.
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
+          [ "$size_kb" -le 2048 ] || { echo "::error::rust is ${size_kb} KiB, over the 2048 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 704 KB
+      - name: TypeScript sources under 1216 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -72,11 +137,44 @@ jobs:
         # the two record parsers, the membership attribute, the canonical states and their
         # unit tests. 640 was the exact measured size, which is a budget with no headroom
         # left — the next file would have tripped it whatever it contained.
+        # Raised from 704 to 768 KiB for full keyframe-delta reconstruction: SH composition,
+        # streamed-prefix recovery, indexed-chain checks and the hostile-input tests that pin them.
+        # Raised from 704 to 768 KiB for the `4dgs` command-line tool: the record walk,
+        # the structural validator and the tests that drive both. Measured 740 KiB, so
+        # this is not headroom being taken speculatively — 680 against 704 left six
+        # filesystem blocks, and a tool is four files before it does anything. The Rust
+        # budget went 500 -> 600 for exactly this, when its `4dgs` tool became a third
+        # crate; that raise is the precedent this one follows.
+        # Raised from 768 to 832 KiB for the review findings on that tool: the Quantization
+        # record's appended SH bit depths, which core did not parse and so no validator here
+        # could check; the provenance and object-layer records the validator now parses for
+        # the cross-record rules `scene.ts` already enforces; four normative checks (§4 the
+        # Footer is last, §4.2 reserved Header flags, §4.5 the summary's composition, §5.8
+        # an index entry framing a whole record); and the seven tests that pin them. That
+        # measured 768 against 768 — the exact cap, which is the same no-headroom position
+        # 640 was in before the object layer raised it.
+        # Raised from 832 to 896 KiB for validator parity review: streamed live-count
+        # checks, timeline coverage outside the decode gate, Delta Chunk SH validation,
+        # summary/depth diagnostics, and the regressions that pin those rules. The prior
+        # review pass already measured 848 KiB against 832 before these follow-ups.
+        # Raised from 896 to 960 KiB after that same review layer measured 900 KiB in CI,
+        # before its final four bounded-validation fixes. Those fixes add no source file;
+        # the completed layer measures 904 KiB, leaving the usual deliberate headroom.
+        # Raised from 960 to 1024 KiB after the validator layer was restacked onto the
+        # current core: CI measures 988 KiB, still source-only and below the next 64 KiB
+        # boundary. The increase is implementation and regression coverage, not vendoring.
+        # Raised from 1024 to 1152 KiB where this branch met main. Both sides had raised this
+        # same budget for different layers — main 768 -> 896 for the keyframe-delta encoder
+        # (sequence writer, gate fixtures and tests, 872 KiB on their own), this branch
+        # 960 -> 1024 for the validator (988 KiB on its own) — and the higher of the two is
+        # not enough, because the two layers are additive rather than alternative: merged,
+        # they measure 1096 KiB. 1152 is the next 64 KiB step and leaves 56 KiB, which is the
+        # same deliberate headroom the raises above took rather than an exact-size assertion.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 704 ] || { echo "::error::typescript is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
-      - name: Dart sources under 608 KB
+          [ "$size_kb" -le 1216 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1216 KiB budget"; exit 1; }
+      - name: Dart sources under 1536 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -97,17 +195,102 @@ jobs:
         # three quarters of it the tests. The headroom is deliberate and will be spent:
         # the rest of the hostile-input suite is still to be ported here, which is what
         # lets a consumer drop a vendored copy of this decoder for the package.
+        # Raised from 608 to 768 KiB for example/main.dart, the last thing pana was
+        # scoring the package on — 150/160 to 160/160 — and for the hostile-input and
+        # writer work still landing on other branches. One 5 KiB file took the tree to
+        # 612 against a cap of 608, because `du` rounds every file to a 4 KiB block and
+        # a new directory costs a block of its own before its contents. 768 rather than
+        # the next step up from 608 because two other branches have already raised this
+        # same number — feat/dart-resource-bounds took it 608 to 704 for the resource
+        # ceilings, and the writer stack took it 704 to 768 — so all three agreeing makes
+        # the merge a no-op instead of three-way arithmetic. The number is coordinated,
+        # not guessed.
+        # Raised from 768 to 832 KiB when the completed single-chunk writer measured 776
+        # KiB in a clean checkout. Its bounded streaming sink, identity lanes, fidelity
+        # gate and regressions are the feature this layer claims; 768 was therefore eight
+        # KiB below the source already under review. The next 64 KiB step leaves 56 KiB of
+        # headroom instead of turning the budget into an exact-size assertion again.
+        # Raised from 832 to 960 KiB for the completed chunked writer and the rebased writer
+        # stack. Its interval tree, reconstructed-support planning, selective-seek proofs and
+        # regressions take the clean tree to 916 KiB; the next 64 KiB step leaves 44 KiB of
+        # headroom while keeping the budget tied to the feature this layer adds.
+        # Raised from 896 to 960 KiB because main is already over it: #174 landed the Dart
+        # refusal diagnostics after #173 set this number, taking a clean tree to 932, and
+        # `size-budget` has been failing on main since. Not this branch's growth — it adds
+        # no Dart — but every PR that merges main inherits the red job.
+        # Raised from 896 to 1024 KiB for keyframe-delta encode: the sequence writer, its
+        # lane-by-lane verification, the unit suite, and the conformance sequence runner.
+        # Raised from 1024 to 1088 KiB after review completed bounded composition and the
+        # sequence regressions. The final pre-restack tree measured 1040 KiB; the next
+        # 64 KiB step leaves 48 KiB of headroom while keeping the vendoring tripwire tight.
+        # Raised from 1088 to 1152 KiB when the SH layer below came up the stack: the
+        # merged tree measures 1108, and 1088 was set before that layer was in it. The
+        # next 64 KiB step, 44 KiB of headroom.
+        # Raised to 1472 KiB by this tool's own review rounds: the validator
+        # reads records by range instead of holding the file, the band and chain checks
+        # are shared by both temporal models, every physically framed record proves its
+        # own structure, and retained findings and index entries carry ceilings. Over
+        # half the added source is hostile-input regressions. The earlier spelling of
+        # this chain here counted from 768 and 832, which were this branch's guesses at
+        # where main would be; main has since landed 832, 896 and 960, so the raise is
+        # stated from where main actually is. The merged tree measures 1224 KiB, so 1280
+        # is the step that holds it. Restated again once #198's encode layer landed on
+        # main: the merged tree is 1404 KiB, and the next step up from there, 1408, would
+        # leave four KiB — an exact-size assertion in all but name, which the raises above
+        # exist not to be. 1472 leaves 68.
+        # Raised to 1536 KiB by the §4 duplicate-record refusal: the tree measures 1476,
+        # which is four KiB past the old ceiling — the same too-tight margin the previous
+        # raise called out and declined to repeat. The added source is the refusal, its
+        # four splice tests, and the changelog entry. 1536 is the next 64 KiB step and
+        # leaves 60.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 608 ] || { echo "::error::dart is ${size_kb} KiB, over the 608 KiB budget"; exit 1; }
-      - name: Swift sources under 300 KB
+          [ "$size_kb" -le 1536 ] || { echo "::error::dart is ${size_kb} KiB, over the 1536 KiB budget"; exit 1; }
+      - name: C++ sources under 896 KB
+        # New, and the reason it is new is worth stating: every other SDK has had a
+        # sub-budget here for some time and C++ never did, so the whole-tree gate above was
+        # the only thing that would have caught it growing — which is the gate that cannot
+        # say which language grew. A vendored dependency landing in `cpp/` would have been
+        # a whole-tree failure somebody had to bisect by hand.
+        #
+        # Sources only, same as every budget beside it: this job builds nothing, so
+        # `cpp/build` is not here to measure. 704 rather than the measured 608 for the
+        # reason the raises above take a step rather than an exact size — the number exists
+        # to catch a vendored dependency, which arrives in hundreds of KiB, not to fail on
+        # the next file. That 608 includes the keyframe-delta encode binding this budget
+        # arrives with (#122): the public surface, the seam on both backends, the
+        # conformance sequence runner and its gate script.
+        #
+        # 896 after the canonical-order round landed in both bindings (#250, #251). C++
+        # measured 708 against 704 and Swift landed exactly on 704 — the gate went red on
+        # `main` at the merge, not on either pull request, because each was measured
+        # against a `main` that did not yet have the other. Both are raised together and
+        # with room, for the reason the Rust budget above was: a number that fits the tree
+        # in front of you is wrong by the merge after next.
+        run: |
+          size_kb=$(du -s cpp | cut -f1)
+          echo "cpp: ${size_kb} KiB"
+          [ "$size_kb" -le 896 ] || { echo "::error::cpp is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
+      - name: Swift sources under 896 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
+        # Raised from 300 to 448 KiB for `4dgs`, the inspect-and-validate tool: the
+        # framing walk and refusal placement, the two commands, the three-line executable
+        # and the corpus-driven tests. `du` rounds every file to a 4 KiB block and these
+        # are new files in new directories; 384 against 300 is not a rounding error.
+        # Raised to 640 KiB for its bounded physical-state validation and adversarial tests;
+        # those checks take Swift to 556 KiB under the same block-counting command.
+        # Raised from 640 to 704 KiB for keyframe-delta encode: the writer's public surface,
+        # the seam that carries a whole sample sequence across the C ABI, the unit suite, and
+        # the conformance sequence runner. Swift measures 676 KiB after them, so 704 is the
+        # next step that leaves 28 KiB — a budget with no headroom is an exact-size assertion
+        # in all but name, which the raises above exist not to be. What this gate is for is a
+        # vendored dependency appearing, not deliberate growth being noticed twice.
         run: |
           size_kb=$(du -s swift | cut -f1)
           echo "swift: ${size_kb} KiB"
-          [ "$size_kb" -le 300 ] || { echo "::error::swift is ${size_kb} KiB, over the 300 KiB budget"; exit 1; }
+          [ "$size_kb" -le 896 ] || { echo "::error::swift is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
 
   no-committed-binaries:
     # The corpus is generated. A committed .4dgs means someone bypassed the generator.
@@ -197,7 +380,8 @@ jobs:
       - run: npx --yes cspell@8 --config cspell.config.yaml "**/*.md"
 
   typescript:
-    name: ${{ matrix.os == 'ubuntu-latest' && 'typescript' || format('typescript ({0})', matrix.os) }}
+    name:
+      ${{ matrix.os == 'ubuntu-latest' && 'typescript' || format('typescript ({0})', matrix.os) }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -501,6 +685,15 @@ jobs:
           ctest --test-dir cpp/build-nocore --build-config "$FOURDGS_CMAKE_CONFIG" \
             --output-on-failure --timeout 120
 
+          # The package's public sentinel remains empty after configure_package_config_file;
+          # a directory path here would make a no-core install look linkable to consumers.
+          cmake --install cpp/build-nocore --prefix "$RUNNER_TEMP/fourdgs-nocore-install" \
+            --config "$FOURDGS_CMAKE_CONFIG"
+          cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-nocore-consumer" \
+            -DFOURDGS_USE_INSTALLED_PACKAGE=ON \
+            -DFOURDGS_EXPECT_NO_CORE_PACKAGE=ON \
+            -Dfourdgs-cpp_DIR="$RUNNER_TEMP/fourdgs-nocore-install/lib/cmake/fourdgs-cpp"
+
       - name: Build and test against the core
         run: |
           cargo build -p fourdgs --release
@@ -509,10 +702,250 @@ jobs:
           ctest --test-dir cpp/build --build-config "$FOURDGS_CMAKE_CONFIG" \
             --output-on-failure --timeout 120
 
+      # Every other source-build leg configures into $RUNNER_TEMP, outside the repository —
+      # which is exactly the layout that cannot see this. Cargo resolves a workspace by
+      # walking up from the manifest CMake stages, so a build directory *inside* the
+      # repository finds the root `Cargo.toml` and refuses the staged crate as a member it
+      # is not. `cpp/build` and `cpp/build-nocore` above are in-repo, cpp/README.md tells a
+      # reader to use `cpp/build`, and neither of those builds the core from source. This
+      # step is the one that does both, so the case cannot go untested again.
+      - name: An in-repo build directory builds the core from source
+        run: |
+          cmake -S cpp -B cpp/build-source \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON
+          cmake --build cpp/build-source --config "$FOURDGS_CMAKE_CONFIG" -j
+          ctest --test-dir cpp/build-source --build-config "$FOURDGS_CMAKE_CONFIG" \
+            --output-on-failure --timeout 120
+
       - name: The example runs, so it cannot rot into a snippet that no longer works
         run: |
           ./cpp/build/examples/decode_summary \
             tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio.4dgs
+
+      # A clean FetchContent checkout has the committed header and no target/ directory.
+      # This is the consumer #150 is about: CMake must drive Cargo itself, link the generated
+      # static core, and run across the ABI without an earlier repository build leaking in.
+      - name: A fresh out-of-tree consumer builds and links the core
+        run: |
+          git update-ref refs/heads/cmake-consumer-test HEAD
+          consumer_config="$FOURDGS_CMAKE_CONFIG"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # The source-built Rust archive always uses /MD. Exercise a normal Debug
+            # consumer here so the target's exported /MD requirement, rather than this
+            # workflow's top-level Release workaround, proves the CRTs agree.
+            consumer_config=Debug
+          fi
+
+          # Top-level repository builds permit the no-core development configuration by
+          # default. An explicit source-build request must override that permissive fallback
+          # without requiring a second, non-obvious ALLOW_NO_CORE=OFF switch.
+          cmake -S cpp -B "$RUNNER_TEMP/fourdgs-top-level-source-opt-in" \
+            -DCMAKE_BUILD_TYPE="$consumer_config" \
+            -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON \
+            -DFOURDGS_BUILD_TESTS=OFF \
+            -DFOURDGS_BUILD_CONFORMANCE=OFF
+
+          cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-consumer" \
+            -DCMAKE_BUILD_TYPE="$consumer_config" \
+            -DFOURDGS_GIT_REPOSITORY="file://$GITHUB_WORKSPACE" \
+            -DFOURDGS_GIT_TAG=cmake-consumer-test
+          cmake --build "$RUNNER_TEMP/fourdgs-consumer" \
+            --config "$consumer_config" -j
+          ctest --test-dir "$RUNNER_TEMP/fourdgs-consumer" \
+            --build-config "$consumer_config" --output-on-failure
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Visual Studio can target another architecture on the same OS without
+            # setting CMAKE_CROSSCOMPILING. The source build must not quietly keep
+            # Cargo's x64 host archive for an ARM64 C++ link.
+            architecture_log="$RUNNER_TEMP/fourdgs-vs-arm64-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-vs-arm64-no-target" \
+              -A ARM64 \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$architecture_log" 2>&1; then
+              cat "$architecture_log"
+              echo "::error::Visual Studio ARM64 configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$architecture_log"
+            grep -q FOURDGS_CARGO_TARGET "$architecture_log"
+
+            # Artifact naming and link compatibility follow the Rust target ABI, not just
+            # the C++ compiler. A GNU Rust target under MSVC must be refused at configure
+            # time instead of waiting for Cargo to emit libfourdgs.a where CMake expected
+            # fourdgs.lib (the reciprocal MinGW/MSVC-host case follows the same check).
+            abi_log="$RUNNER_TEMP/fourdgs-msvc-gnu-rust-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-msvc-gnu-rust-target" \
+              -DFOURDGS_CARGO_TARGET=x86_64-pc-windows-gnu \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$abi_log" 2>&1; then
+              cat "$abi_log"
+              echo "::error::MSVC configured with a GNU Rust target"
+              exit 1
+            fi
+            cat "$abi_log"
+            grep -q 'MSVC C++ ABI cannot link the Rust target x86_64-pc-windows-gnu' "$abi_log"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            # CMAKE_OSX_ARCHITECTURES likewise does not make CMAKE_CROSSCOMPILING true.
+            # A selected thin architecture requires an explicit matching Rust triple.
+            architecture_log="$RUNNER_TEMP/fourdgs-macos-arm64-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-macos-arm64-no-target" \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$architecture_log" 2>&1; then
+              cat "$architecture_log"
+              echo "::error::macOS arm64 configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$architecture_log"
+            grep -q FOURDGS_CARGO_TARGET "$architecture_log"
+
+            # One Cargo target produces a thin archive. Even an explicit triple cannot
+            # satisfy a universal C++ build; require a pre-combined core instead.
+            universal_log="$RUNNER_TEMP/fourdgs-macos-universal.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-macos-universal" \
+              -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64' \
+              -DFOURDGS_CARGO_TARGET=aarch64-apple-darwin \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$universal_log" 2>&1; then
+              cat "$universal_log"
+              echo "::error::a universal macOS build accepted one thin Rust target"
+              exit 1
+            fi
+            cat "$universal_log"
+            grep -q 'cannot produce one universal Rust archive' "$universal_log"
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            # Reproduce the common mixed Windows-toolchain installation without needing
+            # a Windows linker: Clang's GNU Windows target makes CMake select the MinGW ABI,
+            # and static-library try-compiles are enough for configuration. Cargo's MSVC
+            # host target must be rejected before its differently named archive is built.
+            mingw_abi_log="$RUNNER_TEMP/fourdgs-mingw-msvc-rust-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-mingw-msvc-rust-target" \
+              -DCMAKE_SYSTEM_NAME=Windows \
+              -DCMAKE_CXX_COMPILER=clang++ \
+              -DCMAKE_CXX_COMPILER_TARGET=x86_64-w64-windows-gnu \
+              -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+              -DFOURDGS_CARGO_TARGET=x86_64-pc-windows-msvc \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$mingw_abi_log" 2>&1; then
+              cat "$mingw_abi_log"
+              echo "::error::MinGW configured with an MSVC Rust target"
+              exit 1
+            fi
+            cat "$mingw_abi_log"
+            grep -q 'GNU Windows C++ ABI cannot link the Rust target x86_64-pc-windows-msvc' \
+              "$mingw_abi_log"
+
+            # A package manager may expose fetched dependencies read-only. Cargo normally
+            # creates an uncommitted library lockfile beside a workspace manifest, so this
+            # proves the integration stages its Cargo project in the writable build tree
+            # and leaves the source checkout untouched.
+            readonly_source="$RUNNER_TEMP/fourdgs-read-only-source"
+            mkdir -p "$readonly_source"
+            git archive HEAD | tar -x -C "$readonly_source"
+            chmod -R a-w "$readonly_source"
+            cmake -S "$readonly_source/cpp" -B "$RUNNER_TEMP/fourdgs-read-only-build" \
+              -DCMAKE_BUILD_TYPE="$consumer_config" \
+              -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON \
+              -DFOURDGS_BUILD_TESTS=OFF \
+              -DFOURDGS_BUILD_CONFORMANCE=OFF
+            cmake --build "$RUNNER_TEMP/fourdgs-read-only-build" --target fourdgs-cpp -j
+            test ! -e "$readonly_source/Cargo.lock"
+
+            # Compiler modes such as -m32 change the target ABI without setting any of
+            # CMake's target selectors. Static-library try-compiles let CMake detect the
+            # 32-bit pointer width without requiring multilib runtime libraries merely to
+            # exercise this configure-time refusal.
+            if [ "$RUNNER_ARCH" = "X64" ]; then
+              multilib_log="$RUNNER_TEMP/fourdgs-m32-no-cargo-target.log"
+              if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-m32-no-cargo-target" \
+                -DCMAKE_CXX_FLAGS=-m32 \
+                -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+                -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$multilib_log" 2>&1; then
+                cat "$multilib_log"
+                echo "::error::-m32 configured with Cargo's 64-bit host target"
+                exit 1
+              fi
+              cat "$multilib_log"
+              grep -q '4-byte pointer ABI' "$multilib_log"
+              grep -q FOURDGS_CARGO_TARGET "$multilib_log"
+            fi
+
+            # Clang toolchains can select a target through the compiler driver while
+            # leaving CMAKE_CROSSCOMPILING false. The explicit compiler target is still
+            # independent of Cargo's host and therefore requires the matching Rust triple.
+            compiler_target_log="$RUNNER_TEMP/fourdgs-compiler-target-no-cargo-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-compiler-target-no-cargo-target" \
+              -DCMAKE_CXX_COMPILER_TARGET=aarch64-unknown-linux-gnu \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$compiler_target_log" 2>&1; then
+              cat "$compiler_target_log"
+              echo "::error::CMAKE_CXX_COMPILER_TARGET configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$compiler_target_log"
+            grep -q CMAKE_CXX_COMPILER_TARGET "$compiler_target_log"
+            grep -q FOURDGS_CARGO_TARGET "$compiler_target_log"
+
+            # A CMake toolchain changes the target independently of Cargo's host. Without
+            # an explicit Rust triple this must stop at configure time, before producing
+            # a host archive that fails much later in the cross-linker.
+            cross_log="$RUNNER_TEMP/fourdgs-cross-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-cross-no-target" \
+              -DCMAKE_SYSTEM_NAME=Linux \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$cross_log" 2>&1; then
+              cat "$cross_log"
+              echo "::error::cross-compiling without FOURDGS_CARGO_TARGET configured"
+              exit 1
+            fi
+            cat "$cross_log"
+            grep -q FOURDGS_CARGO_TARGET "$cross_log"
+          fi
+
+      # Exercise the package that `cmake --install` actually emits. An absolute libdir is
+      # intentional: packagers use one, and configure_package_config_file must not prefix
+      # it a second time. Running the consumer also proves the installed static link order,
+      # including the Rust archive before its native runtime libraries on Linux.
+      - name: An installed package is linkable with an absolute libdir
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            core="$GITHUB_WORKSPACE/target/release/fourdgs.lib"
+          else
+            core="$GITHUB_WORKSPACE/target/release/libfourdgs.a"
+          fi
+          install_root="$RUNNER_TEMP/fourdgs-install"
+          install_libdir="$install_root/lib"
+          consumer_generator=()
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # A colon is a legal POSIX filename character, while CMake normalizes a
+            # backslash to its portable path separator in the generated install script.
+            # The installed config must preserve the colon and name that same effective
+            # slash-normalized destination instead of emitting an invalid escape.
+            install_libdir="$RUNNER_TEMP/fourdgs:install\\path/lib"
+            consumer_generator=(-G Ninja)
+
+            # Prebuilt archives are commonly selected through a stable relative symlink.
+            # Installing only that link would leave it dangling in the relocated package;
+            # the install must carry the real archive bytes instead.
+            symlink_core="$RUNNER_TEMP/fourdgs-symlink-core"
+            mkdir -p "$symlink_core/actual"
+            cp "$core" "$symlink_core/actual/libfourdgs.a"
+            ln -s actual/libfourdgs.a "$symlink_core/libfourdgs.a"
+            core="$symlink_core/libfourdgs.a"
+          fi
+          cmake -S cpp -B "$RUNNER_TEMP/fourdgs-package" \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DCMAKE_INSTALL_PREFIX="$install_root" \
+            -DCMAKE_INSTALL_LIBDIR="$install_libdir" \
+            -DFOURDGS_CORE_LIBRARY="$core"
+          cmake --build "$RUNNER_TEMP/fourdgs-package" \
+            --config "$FOURDGS_CMAKE_CONFIG" -j
+          cmake --install "$RUNNER_TEMP/fourdgs-package" \
+            --config "$FOURDGS_CMAKE_CONFIG"
+          cmake "${consumer_generator[@]}" \
+            -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DFOURDGS_USE_INSTALLED_PACKAGE=ON \
+            -Dfourdgs-cpp_DIR="$install_libdir/cmake/fourdgs-cpp"
+          cmake --build "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            --config "$FOURDGS_CMAKE_CONFIG" -j
+          ctest --test-dir "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            --build-config "$FOURDGS_CMAKE_CONFIG" --output-on-failure
 
       # The binding owns handles that come from across an FFI boundary, so a leak and a read
       # past the end of a buffer the ABI handed over are the two bugs it is exposed to. The
@@ -537,6 +970,18 @@ jobs:
           for f in tests/conformance/data/*.4dgs; do
             ./cpp/build-asan/conformance/decode_streamed "$f" > /dev/null || {
               [ "$?" -eq 99 ] && { echo "::error::sanitizer report decoding $f"; exit 1; }
+            }
+          done
+          # The encode side owns two things across the boundary the decode side does not: a
+          # writer handle and the buffer the ABI hands back, both of which the binding frees
+          # itself. The keyframe-delta runner stages seventeen samples through one writer and
+          # encodes twice, so a leak on either shows up here rather than in whatever process
+          # first authors a long sequence.
+          mkdir -p "$RUNNER_TEMP/asan-kd"
+          for shape in chained keyframe cadence-one; do
+            ./cpp/build-asan/conformance/encode_keyframe_delta "$RUNNER_TEMP/asan-kd" "$shape" \
+              > /dev/null || {
+              [ "$?" -eq 99 ] && { echo "::error::sanitizer report encoding $shape"; exit 1; }
             }
           done
         env:
@@ -593,7 +1038,31 @@ jobs:
           cd ../conformance && dart analyze --fatal-infos
 
       - name: Tests
-        run: cd dart/fourdgs && dart test
+        run: |
+          cd dart/fourdgs && dart test
+          cd ../conformance && dart test
+
+      # The gate whose absence shipped 0.1.0 unable to build for the web. `dart test` runs on
+      # the VM, where an `int` is a real 64-bit integer; a JavaScript number is not, so a
+      # 64-bit literal anywhere in the compile graph is a dart2js error that no VM test can
+      # produce. 0.1.0 carried three, in the writer's Morton masks, and the umbrella library
+      # exported the writer — so a browser app that only ever READ `.4dgs` could not be
+      # built at all, and nothing here noticed until a consumer did.
+      #
+      # The probe imports the umbrella and nothing else. What it proves is not what the
+      # decoder computes but that the read path compiles for the web at all.
+      #
+      # This gate outlives the bug that prompted it. Moving the encoder to its own library
+      # fixed one instance; a 64-bit literal landing in any file the umbrella exports — a
+      # reader optimisation reaching for Morton codes would do it — is the same failure
+      # again, and only this step would catch it.
+      #
+      # Confirm it can fail before trusting it: re-add `export 'src/writer.dart';` to
+      # lib/fourdgs.dart and this step reports the three literals. A gate nobody has
+      # watched fail is a gate nobody should believe.
+      - name: The read path compiles for the web
+        if: matrix.os == 'ubuntu-latest'
+        run: cd dart/conformance && dart compile js -o "$RUNNER_TEMP/web_read_probe.js" bin/web_read_probe.dart
 
       # The one gate that would otherwise be discovered on release day. It is cheap, it
       # needs no credentials, and a package that cannot be packed is a package whose first
@@ -641,7 +1110,9 @@ jobs:
             ~/.cargo/bin
             ~/.cargo/registry
             ~/.rustup
-          key: rust-toolchain-stable-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
+          key:
+            rust-toolchain-stable-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml')
+            }}
       - name: Cache the core's build
         uses: actions/cache@v6
         with:
@@ -673,17 +1144,34 @@ jobs:
       # the shared one. That is fine — but then everything that runs needs it on the
       # loader's path too, which is what LD_LIBRARY_PATH is for. Apple platforms link the
       # staticlib and need no equivalent.
+      #
+      # No --package-path: the manifest is Package.swift at the repository root, because
+      # SwiftPM looks for it at the top of whatever it clones and a manifest under swift/
+      # cannot be depended on by URL. --scratch-path puts the build products back under
+      # swift/ anyway — tests/conformance/run.py looks for the runners in
+      # swift/.build/release, and SwiftPM's scratch directory is Swift's, not the root's.
       - name: Build
-        run: swift build --package-path swift -Xlinker -L$PWD/target/release
+        run: swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
+      # `4dgs`'s tests are driven by the generated corpus: seven invalid variants, each with
+      # the refusal identifier a reader must produce committed beside it. The corpus has to
+      # exist before the suite runs, because a validator checked against fixtures its own
+      # author wrote proves only that the author was consistent — and a suite that skipped
+      # itself here would be green for exactly that reason.
+      - name: Generate the conformance corpus
+        run: |
+          python3 -m pip install --break-system-packages -e ./python/fourdgs >/dev/null
+          python3 tests/conformance/generate.py >/dev/null
       - name: Tests
-        run: LD_LIBRARY_PATH=$PWD/target/release swift test --package-path swift -Xlinker -L$PWD/target/release
+        run:
+          LD_LIBRARY_PATH=$PWD/target/release swift test --scratch-path swift/.build -Xlinker
+          -L$PWD/target/release
 
       # The canonical JSON is a contract between languages, and this is where Swift's half
       # of it is checked — against canonical.py, on a synthetic scene, with no decoding in
       # the way. It means a conformance mismatch is about the decode and nothing else.
       - name: Canonical JSON agrees with canonical.py
         run: |
-          LD_LIBRARY_PATH=$PWD/target/release swift run --package-path swift \
+          LD_LIBRARY_PATH=$PWD/target/release swift run --scratch-path swift/.build \
             -Xlinker -L$PWD/target/release canonical_selftest > /tmp/swift.json
           python3 swift/conformance/selftest.py --compare /tmp/swift.json
 
@@ -696,7 +1184,7 @@ jobs:
         run: |
           python3 -m pip install --break-system-packages -e ./python/fourdgs >/dev/null
           python3 tests/conformance/generate.py >/dev/null
-          swift build --package-path swift --configuration release -Xlinker -L$PWD/target/release
+          swift build --scratch-path swift/.build --configuration release -Xlinker -L$PWD/target/release
           variant=$(ls tests/conformance/data/*UseChunkIndex*.4dgs | head -1)
           echo "decoding $variant"
           export LD_LIBRARY_PATH=$PWD/target/release
@@ -730,17 +1218,17 @@ jobs:
           cargo build -p fourdgs --release --target aarch64-apple-visionos
           cargo build -p fourdgs --release --target aarch64-apple-ios
       - name: Build for macOS
-        run: swift build --package-path swift -Xlinker -L$PWD/target/release
+        run: swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
       - name: Build for visionOS and iOS
+        # xcodebuild resolves the package from the working directory, which is the
+        # repository root now that the manifest lives there — there is nothing to cd into.
         run: |
           set -e
-          root="$PWD"
-          cd swift
           for spec in "visionOS aarch64-apple-visionos" "iOS aarch64-apple-ios"; do
             set -- $spec
             echo "::group::$1"
             xcodebuild -scheme FourDGS -destination "generic/platform=$1" \
               -skipPackagePluginValidation \
-              OTHER_LDFLAGS="-L$root/target/$2/release" build | tail -5
+              OTHER_LDFLAGS="-L$PWD/target/$2/release" build | tail -5
             echo "::endgroup::"
           done

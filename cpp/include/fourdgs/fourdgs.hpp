@@ -23,7 +23,9 @@
 
 namespace fourdgs {
 
-/// This package's version, `"0.0.0"` while the binding is a skeleton.
+/// This package's version — the same number `project(fourdgs-cpp VERSION ...)` declares and
+/// the installed `fourdgs-cpp-config-version.cmake` answers `find_package` with, so what an
+/// application reports at run time and what its build resolved cannot disagree.
 const char* version() noexcept;
 
 /// The version string the linked core reports, or `nullptr` when no core is linked.

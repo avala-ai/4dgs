@@ -11,12 +11,13 @@
  */
 
 import { Cursor } from "./cursor.js";
-import { MalformedFile, TruncatedFile, UnsupportedVersion } from "./errors.js";
+import { MalformedFile, Refusal, TruncatedFile, UnsupportedVersion } from "./errors.js";
 import {
   AUDIO_SOURCE_FLAG_LOOP,
   AUDIO_SOURCE_FLAG_SPATIAL,
   HEADER_FLAG_HAS_AUDIO,
 } from "./opcodes.js";
+import { SH_MAX_BITS, SH_MIN_BITS } from "./sh.js";
 
 /**
  * `0x89 4 D G S 1 CR LF`.
@@ -28,6 +29,9 @@ export const MAGIC = new Uint8Array([0x89, 0x34, 0x44, 0x47, 0x53, 0x31, 0x0d, 0
 
 /** The major version this reader implements. */
 export const VERSION = 1;
+
+/** Where the major version sits in the magic. Every other byte is a fixed sentinel. */
+const VERSION_AT = 5;
 
 /** `u8` opcode plus `u64` content length. */
 export const RECORD_HEADER_BYTES = 9;
@@ -65,15 +69,24 @@ export function checkMagic(head: Uint8Array): void {
   }
   const found = head.subarray(0, MAGIC.length);
   if (bytesEqual(found, MAGIC)) return;
+  // Told apart by whether the version byte is the ONLY difference: every other byte of
+  // the magic is a fixed sentinel, so a file that differs elsewhere is not a 4dgs file
+  // whatever its version byte happens to say. Testing only `found[1..5] === "4DGS"` — as
+  // this did — reported a corrupted first byte as an unsupported version 1, which sends
+  // its holder looking for a newer reader that would not have helped. Nothing in the
+  // valid corpus can reach this, which is why it survived until the invalid corpus asked.
   const isFourdgs =
-    found[1] === 0x34 && found[2] === 0x44 && found[3] === 0x47 && found[4] === 0x53;
+    bytesEqual(found.subarray(0, VERSION_AT), MAGIC.subarray(0, VERSION_AT)) &&
+    bytesEqual(found.subarray(VERSION_AT + 1), MAGIC.subarray(VERSION_AT + 1));
   if (isFourdgs) {
     throw new UnsupportedVersion(
-      `4dgs major version ${String.fromCharCode(found[5]!)} is not supported by this reader`,
+      `4dgs major version ${String.fromCharCode(found[VERSION_AT]!)} is not supported by this reader`,
+      { refusalCode: Refusal.UnsupportedMajorVersion },
     );
   }
   throw new UnsupportedVersion(
     `not a 4dgs file: magic is ${Array.from(found, (b) => b.toString(16).padStart(2, "0")).join(" ")}`,
+    { refusalCode: Refusal.MagicMismatch },
   );
 }
 
@@ -179,6 +192,16 @@ export interface Quantization {
   readonly stepSh: number;
   /** Declared maximum deviation per attribute, as the decimal strings the file carries. */
   readonly bounds: ReadonlyMap<string, string>;
+  /**
+   * Per-band spherical harmonic bit depths, band 1 first, or empty.
+   *
+   * Appended after the record's original fields, so a file that declares none is
+   * byte-identical to one written before the field existed — an empty list is written as
+   * no bytes at all, not as a zero count.
+   */
+  readonly shBitDepths: readonly number[];
+  /** True when appended bytes look like an SH depth list but do not frame a legal one. */
+  readonly shBitDepthsMalformed: boolean;
 }
 
 export function parseQuantization(content: Uint8Array): Quantization {
@@ -186,6 +209,9 @@ export function parseQuantization(content: Uint8Array): Quantization {
   const scheme = c.string();
   const posOrigin = c.f64s(3);
   const steps = c.f64s(8);
+  const stepSh = c.u8();
+  const bounds = c.stringMap();
+  const parsedDepths = shBitDepths(c);
   const quantization: Quantization = {
     scheme,
     posOrigin,
@@ -197,8 +223,10 @@ export function parseQuantization(content: Uint8Array): Quantization {
     stepMotion: steps[5]!,
     stepTime: steps[6]!,
     stepSigmaLog: steps[7]!,
-    stepSh: c.u8(),
-    bounds: c.stringMap(),
+    stepSh,
+    bounds,
+    shBitDepths: parsedDepths.values,
+    shBitDepthsMalformed: parsedDepths.malformed,
   };
   // `object_id` is an exact label (spec section 6.6), not a metric value, so there is no
   // meaningful error bound between two different labels — section 6.5 makes a bound for it
@@ -211,6 +239,41 @@ export function parseQuantization(content: Uint8Array): Quantization {
     );
   }
   return quantization;
+}
+
+/**
+ * Read the appended per-band SH bit depths, or nothing.
+ *
+ * Deliberately tolerant, exactly as the Python and Rust readers are. Appended fields are
+ * positional, so anything sitting after the bounds map lands where this field is —
+ * including bytes a *different* newer writer appended, or the arbitrary trailer a
+ * forward-compatibility fixture puts there. The declaration describes encoding that
+ * already happened and no decoded value depends on it, so a count the record is too short
+ * for, or a depth outside the legal range, is read as "this file declares none" rather
+ * than as a corrupt file (spec §5.3).
+ */
+function shBitDepths(c: Cursor): {
+  readonly values: readonly number[];
+  readonly malformed: boolean;
+} {
+  if (c.remaining < 1) return { values: [], malformed: false };
+  const at = c.pos;
+  const count = c.u8();
+  if (count === 0) {
+    c.pos = at;
+    return { values: [], malformed: false };
+  }
+  if (c.remaining < count) {
+    c.pos = at;
+    return { values: [], malformed: true };
+  }
+  const depths: number[] = [];
+  for (let i = 0; i < count; i++) depths.push(c.u8());
+  if (depths.some((bits) => bits < SH_MIN_BITS || bits > SH_MAX_BITS)) {
+    c.pos = at;
+    return { values: [], malformed: true };
+  }
+  return { values: depths, malformed: false };
 }
 
 /** Validity windows, as `[lo, hi]` pairs flattened into one array. */
@@ -1288,6 +1351,16 @@ export function checkObjectTrack(track: ObjectTrack): void {
     throw new MalformedFile(
       "an ObjectTrack names object 0, which means background / unassigned; a track must move " +
         "an object that exists (section 5.15.7)",
+    );
+  }
+  // The streamed and indexed readers enforce this before allocating their
+  // sample arrays. A caller-authored track has to meet the same ceiling before
+  // validation walks the arrays or the writer materializes 64 bytes per row,
+  // otherwise this SDK can write a record it refuses to reopen.
+  if (track.times.length > MAX_TRAJECTORY_SAMPLES) {
+    throw new MalformedFile(
+      `ObjectTrack for object ${track.objectId} declares ${track.times.length} samples, past the ` +
+        `${MAX_TRAJECTORY_SAMPLES} ceiling`,
     );
   }
   // The trajectory rules iterate each array on its own, so they cannot see a track whose

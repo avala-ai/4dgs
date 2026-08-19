@@ -6,27 +6,52 @@
 This is what makes a third-party encoder possible: a way to find out *why* a file is
 wrong that does not involve reading someone else's decoder. Every finding names the
 record, the field and what was expected.
+
+Two things beyond the framing walk, because a validator that only walks the framing
+answers a narrower question than the one its holder asked:
+
+* **It decodes the chunks.** Walking the framing steps *over* a chunk by its declared
+  length, which is exactly not looking inside it — so an unimplemented stream codec and an
+  out-of-range window index were both invisible here, and both are in the invalid corpus.
+  One chunk is resident at a time (AGENTS.md §1), so validating a file larger than memory
+  still works.
+* **It knows `keyframe-delta`.** Every structural check below assumed the gaussian-birth
+  chunk shape, so a conforming keyframe-delta file came back with seven errors. The
+  Header's declared model now selects the reader, because refusing a file for declaring a
+  model this library implements was never a statement about the file.
+
+Findings that came from a refusal carry the refusal's identifier and the byte it fired at;
+see `refusal`. The finding line itself is unchanged, so it still reads word for word as
+the Rust validator's, which is what lets the two tools be diffed.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import FourdgsError
+from . import refusal
+from .exceptions import ExceedsReaderLimit, FourdgsError
 from .object_layer import ObjectLayer
 from .provenance import LENGTH_UNIT_METRES, Provenance
 from .quantization import sh_bound, sh_step
 from .readable import BytesReadable
-from .serialization import MAGIC, check_magic, crc32, iter_records
+from .refusal import Named, Site, Walk
+from .serialization import MAGIC, crc32, iter_records
 
 
 @dataclass
 class Finding:
     severity: str  # "error" | "warning" | "note"
     message: str
+    #: The refusal identifier and the byte it fired at, for the findings that have one.
+    #: Most do not: "Header declares 640 gaussians; chunks contain 256" is a rule this
+    #: validator checks itself, not a refusal a reader raised, and the refusal table does
+    #: not name it.
+    refusal: Named | None = None
 
     def __str__(self) -> str:
         return f"{self.severity}: {self.message}"
@@ -48,6 +73,21 @@ class Report:
 
     def note(self, msg: str) -> None:
         self.findings.append(Finding("note", msg))
+
+    def refused(
+        self,
+        prefix: str,
+        exc: FourdgsError,
+        where: Walk | None = None,
+        site: Site | None = None,
+    ) -> None:
+        """An error a reader raised, carrying its identifier and the byte if it has one.
+
+        `prefix` is what the message is introduced with, so the sentence stays the one the
+        other validators print; the identifier arrives separately and changes nothing
+        about it.
+        """
+        self.findings.append(Finding("error", f"{prefix}{exc}", refusal.describe(exc, where, site)))
 
 
 def _check_quantization_finite(quant: rec.Quantization, report: Report, ordinal: int = 0) -> None:
@@ -163,6 +203,47 @@ def _check_provenance(prov: Provenance, report: Report) -> None:
         )
 
 
+#: The whole of the spelling §5.3 allows a `bounds` value: an optional sign, ASCII digits with
+#: an optional point, and an optional exponent. Nothing surrounds it and nothing separates its
+#: digits.
+_BOUND = re.compile(r"([+-]?)(?:([0-9]+)(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?")
+
+
+def _decimal_equals_integer(value: str, expected: int) -> bool:
+    """Whether the §5.3 bound `value` spells exactly the non-negative integer `expected`.
+
+    Deliberately not `Decimal(value)`. This reference has to agree with the TypeScript, Rust
+    and Dart validators on every input, and `Decimal` accepts a far wider language than §5.3
+    — underscores anywhere, decimal digits from any script, Python's own whitespace set — and
+    refuses exponents outside a range that moves with the interpreter build. Matching the
+    grammar here is what makes the four agree, and comparing digit strings is what lets an
+    exponent of any length be read without building the number or touching binary64.
+    """
+    match = _BOUND.fullmatch(value)
+    if match is None:
+        return False
+    integer = match[2] or ""
+    digits = integer + (match[3] or match[4] or "")
+    first_nonzero = next((i for i, digit in enumerate(digits) if digit != "0"), None)
+    # A significand of zeroes is the value zero, at whatever exponent it carries.
+    if first_nonzero is None:
+        return expected == 0
+    if match[1] == "-":
+        return False
+    significant = digits[first_nonzero:].rstrip("0")
+    required = len(str(expected)) - len(integer) + first_nonzero
+    return significant == str(expected) and _decimal_integer_equals(match[5] or "0", required)
+
+
+def _decimal_integer_equals(value: str, expected: int) -> bool:
+    """Whether the signed digit string `value` is `expected`, without building the number."""
+    negative = value.startswith("-")
+    digits = (value[1:] if value.startswith(("+", "-")) else value).lstrip("0")
+    if not digits:
+        return expected == 0
+    return negative == (expected < 0) and digits == str(abs(expected))
+
+
 def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report) -> None:
     """The per-band SH bit depths, against the degree the Header declares (spec §6.5).
 
@@ -173,7 +254,11 @@ def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report
     """
     if not quant.sh_bit_depths or sh_degree <= 0:
         return
-    if len(quant.sh_bit_depths) != sh_degree:
+    # A degree the validator has already refused is not a number to measure a correct
+    # record against. Comparing the depth count with it produced a second error naming
+    # the Quantization record, which had done nothing wrong; the per-band bounds below
+    # are still worth checking, because each of those is about the depth itself.
+    if 0 <= sh_degree <= 3 and len(quant.sh_bit_depths) != sh_degree:
         report.error(
             f"Quantization declares {len(quant.sh_bit_depths)} SH bit depths; "
             f"the Header declares degree {sh_degree}, and there is one band per degree (§6.5)"
@@ -181,10 +266,10 @@ def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report
     for i, bits in enumerate(quant.sh_bit_depths[:sh_degree], start=1):
         key = f"sh_band{i}"
         declared = quant.bounds.get(key)
-        expected = str(sh_bound(bits))
+        expected = sh_bound(bits)
         if declared is None:
             report.warn(f"Quantization declares {bits} bits for SH band {i} but no `{key}` bound (§5.3)")
-        elif declared != expected:
+        elif not _decimal_equals_integer(declared, expected):
             report.warn(f"Quantization declares `{key}` as {declared}; {bits} bits gives a bound of {expected} (§6.5)")
     coarsest = max(sh_step(b) for b in quant.sh_bit_depths[:sh_degree])
     if quant.step_sh != coarsest:
@@ -196,23 +281,33 @@ def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report
 
 def validate(data: bytes) -> Report:
     report = Report()
+    # Framing first, and for two reasons: it refuses a file that is not ours before
+    # anything reads a byte as an opcode, and it is what gives every later refusal a byte
+    # to point at.
     try:
-        check_magic(data)
+        walk = refusal.walk(data, retain_records=False)
     except FourdgsError as exc:
-        report.error(str(exc))
+        report.refused("", exc)
         return report
 
     if not data.endswith(MAGIC):
         report.error("file does not end with the magic; it is truncated or was written by a broken encoder")
 
-    seen: list[int] = []
+    seen: set[int] = set()
+    first_opcode: int | None = None
     header = None
     quant = None
     quant_count = 0
     chunk_count = 0
     counted = 0
     index: list[rec.ChunkIndexEntry] = []
+    index_record_offsets: list[int] = []
+    #: Where every Chunk and Delta Chunk record sits, in file order — what the index is
+    #: checked against, and what says a Delta Chunk turned up in a file that declares a
+    #: model with no such record.
+    first_delta_offset: int | None = None
     footer = None
+    footer_offset: int | None = None
     provenance = Provenance()
     objects = ObjectLayer()
     audio_sources: dict[int, rec.AudioSource] = {}
@@ -221,9 +316,20 @@ def validate(data: bytes) -> Report:
 
     try:
         for record in iter_records(data, len(MAGIC)):
-            seen.append(record.opcode)
+            if first_opcode is None:
+                first_opcode = record.opcode
+            seen.add(record.opcode)
             if record.opcode == op.HEADER:
-                header = rec.Header.parse(record.content)
+                # Decoded, then checked, rather than parsed-or-raised. `Header.parse`
+                # refuses an out-of-range `sh_degree`, which is right for a reader and
+                # wrong here: this loop is the validator's only pass over the records,
+                # and letting that refusal out of it abandoned every finding after the
+                # first record — then reported "no Header record", "no Quantization
+                # record" and "no Footer record" about three records the file carries.
+                header = rec.Header.decode_fields(record.content)
+                problem = header.sh_degree_problem()
+                if problem is not None:
+                    report.error(problem)
             elif record.opcode == op.QUANTIZATION:
                 quant = rec.Quantization.parse(record.content)
                 # Checked here, as the record is met, rather than once at the end on
@@ -238,8 +344,13 @@ def validate(data: bytes) -> Report:
                 counted += head.count
                 if head.t1 < head.t0:
                     report.error(f"chunk {chunk_count} has t1 ({head.t1}) before t0 ({head.t0})")
+            elif record.opcode == op.DELTA_CHUNK:
+                first_chunk_seen = True
+                if first_delta_offset is None:
+                    first_delta_offset = record.offset
             elif record.opcode == op.CHUNK_INDEX:
                 index.append(rec.ChunkIndexEntry.parse(record.content))
+                index_record_offsets.append(record.offset)
             elif record.opcode == op.AUDIO_SOURCE:
                 source = rec.AudioSource.parse(record.content)
                 if first_chunk_seen:
@@ -294,6 +405,7 @@ def validate(data: bytes) -> Report:
                 audio_data[payload.source_id] = len(payload.data)
             elif record.opcode == op.FOOTER:
                 footer = rec.Footer.parse(record.content)
+                footer_offset = record.offset
             elif record.opcode == op.COORDINATE_FRAME:
                 provenance.frames.append(rec.CoordinateFrame.parse(record.content))
             elif record.opcode == op.SENSOR_CALIBRATION:
@@ -313,9 +425,15 @@ def validate(data: bytes) -> Report:
             elif record.opcode == op.OBJECT_TRACK:
                 objects.tracks.append(rec.ObjectTrack.parse(record.content))
             elif op.is_provenance(record.opcode):
+                # The reserved tail of the family, and only the tail: every branch above
+                # parses one of `0x20`-`0x25`, so a capture carrying frames, sensors, a rig
+                # and a georeference collects no notes here. The range named is the one
+                # that is actually still reserved — `0x24` and `0x25` were assigned to the
+                # object layer, and a note calling them reserved tells its reader that two
+                # records this library parses were skipped.
                 report.note(
                     f"reserved provenance record 0x{record.opcode:02X} — skipped, as required "
-                    f"(0x24-0x2F, section 5.15.6)"
+                    f"(0x26-0x2F, section 5.15.6)"
                 )
             elif op.is_private(record.opcode):
                 report.note(
@@ -329,14 +447,63 @@ def validate(data: bytes) -> Report:
     if not seen:
         report.error("no records at all")
         return report
-    if seen[0] != op.HEADER:
-        report.error(f"first record is {op.name(seen[0])}; the Header must come first")
+    if first_opcode != op.HEADER:
+        report.error(f"first record is {op.name(first_opcode)}; the Header must come first")
     if header is None:
         report.error("no Header record")
     if quant is None:
         report.error("no Quantization record")
     if footer is None:
         report.error("no Footer record")
+
+    # Select exactly the index records in the Footer-selected summary. Summary records
+    # are contiguous but not grouped by opcode: Statistics and Summary Offset records may
+    # sit between Chunk Index records, and the indexed reader walks the whole selected
+    # range. Keep this pass lazy just like the framing walk; retaining a Frame per record
+    # would let a hostile run of tiny records turn bounded framing into unbounded memory.
+    # Only meaningful when the Footer actually named a summary. A file with no Footer, or
+    # one whose `summary_start` is 0 -- the indexless file of §5.2 -- selects nothing, and
+    # reading that as "nothing is selected" is wrong twice over: it buries the real fault
+    # under one line per Chunk Index record, thousands of them on a real capture, and it
+    # empties `index` so every per-entry check below silently stops running on records that
+    # are still sitting there to be checked. The absent Footer is already reported above.
+    footer_selects_summary = False
+    selected_index_offsets: set[int] = set()
+    if footer is not None and footer_offset is not None and footer.summary_start:
+        footer_selects_summary = True
+        selected_start_seen = False
+        for frame in walk.intact_records():
+            if frame.offset < footer.summary_start:
+                continue
+            if frame.offset >= footer_offset:
+                break
+            if not selected_start_seen:
+                if frame.offset != footer.summary_start:
+                    break
+                selected_start_seen = True
+            if frame.opcode == op.CHUNK_INDEX:
+                selected_index_offsets.add(frame.offset)
+        if not selected_start_seen:
+            report.error(
+                f"the Footer's summary_start {footer.summary_start} does not name a complete summary record "
+                f"before the Footer at byte {footer_offset}"
+            )
+    # A Chunk Index record outside the range the Footer named — or present at all in a file
+    # whose Footer names no summary — is orphaned: nothing reaches it by seeking, and saying
+    # so is the point. A file with no Footer at all is the different case: there is no
+    # declaration for anything to be outside of, the real fault is the missing Footer and it
+    # is reported above, and adding a line per index record buries it.
+    if footer is not None:
+        for offset in index_record_offsets:
+            if offset not in selected_index_offsets:
+                report.error(f"the Chunk Index record at byte {offset} lies outside the Footer-selected summary index")
+    # Narrowed only when a summary was actually named. Otherwise the entries stay, because
+    # they are still there to be read: emptying the list silently stopped every per-entry
+    # check below from running on records whose own contents may be the fault.
+    if footer_selects_summary:
+        index = [
+            entry for offset, entry in zip(index_record_offsets, index, strict=True) if offset in selected_index_offsets
+        ]
 
     try:
         provenance.check()
@@ -348,7 +515,18 @@ def validate(data: bytes) -> Report:
     except FourdgsError as exc:
         report.error(str(exc))
 
-    if header is not None and counted != header.gaussian_count:
+    # Which chunk shape the rest of this validator is entitled to assume. A
+    # `keyframe-delta` file's Chunks are keyframes and its Delta Chunks are differences
+    # against them, so several checks below are about the gaussian-birth shape and about
+    # nothing else. Read from the Header rather than guessed from the records, because a
+    # file that carries Delta Chunks and does not say so is itself a fault.
+    keyframe_delta = header is not None and header.temporal_model == "keyframe-delta"
+
+    # `gaussian_count` counts distinct gaussians over the whole sequence under
+    # `keyframe-delta`, and every keyframe carries a full population — so the sum across
+    # chunks is a larger number by design, not a disagreement. Summing it anyway is what
+    # made this validator call a conforming keyframe-delta file invalid.
+    if header is not None and not keyframe_delta and counted != header.gaussian_count:
         report.error(f"Header declares {header.gaussian_count} gaussians; chunks contain {counted}")
     if header is not None:
         for source in audio_sources.values():
@@ -377,11 +555,61 @@ def validate(data: bytes) -> Report:
     for source_id in audio_data.keys() - audio_sources.keys():
         report.error(f"Audio Data id {source_id} has no matching Audio Source record")
 
+    # A Delta Chunk "exists only under `temporal_model = "keyframe-delta"`; a
+    # `gaussian-birth` file never contains one" (§5.18). Neither reader says so: the
+    # streamed one skips the opcode as though it were unknown, and the indexed one stops
+    # at the first Chunk — so a Delta Chunk in a gaussian-birth file was read by nobody
+    # and reported by nobody, and the state it carries silently was not in the scene.
+    if first_delta_offset is not None and not keyframe_delta:
+        model = "gaussian-birth" if header is None else header.temporal_model
+        report.error(
+            f"a Delta Chunk record appears at byte {first_delta_offset}, but the Header declares "
+            f"temporal model {model!r}; Delta Chunks exist only under 'keyframe-delta' (§5.18)"
+        )
+
+    named_by_index: dict[int, int] = {}
     for i, entry in enumerate(index):
-        if entry.chunk_offset + entry.chunk_length > len(data):
-            report.error(f"chunk index entry {i} points past the end of the file")
-        elif data[entry.chunk_offset] != op.CHUNK:
+        if (
+            entry.chunk_offset >= len(data)
+            or entry.chunk_length < 9
+            or entry.chunk_offset + entry.chunk_length > len(data)
+        ):
+            report.error(
+                f"chunk index entry {i} range [{entry.chunk_offset}, "
+                f"{entry.chunk_offset + entry.chunk_length}) does not contain a complete "
+                f"record header inside the {len(data)}-byte file"
+            )
+            continue
+        # A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a Delta
+        # Chunk is a difference against one, and an index that could only name the former
+        # could not seek the model at all.
+        at = data[entry.chunk_offset]
+        if at != op.CHUNK and not (keyframe_delta and at == op.DELTA_CHUNK):
             report.error(f"chunk index entry {i} does not point at a Chunk record")
+            continue
+        if entry.chunk_offset in named_by_index:
+            report.error(
+                f"chunk index entries {named_by_index[entry.chunk_offset]} and {i} both name the "
+                f"chunk at byte {entry.chunk_offset}; the index carries one entry per chunk (§4)"
+            )
+        named_by_index[entry.chunk_offset] = i
+
+    # The index is data, and data in an untrusted file can say anything — including
+    # nothing at all about a chunk that is in the file. Every check that decodes a chunk
+    # below is driven by the index, so a chunk no entry names is a chunk nothing decodes:
+    # a file whose index omits the one chunk carrying an unimplemented codec was reported
+    # valid. The file layout is "one per chunk" (§4), so the omission is itself the fault
+    # and naming it is better than quietly decoding around it.
+    if index:
+        for frame in walk.intact_records():
+            if frame.opcode not in (op.CHUNK, op.DELTA_CHUNK):
+                continue
+            at = frame.offset
+            if at not in named_by_index:
+                report.error(
+                    f"the {op.name(frame.opcode)} record at byte {at} is not named by any chunk index entry; "
+                    f"a seeking reader never reads it (§4)"
+                )
 
     if footer is not None and footer.summary_crc and footer.summary_start:
         tail = len(data) - (9 + 20 + len(MAGIC))
@@ -392,12 +620,304 @@ def validate(data: bytes) -> Report:
     if header is not None and not index:
         report.warn("no chunk index: this file can only be read front to back, not seeked")
 
-    # Opening the file the way a seeking client would is itself a check.
+    # What survived the cut, which is the question the errors above do not answer.
+    #
+    # A cut file is invalid and every finding about it stands — but records are
+    # length-prefixed, so everything complete before the cut is intact and the streamed
+    # reader keeps it. Saying only that the file stopped reading leaves its holder to
+    # guess whether anything is salvageable; this says how much.
+    if walk.cut is not None:
+        record_start = (
+            f"The incomplete record starts at byte {walk.cut.record_at:,}. " if walk.cut.record_at is not None else ""
+        )
+        report.note(
+            f"the file is cut at byte {walk.cut.at:,}: {walk.cut.reason}. "
+            f"{record_start}"
+            f"The {walk.intact()} complete records before it are intact, "
+            f"and a streamed reader recovers them"
+        )
+
+    if keyframe_delta:
+        assert header is not None  # `keyframe_delta` is read off it
+        # A *usable* index, not merely the presence of parsed Chunk Index records. The
+        # indexed branch opens the file with `open_indexed`, which needs the Footer to
+        # name a summary; a file whose `summary_start` is 0 carries index records that
+        # no seeking reader can reach, and sending it down that branch refuses it with
+        # "a seeking reader cannot open this file" and decodes nothing. §5.2 calls that
+        # file indexless, and the streamed branch is the one that reads it.
+        _check_keyframe_delta(data, walk, report, header, footer_selects_summary and bool(index))
+    else:
+        _check_gaussian_birth(data, walk, report)
+
+    return report
+
+
+def _check_gaussian_birth(data: bytes, walk: Walk, report: Report) -> None:
+    """The two checks that only a reader can perform: open the file, then decode it.
+
+    Opening it the way a seeking client would is where the front-matter refusals fire — an
+    unimplemented temporal model, an unimplemented quantization scheme. Decoding the chunks
+    is where the rest do, and there is no substitute for it: the framing walk steps over a
+    chunk by its declared length, so an unimplemented stream codec and an out-of-range
+    window index are both invisible to everything above. Both are in the invalid corpus,
+    and both used to validate clean.
+    """
+    if not _check_compatibility_records(walk, data, report, "gaussian-birth"):
+        return
+
     try:
         from .indexed_reader import open_indexed
 
-        open_indexed(BytesReadable(data))
-    except FourdgsError as exc:
-        report.error(f"a seeking reader cannot open this file: {exc}")
+        scene = open_indexed(BytesReadable(data))
+        if scene.index:
+            from .keyframe_delta_file import check_index_bands
 
-    return report
+            check_index_bands(data, scene.index, scene.header.sh_degree)
+    except FourdgsError as exc:
+        report.refused("a seeking reader cannot open this file: ", exc, walk)
+        # A file that will not open will not decode either, and the second error would say
+        # the same thing about the same byte.
+        return
+    refused = refusal.scan_chunks(data, walk)
+    if refused is not None:
+        report.refused("a chunk does not decode: ", refused.error, walk, refused.site)
+
+
+def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.Header, indexed: bool) -> None:
+    """The same, for the temporal model whose chunks are keyframes and differences.
+
+    The same statement as the branch above — open the file the way a client would, then
+    decode what it carries — expressed in the reader the file's declared model actually
+    needs. The alternative, which is what this validator did until now, is to run the
+    gaussian-birth reader over it and report its refusal as a fault in the file.
+
+    Entry by entry, and never `decode_indexed`, for the two reasons the branch above is
+    per chunk: a composed state is a whole population and holding one per index entry
+    costs many times the file, and an entry that refuses is an entry whose **offset** the
+    report can name.
+    """
+    from . import keyframe_delta_file as kdf
+
+    if not _check_compatibility_records(walk, data, report, "keyframe-delta"):
+        return
+
+    current_site: Site | None = None
+
+    def visiting_record(offset: int, opcode: int) -> None:
+        nonlocal current_site
+        current_site = Site(offset, f"the {op.name(opcode)} record")
+
+    identity_audit = kdf.BoundedIdentityAudit()
+    past_ceiling: ExceedsReaderLimit | None = None
+
+    def audit(offset: int, state) -> None:
+        """One state into the identity audit, from whichever scan this file needs.
+
+        Driven from the walk this function is already doing, so the distinct ids and the
+        reuse check cost no second decode of the file. Passing the audit's ceiling ends
+        the audit and nothing else: the timeline, window and band checks below still have
+        a whole file to make, and a sequence too large to count is not thereby malformed.
+        """
+        nonlocal past_ceiling
+        if past_ceiling is not None:
+            return
+        try:
+            identity_audit.observe(offset, state)
+        except ExceedsReaderLimit as exc:
+            past_ceiling = exc
+
+    if not indexed:
+        # No index is a legal file, not a broken one: §4 makes the summary optional and
+        # AGENTS.md §2 makes streaming first-class. The indexed reader was being run over
+        # it anyway, which read the Footer's `summary_start` of 0 as an offset and parsed
+        # the magic as record framing — so every conforming indexless keyframe-delta file
+        # was reported invalid, with a diagnosis about a record that does not exist.
+        windows = _window_table(walk, data)
+        first_t0: float | None = None
+        previous_t1: float | None = None
+        last_t1: float | None = None
+
+        def interval(offset: int, t0: float, t1: float) -> None:
+            nonlocal first_t0, previous_t1, last_t1
+            if t1 < t0:
+                raise FourdgsError(
+                    f"state chunk at {offset} has an inverted interval [{t0}, {t1})",
+                    code="non-tiling-chunks",
+                )
+            if first_t0 is None:
+                first_t0 = t0
+                if t0 != 0.0:
+                    raise FourdgsError(
+                        f"the first keyframe-delta state starts at {t0}, not 0",
+                        code="timeline-gap",
+                    )
+            elif previous_t1 != t0:
+                raise FourdgsError(
+                    f"state chunk at {offset} starts at {t0}; the preceding interval ends at {previous_t1}",
+                    code="timeline-gap",
+                )
+            previous_t1 = last_t1 = t1
+
+        try:
+            for _offset, _kind, state in kdf.scan_streamed(
+                data,
+                on_record=visiting_record,
+                on_state=interval,
+                sh_degree=header.sh_degree,
+            ):
+                kdf.check_window_indices_of(state, windows)
+                audit(_offset, state)
+                del state
+            if last_t1 != header.duration_sec:
+                raise FourdgsError(
+                    f"the last keyframe-delta state ends at {last_t1}; the Header duration is {header.duration_sec}",
+                    code="timeline-gap",
+                )
+        except FourdgsError as exc:
+            report.refused("a chunk does not decode: ", exc, walk, current_site)
+            return
+    else:
+        try:
+            opened = kdf.open_indexed(data)
+            kdf.check_index_bands(data, opened.index, opened.header.sh_degree)
+        except FourdgsError as exc:
+            report.refused("a seeking reader cannot open this file: ", exc, walk)
+            return
+        i = 0
+        entry = opened.index[0] if opened.index else None
+        band_site: Site | None = None
+
+        def visiting(ordinal: int, candidate: rec.ChunkIndexEntry) -> None:
+            nonlocal i, entry, band_site
+            i, entry = ordinal, candidate
+            band_site = None
+
+        def visiting_band(band: int, offset: int) -> None:
+            nonlocal band_site
+            band_site = Site(offset, f"the SH Band Stream for band {band} at index entry {i}")
+
+        def state_ready() -> None:
+            nonlocal band_site
+            # Band callbacks have completed successfully once scan_indexed yields. Any
+            # refusal raised by the identity audit belongs to the owning state record.
+            band_site = None
+
+        try:
+            for _entry, state in kdf.scan_indexed(
+                data,
+                opened.index,
+                opened.windows,
+                visiting,
+                visiting_band,
+                opened.grids,
+            ):
+                state_ready()
+                audit(_entry.chunk_offset, state)
+                # Dropped before the next entry is composed, not merely rebound after it:
+                # the generator retains only current and GOP-keyframe state.
+                del state
+        except FourdgsError as exc:
+            site = band_site
+            if site is None and entry is not None:
+                what = "Chunk" if entry.kind == 0 else "DeltaChunk"
+                site = Site(entry.chunk_offset, f"the {what} record at index entry {i}")
+            report.refused("a chunk does not decode: ", exc, walk, site)
+            return
+
+    if past_ceiling is not None:
+        # The fast path deliberately stops retaining identities at its declared ceiling.
+        # Validation cannot stop answering there: reuse after that point is still a fault,
+        # and Header.gaussian_count is still a required comparison. Revisit bounded
+        # partitions of the u32 identity space only for this exceptional scale. That may
+        # decode several times, but each pass has the same memory ceiling and the verdict
+        # remains exact.
+        try:
+            if indexed:
+                distinct = kdf.count_distinct_ids_partitioned(
+                    data,
+                    max_ids_per_partition=identity_audit.max_distinct_ids,
+                    index=opened.index,
+                    windows=opened.windows,
+                    on_entry=visiting,
+                    on_band=visiting_band,
+                    on_state=state_ready,
+                )
+            else:
+                distinct = kdf.count_distinct_ids_partitioned(
+                    data,
+                    max_ids_per_partition=identity_audit.max_distinct_ids,
+                    on_record=visiting_record,
+                )
+        except FourdgsError as exc:
+            site = current_site
+            if indexed:
+                site = band_site
+                if site is None and entry is not None:
+                    what = "Chunk" if entry.kind == 0 else "DeltaChunk"
+                    site = Site(entry.chunk_offset, f"the {what} record at index entry {i}")
+            report.refused("a chunk does not decode: ", exc, walk, site)
+            return
+    else:
+        distinct = identity_audit.distinct
+    if distinct != header.gaussian_count:
+        report.error(
+            f"Header declares {header.gaussian_count} gaussians; the sequence carries {distinct} distinct gaussian ids"
+        )
+
+
+def _check_compatibility_records(
+    walk: Walk,
+    data: bytes,
+    report: Report,
+    expected_model: str,
+) -> bool:
+    """Gate every Header and Quantization record, including copies after the first Chunk.
+
+    Indexed openers stop reading front matter at the first state record. Validation walks
+    the whole file, so a later record must not be allowed to smuggle in a model or scheme
+    that a front-to-back reader would refuse. The selected model is checked too: a known
+    value for the other decoder is malformed here, while an unknown value keeps its named
+    registry refusal.
+    """
+    from .registry import check_quantization_scheme, check_temporal_model
+
+    gate_site: Site | None = None
+    try:
+        for frame in walk.intact_records():
+            if frame.opcode not in (op.HEADER, op.QUANTIZATION):
+                continue
+            content = frame.content(data)
+            if content is None:
+                continue
+            gate_site = Site(frame.offset, f"the {op.name(frame.opcode)} record")
+            if frame.opcode == op.HEADER:
+                model = rec.Header.parse(content).temporal_model
+                if model != expected_model:
+                    check_temporal_model(model)
+                    raise FourdgsError(
+                        f"a {expected_model} sequence contains a Header declaring {model!r}",
+                        code="wrong-temporal-model",
+                    )
+            else:
+                check_quantization_scheme(rec.Quantization.parse(content).scheme)
+    except FourdgsError as exc:
+        report.refused("a seeking reader cannot open this file: ", exc, walk, gate_site)
+        return False
+    return True
+
+
+def _window_table(walk: Walk, data: bytes) -> list[tuple[float, float]]:
+    """The effective Window Table, matching the streamed decoder's last-one-wins rule."""
+    frame = None
+    for record in walk.intact_records():
+        if record.opcode == op.WINDOW_TABLE:
+            frame = record
+    if frame is None:
+        return []
+    content = frame.content(data)
+    if content is None:
+        return []
+    try:
+        return rec.WindowTable.parse(content).windows
+    except FourdgsError:
+        return []

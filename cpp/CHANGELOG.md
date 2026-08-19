@@ -6,8 +6,192 @@ All notable changes to the C++ package are documented here, following
 
 ## [Unreleased]
 
+### Changed
+
+- **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
+  at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
+  already the intent, but no sentence made it a refusal and both read paths quietly guessed —
+  differently. The streamed reader walked every record and kept whichever copy came last; the
+  indexed opener parses the front matter and kept the first. A file with two Quantization records
+  declaring different steps therefore decoded to two different scenes depending on which reader
+  opened it, with nothing raised on either path. §4 now states the multiplicity rule and requires
+  the refusal, which names the record and the byte. A Window Table is tracked with a flag rather
+  than by testing the window list for emptiness: a file may legitimately carry a table with no
+  entries, which is not the same thing as carrying no table at all. Reached through the Rust core's
+  C ABI, so this package inherits the refusal without a change of its own.
+
 ### Added
 
+- Out-of-tree CMake source consumers now build the Rust core automatically. CPM, FetchContent and
+  `add_subdirectory` checkouts default `FOURDGS_BUILD_CORE_FROM_SOURCE` on, invoke Cargo for only
+  the `fourdgs` crate in an isolated CMake build directory, and link the resulting static library
+  through an explicit target dependency. A prebuilt `FOURDGS_CORE_LIBRARY` still takes precedence,
+  and the intentional no-core build remains available explicitly. Installing the CMake package now
+  copies the selected core beside its targets and resolves it relative to the install prefix, so a
+  relocated `find_package(fourdgs-cpp)` consumer needs neither the original build tree nor Cargo. CI
+  proves the public path with a fresh out-of-tree FetchContent checkout that builds, links, and
+  crosses the C ABI without a prior repository core build. This completes issue #150's consumer
+  path; Swift and prebuilt release artifacts remain tracked together by #162.
+- Source builds pass an explicit Cargo target triple and require `FOURDGS_CARGO_TARGET` when CMake
+  cross-compiles or selects a target through `CMAKE_CXX_COMPILER_TARGET` or a same-OS architecture,
+  or when a compiler mode such as `-m32` changes the detected pointer ABI, preventing a host archive
+  from reaching the target linker. Cargo emits only the static library this binding consumes, so an
+  unrelated cross-target `cdylib` link cannot fail before that archive is produced. Universal macOS
+  builds explicitly require a pre-combined core rather than silently linking one thin archive. MSVC
+  Debug consumers inherit the Rust archive's `/MD` runtime, and absolute package library directories
+  retain Windows drive syntax and legal POSIX colons while generated configs safely match CMake's
+  effective destination for backslash-containing paths. An explicit top-level
+  `FOURDGS_BUILD_CORE_FROM_SOURCE=ON` takes precedence over the repository's permissive no-core
+  default, while an installed no-core package preserves an empty `fourdgs-cpp_CORE_LIBRARY` value.
+  The Cargo project is staged in the build tree so an absent lockfile never makes a read-only
+  fetched source fail, and installing a prebuilt core dereferences symbolic links so the relocated
+  package contains archive bytes rather than a dangling build-tree link. The staged manifest
+  declares itself its own workspace root: Cargo resolves a workspace by walking up from the manifest
+  it is given, so a build directory anywhere inside this repository — `cpp/build`, which the README
+  and CI both use — found the root `Cargo.toml` and refused with "current package believes it's in a
+  workspace when it's not". CI now configures a source build into `cpp/build-source` as well as into
+  the runner's temporary directory, so the in-repo layout is covered rather than assumed.
+
+- **Complete bounded validation for `keyframe-delta`.** The tool now certifies the sequential path
+  for every file and the indexed path when a Chunk Index is present, through the core's range-reader
+  ABI rather than a whole-file buffer. It retains no sequence: the core keeps only the current
+  population and GOP keyframe, while the CLI partitions lifetime identity introductions into
+  temporary files and reduces one fixed 32 MiB bitmap at a time. Reused identities and a Header
+  lifetime count mismatch are refused, and core failures carry their structured record byte into the
+  tool's diagnosis. Both core and no-core builds keep their existing contract; the latter still
+  reports that validation cannot run.
+
+- **`keyframe-delta` encode** (spec §11):
+  `fourdgs::encodeKeyframeDeltaSequence(samples, durationSec, options)`, with `KeyframeDeltaSample`
+  — a `t0`, a `gaussian_id` stream and a `GaussianView`, all borrowed for the call — and
+  `KeyframeDeltaOptions` for cadence, delta mode, forced keyframe indices, quantization profile,
+  cutoff, `library` and codec. A separate entry point from `encodeScene`, not an option on it: the
+  model is a sequence of populations with correspondence between them rather than one population of
+  independently-lived gaussians, so it takes samples rather than gaussians.
+
+  Like the rest of this package it is a binding, not a second encoder. The model's arithmetic
+  belongs to the core, reached through the `fourdgs_kd_writer_*` exports the layer below adds — a
+  delta is a difference of quantization bins against its reference chunk and never a quantization of
+  a difference (§11.7), rotation is restated absolutely, and `sigma_t`, `flags` and `window_index`
+  never reach an update group (§11.5). The binding stages options and columns and copies bytes out;
+  it computes nothing. What it does check is the one thing the ABI cannot see, because that call
+  takes a single count for both: a sample whose id stream and gaussian columns are different lengths
+  is refused here, where both lengths are still in hand, rather than silently renaming gaussians.
+  The gaussian columns are held to that same count for the same reason and a stronger one — see the
+  ragged-view fix under **Fixed**.
+
+  `cpp/conformance/encode_keyframe_delta` writes three sequences — chained, keyframe-referenced, and
+  the cadence-one shape §11.11 says subsumes `frame-sequence` — each with births, deaths, updates
+  and ids rotated within every sample so that a writer pairing gaussians by row rather than by
+  identity could not pass. `cpp/keyframe-delta-roundtrip.sh` then makes four claims about each: the
+  file is inside the bounds its own declared grid pitches promise against the population that went
+  in; the C++ and Python decoders read it to the same canonical `states`; every count its chunk
+  index declares matches the records it points at; and, given the same samples and options, it is
+  byte for byte the file the Rust reference writer produces — which is the claim a binding is
+  actually making. The feature matrix's `Encode keyframe-delta` cell for C++ moves from `Planned` to
+  `Yes` on that suite (issue #122).
+
+### Fixed
+
+- **The canonical summary is JSON under any `LC_NUMERIC`.** `renderRounded` formatted with
+  `snprintf("%.*f")` and read back with `strtod`, and both take the radix from the locale. Nothing
+  in the conformance runners sets one, so this was latent there and live for anyone linking this
+  canonical form into a host that does — ICU, Qt and GTK all call `setlocale(LC_ALL, "")` while
+  initialising. Under a comma-radix locale `num(0.05).render()` produced `"0,050000"`, which is not
+  JSON, and `run.py` failed to parse every file in the corpus; `roundToDecimals` was affected the
+  same way through `strtod`, stopping at the integer part and dropping every fractional digit out of
+  the content-order key. The render is now rewritten to `.` and the read-back to the locale's own
+  radix, both handling a multi-byte separator, and the zero normalisation drops the sign rather than
+  returning a spelled-out `"0.000000"` — which had hard-coded both the radix and six digits, so a
+  document could carry dotted zeros among comma-spelled numbers.
+
+- **A `GaussianView` whose columns are shorter than its `count` is refused rather than read past.**
+  `count` is a public field of its own and the `Span`s beside it are independent, so
+  `GaussianView{count = 4, positions = Span(p, 6), …}` is a value any caller can build without
+  writing `unsafe` anywhere. Both `encodeScene` and `encodeKeyframeDeltaSequence` then handed the C
+  ABI that count and a bare pointer per column, and the ABI reads `count × width` floats from each —
+  a heap read past the end of the caller's own buffer, reachable from a public, safe API, which
+  AddressSanitizer reports as a `heap-buffer-overflow` in `fourdgs_kd_writer_add_sample`. All nine
+  columns are now checked against `count` before anything is staged, on both entry points, and the
+  refusal names the column, what it holds and what it needed. A count too large for the ABI's 32-bit
+  parameter is refused by name instead of being truncated into a different number.
+
+  `encodeScene` had the defect first and `encodeKeyframeDeltaSequence` inherited the pattern; the
+  check is one function and both call it, so neither can drift from the other.
+
+- **`cutoff`, `codec` and `level` are proved to reach the core.** They were forwarded, but nothing
+  noticed if they were not: this struct restates the core's own defaults for all three, so a value
+  that went nowhere produced exactly the file the core would have written anyway, and deleting any
+  of the three forwarding calls left the whole C++ suite green. Each is now set to something other
+  than its default in a test that requires the bytes to move.
+
+## [0.1.0] - 2026-08-10
+
+### Added
+
+- A CMake package another project can consume. The install already exported its targets under the
+  `fourdgs::` namespace but generated no config file, so `find_package(fourdgs-cpp)` could not
+  succeed against it — the install rules produced something nothing could find. It now installs
+  `fourdgs-cpp-config.cmake` and `fourdgs-cpp-config-version.cmake` beside the targets file, so a
+  version request is answerable (`SameMinorVersion`, which is what a 0.x compatibility promise
+  means). `fourdgs::cpp` names the library whether it arrived through `find_package` or
+  `add_subdirectory`, and the tests, conformance runners and examples build by default only when
+  this is the top-level project, so consuming the package no longer adds them to somebody else's
+  build. `cpp/README.md` documents the three consumption paths, including the `SOURCE_SUBDIR cpp`
+  argument that a `CPMAddPackage` needs and nobody would guess: this repository has no CMakeLists at
+  its root, and without that argument the fetch silently adds nothing.
+- `fourdgs::version()` now reports the version the CMake project declares, compiled in from
+  `PROJECT_VERSION` rather than written out a second time. It returned `"0.0.0"` while the package
+  answered `find_package(fourdgs-cpp 0.1)`, so an application reporting the linked SDK version and
+  the build that resolved it disagreed.
+- A `4dgs` command-line tool (`cpp/tools/`, built as `cpp/build/tools/4dgs`) with two commands.
+  `inspect` walks the file record by record — offset, opcode name, content and total length, and the
+  CRC status of the region each record sits in — reading nine bytes per record, so it costs the same
+  on a file carrying an hour of audio as on one carrying none. `validate` checks the file and, when
+  it is refused, prints the refusal identifier **and the byte it fired at** beneath the finding it
+  belongs to: `refusal unknown-stream-codec at byte 659 (the Chunk record at index entry 0)`. All
+  seven variants of the invalid corpus are refused by the identifier their expectation file
+  declares, at the same bytes the Rust tool reports.
+- `validate` decodes the chunks, one resident at a time on the indexed path. A framing walk steps
+  _over_ a chunk by its declared length, which is exactly not looking inside it — so
+  `unknown-stream-codec` and `window-index-out-of-range` are reachable at all only by decoding, and
+  a framing-only validator calls those two files valid.
+- **Every spherical-harmonic band the file declares is decoded, not just band 0.** Each band is its
+  own record with its own stream header, addressed by byte range so a reader that has capped its
+  degree never transfers the higher ones — which is what hid them from a validator scanning at band
+  0, and what let a file whose band 2 will not decode come back `valid`, exit 0. When a band
+  refuses, the byte names _that band's own record_, narrowed by raising the cap until the fetch
+  starts failing, on the failure path only.
+- Both commands read byte ranges rather than the file. `inspect` transfers nine bytes per record
+  plus the checksummed region, and `validate` opens the scene over the same transport instead of
+  handing the core a buffer it would copy — so neither holds a capture whose size it does not
+  control. The one exception is a `keyframe-delta` file, because
+  `fourdgs_keyframe_delta_states_json` takes `(const uint8_t*, size_t)` and the C ABI offers no
+  range-reading counterpart.
+- `validate` branches on the Header's declared `temporal_model`, so a conforming `keyframe-delta`
+  file is validated by the reader its model needs instead of producing errors from the
+  gaussian-birth chunk shape it does not have.
+- A truncated file is walked as far as it goes and then reports the cut: the byte, the record's
+  declared length against the file's size, and how many complete records before it a streamed reader
+  keeps. `inspect` prints it beneath the table and `validate` adds it as a note beside its errors.
+- Exit codes a pipeline can act on: `0` fine, `1` refused or invalid, `2` valid with warnings, `3`
+  the tool could not run. The last is the one that matters — a missing file, an unrecognized
+  argument, or a build with no decoder behind it is the absence of an answer, not a verdict on a
+  file, and a tool that exits `1` for both is indistinguishable from a broken one.
+- Refusal diagnosis: `fourdgs::Error::refusal` names _which_ rule refused a file — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — in the same words every other SDK prints.
+  `ErrorCode` says what kind of thing went wrong and `kUnsupported` alone covers three of those six,
+  so the code could not answer the question. A `std::optional`, and empty for every failure the
+  specification's table does not name: a truncated file and a transport that gave up are real errors
+  with no rule behind them. Additive, so existing catch sites are unchanged. Read across the C ABI
+  from `fourdgs_last_refusal_code` as a (pointer, length) pair and copied by length — the string is
+  not NUL-terminated, and reading it as though it were is the ABI bug that shape exists to prevent.
+- The `decode_streamed` and `decode_indexed` conformance runners answer a refused file with
+  `{"refused": "<identifier>"}` on stdout and exit 0, so the suite can tell "refused the file" from
+  "refused it for the right reason" — a decoder that rejects a bad-magic file because it mis-parsed
+  the version passes the first and fails the second. `cpp` joins `REFUSAL_FAMILIES`, and the
+  seven-variant invalid corpus is read on both paths: the suite goes from 105 checks to 119.
 - keyframe-delta decode: `fourdgs::keyframeDeltaStatesJson` and `fourdgs::peekTemporalModel`,
   binding the core's additive states-JSON C ABI. The summary is computed in the Rust core, so the
   binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` conformance
@@ -37,8 +221,29 @@ All notable changes to the C++ package are documented here, following
   comparison rests on, that reordering a scene's gaussians cannot change one character of its
   summary.
 
+### Fixed
+
+- Configuring without a core no longer depends on which half of the core is missing. The backend was
+  chosen from the header alone, and `rust/fourdgs/include/fourdgs.h` is committed while
+  `target/release/libfourdgs.a` is a build artifact — so in a fresh checkout, `cmake -S cpp` before
+  `cargo build` failed outright and `-DFOURDGS_ALLOW_NO_CORE=ON` could not rescue it, which is the
+  configuration that option exists for. The header and the library are resolved together now, and a
+  failed search is not cached, so configuring the same build directory again after
+  `cargo build -p fourdgs --release` links the core rather than keeping the build that has none.
+
+### Known limitations
+
+An out-of-tree build supplies the Rust core itself: this is a binding over that core's C ABI, and
+the core's library is a build artifact, so `FOURDGS_CORE_LIBRARY` (and, for a copy of `cpp/` on its
+own, `FOURDGS_CORE_HEADER_DIR`) point at what `cargo build -p fourdgs --release` produced.
+Configuring without them outside this repository is now a fatal error naming both, rather than a
+STATUS line and a library that refuses every call. Building the core from CMake with Corrosion, or
+fetching a prebuilt one, would remove the step; neither is implemented, and the choice between them
+is deliberately not being made here.
+
 ### Notes
 
 Conformance-verified: 79 checks across the 45 valid variants this binding supports, and the feature
-matrix records exactly what that proves. Nothing is released yet — the package has no version to
-release from.
+matrix records exactly what that proves. This is the first release: 0.1.0 rather than a number
+matched to another SDK's, because the packages version independently and this one has shipped
+nothing before.

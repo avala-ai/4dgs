@@ -11,6 +11,7 @@
  */
 
 import {
+  FourdgsError,
   MAGIC,
   Opcode,
   assembleGaussians,
@@ -27,7 +28,7 @@ import {
 } from "@4dgs/core";
 import { FileHandleReadable } from "@4dgs/nodejs";
 
-import { canonical, summarize } from "./canonical.js";
+import { canonical, refusalAnswer, summarize } from "./canonical.js";
 import { checkIndexedInvariants, CountingReadable } from "./checks.js";
 
 /** How much of the front is read to learn the temporal model without decoding gaussians. */
@@ -131,4 +132,20 @@ if (path === undefined) {
   process.stderr.write("usage: decode_indexed.js <file.4dgs>\n");
   process.exit(2);
 }
-process.stdout.write((await run(path)) + "\n");
+try {
+  process.stdout.write((await run(path)) + "\n");
+} catch (error) {
+  // Both read paths answer the invalid corpus, and they reach the Header by different
+  // routes — one front to back, one through the Footer. A check placed on only one of
+  // them refuses half the files it should, and only running both can show that.
+  if (!(error instanceof FourdgsError)) throw error;
+  // The same rule about what counts as an answer, reached by the other route: only an
+  // error the refusal table names is one. Anything else is a failed invocation, on
+  // stderr with a non-zero exit. See `refusalAnswer`.
+  const answer = refusalAnswer(error);
+  if (answer === null) {
+    process.stderr.write(`${path}: ${error.message}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(answer + "\n");
+}

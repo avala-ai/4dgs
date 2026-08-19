@@ -8,6 +8,215 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Changed
+
+- **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
+  at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
+  already the intent, but no sentence made it a refusal and both read paths quietly guessed —
+  differently. The streamed reader walked every record and kept whichever copy came last; the
+  indexed opener parses the front matter and kept the first. A file with two Quantization records
+  declaring different steps therefore decoded to two different scenes depending on which reader
+  opened it, with nothing raised on either path. §4 now states the multiplicity rule and requires
+  the refusal, which names the record and the byte. A Window Table is tracked with a flag rather
+  than by testing the window list for emptiness: a file may legitimately carry a table with no
+  entries, which is not the same thing as carrying no table at all.
+
+## [0.6.0] - 2026-08-14
+
+### Fixed
+
+- **A string on the wire keeps its leading U+FEFF.** `@4dgs/core`'s `Cursor` and the validator's two
+  string readers built their `TextDecoder` without `ignoreBOM`, whose default is to strip a leading
+  byte-order mark. That default is for reading a text file, where the mark is a preamble; every
+  string in this format is length-prefixed UTF-8 inside a binary record, where U+FEFF is a character
+  the writer wrote. So these readers returned a different string from the Python, Rust and Dart
+  readers for the same bytes — silently changing a `bounds` value, a metadata key or an `object_id`.
+
+- **A per-band SH bound is read by the grammar spec §5.3 writes down.** The comparison anchored its
+  pattern with `\s`, which in JavaScript matches U+FEFF, so a bound wrapped in whitespace — or led
+  by a byte-order mark — was accepted as the bare number. The pattern now admits nothing around the
+  number and spells its digits `[0-9]` rather than leaving `\d` to depend on a `/u` flag. Equivalent
+  spellings such as `5e-05`, `5e-5` and `0.00005` remain one bound, and `0e999999999999999999999999`
+  is still the zero it spells.
+- The Gaussian-birth writer plans chunks from reconstructed temporal values and contains the full
+  rounded-visible marginal plateau, so an indexed seek cannot miss a Gaussian that the complete
+  decoded state reports as visible at the same instant.
+- Summary Offsets emitted with Statistics now frame only the Chunk Index records they name.
+- Chunk containment is exact. The planner no longer admits a Gaussian into a chunk whose interval
+  ends up to `1e-9` before its support does, which left `chunksForTime` returning a chunk without a
+  Gaussian that `stateAt` reported visible at the same instant.
+
+### Changed
+
+- `encodeScene` refuses a `cutoff` outside `(0, 1]` instead of writing a file planned from a `NaN`
+  support half-width. A marginal threshold of zero or less has no logarithm to invert.
+
+## [0.5.0] - 2026-08-12
+
+### Added
+
+- `reconstructKeyframeDelta` in `@4dgs/core`: the full population at an instant of a
+  `keyframe-delta` sequence — gaussian ids, centres, scales, rotations, linear RGB, marginal-folded
+  opacity, spherical harmonics, and object membership where a chunk carries it — in ascending
+  `gaussian_id` order (spec §11.7). `keyframeDeltaChunkAt` answers the seek that precedes it: the
+  chunk whose half-open `[t0, t1)` contains `t`. Until now the package published only
+  `keyframeDeltaStatesJson`, which samples positions and scales for the cross-SDK statement, so
+  consumers had to reimplement §11.7 to get every attribute of every gaussian.
+- `dequantizeRotation` accepts a `Float64Array` output as well as a `Float32Array`.
+- `ATTRIBUTE_CHANNELS`, the interleaving width the registry gives each attribute id it defines.
+- `KeyframeDeltaIndexedDecoder`, a range-backed `IReadable` seek for `keyframe-delta` files. Opening
+  reads bounded front-matter and summary windows; `reconstructAt(t)` fetches and composes only the
+  index chain and spherical-harmonic ranges needed for that instant.
+- **A `4dgs` command-line tool, in `@4dgs/nodejs`.** `4dgs inspect <file>` walks the file record by
+  record and prints opcode, byte offset, content and total length, and whether the file's own
+  summary checksum covers that record — framing only, so it costs the same on a scene carrying a
+  six-megabyte audio payload as on one carrying none. `4dgs validate <file>` runs the structural
+  checks, and every check, severity and sentence it composes is
+  `python/fourdgs/fourdgs/validate.py`'s: over the whole 60-file conformance corpus the two tools
+  print identical findings, and the two remaining differences are sentences the libraries raise
+  rather than the validators write. `--json` gives `inspect` a machine-readable form; `--decode`
+  gives `validate` the two refusals that live inside a chunk's attribute streams, where no amount of
+  framing reaches them. The tool lives in `@4dgs/nodejs` because it opens files and I/O lives at the
+  edges; `inspectFile` and `validateFile` are exported, so anything the tool can do a caller can do
+  in process. Also exported: `bytesEqual` from `@4dgs/core`, which the walk needs to recognize a
+  trailing magic.
+- **A refused file is named by rule and by byte.** Both commands print
+  `refused: <identifier> at byte <n> (<what sits there>)` —
+  `unknown-quantization-scheme at byte 154 (the Quantization record)` — using the `Refusal`
+  identifiers below. All seven files in the invalid conformance corpus are answered this way, each
+  with the identifier the corpus expects.
+- **Exit codes a pipeline can act on.** `0` fine, `1` refused or invalid, `2` valid with warnings,
+  `3` the tool itself failed. The third is the one that is not the Rust tool's: exiting `1` both for
+  "I read this file and it does not conform" and for "I fell over" makes a verdict about a file
+  indistinguishable from a broken validator, and those need opposite reactions from whoever is
+  holding the file.
+- **A truncated file is reported, not thrown.** `inspect` names every record that was complete
+  before the cut, with the offsets and lengths it has in the whole file, and then says where the cut
+  is; `validate` prints what the Python validator prints for the same file, byte for byte.
+- **Refusals say which rule was broken.** Every error in `@4dgs/core` now carries an optional
+  `refusalCode`, and the six identifiers the specification's refusal table names — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — are exported as the `Refusal` constants
+  rather than written as literals at the raise sites, because six implementations are compared on
+  those strings. The class alone was too coarse to compare on: `UnsupportedCodec` covers an unknown
+  temporal model, an unknown quantization scheme and an unknown stream codec alike, so "it threw
+  `UnsupportedCodec`" cannot tell a decoder that refused for the right reason from one that refused
+  for the wrong one. `undefined` means "a real error the refusal table does not name", not "no
+  error". This is additive: `refusalCode` is a property on the existing `FourdgsError` rather than a
+  new subclass, so every `instanceof` check keeps working.
+- **`keyframe-delta` encode in `@4dgs/core`** (spec §11), closing the last writer gap on the
+  TypeScript side: `encodeKeyframeDeltaSequence(samples, durationSec, options)` takes a sequence of
+  populations with identities and writes a whole file — Header, Quantization, Window Table, a
+  keyframe Chunk or a Delta Chunk per sample, the extended Chunk Index, Statistics and the Footer.
+  `KeyframeDeltaWriteOptions` carries cadence (`keyframeEvery`, `keyframeAt`), `deltaMode`, the
+  quantization profile and cutoff, and which summary records to write. Shared grids are derived in
+  bounded passes over the sequence, then only the current population and its reference are quantized
+  at once; a delta is an integer subtraction between bins on one grid, the composition telescopes,
+  and the declared bound holds at any depth.
+- A gaussian is written into a delta only when one of its bins moved, so an unchanged gaussian costs
+  no bytes — the property the model exists to buy. Rotation is restated absolutely rather than
+  differenced, because the smallest-three basis changes with the largest component.
+- The writer refuses what it cannot honestly write, naming the field and the sample: a timeline that
+  does not tile `[0, duration_sec)`, a non-finite duration, an id list that does not match the
+  population, falls outside `u32`, repeats an id or reuses one after death, a chained depth that
+  cannot fit its `u16` field, a `delta_mode` outside `{0, 1}`, an unknown profile, a non-positive or
+  non-finite `sigma_t`, an absolute bin outside `i32`, spherical harmonics (which are never silently
+  dropped even when their degree metadata is missing), and a GOP-invariant attribute — `sigma_t`,
+  `flags`, `window_index` — that changes mid-group, where a bin difference would subtract bins
+  living on two different grids and decode into a wrong value rather than into an error. Valid
+  gaussian ids use the complete `u32` domain through the stream codec's signed two's-complement
+  bridge, and each sample's `mu_t` is anchored to that sample's timestamp as §11.3 requires.
+- **`parseQuantization` reads the appended per-band SH bit depths** into `Quantization.shBitDepths`,
+  as the Python and Rust readers already did — TypeScript wrote the field in `encodeScene` and was
+  the only reader that could not read it back. `shStep` and `shBound`, the pitch and bound a depth
+  implies, move out of the writer and are exported from `@4dgs/core` alongside `SH_MIN_BITS` and
+  `SH_MAX_BITS`. Reading it is deliberately tolerant: appended fields are positional, so a count the
+  record is too short for, or a depth outside 3..8, is read as "this file declares none" rather than
+  as a corrupt file (§5.3).
+
+### Changed
+
+- `keyframeDeltaStatesJson` is now computed from `reconstructKeyframeDelta` rather than from a
+  second private reconstruction, so the statement the SDKs are diffed on is exactly the rows a
+  consumer gets. Its `states[].liveCount` is the count of gaussians the reconstruction returns
+  rather than the chunk's composed population, which matches the Python reference.
+- A gaussian outside its own validity window is absent from a reconstructed instant rather than
+  present at full opacity: outside the window a gaussian does not exist at that time (spec §3),
+  which is how the `gaussian-birth` path has always decided it. Unobservable on files that carry one
+  full-duration window, which is every keyframe-delta file in the corpus today.
+- `ObjectLayer.apply` accepts either `Float32Array` or `Float64Array` centres and orientations, so
+  object tracks compose directly onto `keyframe-delta` reconstruction without a narrowing copy.
+- `writer.ts` now exports its quantization and record-framing internals (`rint`, `median`,
+  `quantizeRotation`, `rctForward`, `ByteWriter`, `putStrMap`, `record`, `encodeStream`) as
+  `@internal`, so both encoders share one arithmetic instead of restating it. They are not
+  re-exported from the package entry point and are not API.
+
+### Fixed
+
+- **An attribute stream whose `channels` is not the width the registry gives it is refused**, on
+  both the `gaussian-birth` chunk path and the `keyframe-delta` composition path. Every reader of
+  these bins indexes with a fixed stride, so a `rotation` column declaring one channel and the right
+  element count read the next row's bin as this row's second component — and `undefined` past the
+  end, which arithmetic turns into a `NaN` quaternion rather than into a refusal. The rule was
+  enforced for `object_id` alone, where a wrong width would have shifted every gaussian's
+  membership; `ATTRIBUTE_CHANNELS` now states it once for every attribute the registry names.
+- **SH Band Stream dimensions are checked before payload decode.** A constant stream can expand a
+  handful of symbols into its declared row count, so band, width, and chunk row count are now
+  compared before an untrusted declaration can allocate hundreds of megabytes.
+- **A birth that introduces `object_id` no longer misaligns the column it introduces.** Membership
+  is optional per chunk and its omission means `0` (§6.6), so a background keyframe without the
+  stream followed by a delta birth that has one is a legal file. Composed without a default for the
+  rows already in the state, the merged column was `birth_count` rows long against the whole
+  population: the birth's membership landed on a gaussian that was already there, and the birth
+  itself read past the end as `0`. The rows that came before an introduced column now carry the
+  omission default.
+- **A seek past the end of a truncated prefix is refused rather than answered with the last state
+  before the cut.** `keyframeDeltaChunkAt` resolves a `t` at or past the end of a _complete_
+  timeline to the last chunk, which is the boundary convenience a player wants; on a streamed prefix
+  of a truncated file (§11.10) the last decodable instant is the last complete chunk's `t1`, and
+  reporting the state before the cut as the state after it is a decoder inventing content. The
+  indexed path already refused it.
+- **`4dgs` runs when it is invoked through the symlink npm installs.** `bin` is linked into
+  `node_modules/.bin`, and Node reports the link path in `process.argv[1]` while resolving
+  `import.meta.url` through it, so the entry-point comparison was false for every installed
+  invocation: the advertised executable printed nothing and exited `0`, which a pipeline cannot tell
+  from success. Both ends are now resolved before they are compared.
+- **`inspect` fails a file that does not end with the magic.** A file cut inside its own closing
+  magic framed every record, so nothing reported a stop, and the walk exited `0` with a note — while
+  `validate` called the same file truncated and refused it. The walk now says which bytes are not
+  the magic, and a missing magic is a failing exit code in either shape.
+- **`validate --decode` decodes SH Band Streams.** Framing steps over these records, so a band
+  declaring a codec this build does not have, or carrying a cut payload, was reported valid by the
+  validator and refused by this package's own streamed decoder. Both refusals a chunk's streams can
+  raise are reachable from a band's stream, and `--decode` now reaches them.
+- **`validate` checks the records it was stepping over.** The provenance and object-layer records
+  are parsed for the cross-record rules `scene.ts` already enforces and the Python validator already
+  checks — a duplicate name, a sensor posed against a rig the file does not carry, two tracks moving
+  one object, a second Object Table — so a file this package cannot decode is no longer reported as
+  conforming. The per-band SH bit depths are checked against the Header's degree and the declared
+  bounds (§6.5), which the Python and Rust validators both do.
+- **Four normative rules a structural pass could not see.** The Footer must be the last record (§4);
+  Header flag bits 2-7 are reserved and must be zero (§4.2) — the same rule the parser already
+  applies to an Audio Source's flags; the summary is exactly the Chunk Index, Statistics and Summary
+  Offset records, contiguous (§4.5), which its checksum cannot answer because a writer that smuggles
+  a record in there recomputes it; and a chunk index entry frames a whole record (§5.8), without
+  which an entry with a plausible offset and a wrong length passes validation and makes the seek
+  path unusable.
+- **A file whose magic is corrupted anywhere but the version byte is no longer reported as an
+  unsupported version.** `checkMagic` tested only that bytes 1-4 read `4DGS`, so flipping the
+  leading `0x89` sentinel — the byte that stops byte-oriented tooling treating a 4dgs file as text —
+  produced "4dgs major version 1 is not supported by this reader". That sends the file's holder
+  looking for a newer reader, which would not have helped. The version byte must now be the only
+  difference. Python's reader carries a comment about making exactly this mistake; nothing inside
+  TypeScript could see it, because both answers are an `UnsupportedVersion` with a sentence.
+
+### Removed
+
+- `KeyframeDeltaState.column()` and `KeyframeDeltaState.attributes()`, which were exported and
+  marked `@internal`. Composed bins are not public API; `reconstructKeyframeDelta` is the supported
+  way to values, and the bins are now a JavaScript private field so the boundary is enforced rather
+  than documented.
+
 ## [0.4.0] - 2026-08-10
 
 ### Added

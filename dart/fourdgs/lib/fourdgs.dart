@@ -22,9 +22,23 @@
 /// the edges, so the decoder can be tested without a network and shipped
 /// without a platform.
 ///
+/// Writing goes the other way through the same primitives, and lives in
+/// `package:fourdgs/writer.dart`: [writeFourdgsToSink] and
+/// [writeKeyframeDeltaToSink] emit bounded records, [writeFourdgsBytes] and
+/// [writeKeyframeDeltaBytes] are their in-memory conveniences. They encode
+/// gaussian state in their own right rather than wrapping another SDK, which is
+/// what makes their agreement with those SDKs worth something.
+///
+/// The encoder is a separate import because it cannot be compiled for the web
+/// at all — its Morton-code masks are 64-bit values a JavaScript number cannot
+/// represent — and an export is enough to put a file in the compile graph. Kept
+/// here, it made this whole library impossible to build for a browser consumer
+/// that only ever reads. See that library's own documentation for why the masks are
+/// not the thing to change.
+///
 /// Reading a file from disk needs one more import: `package:fourdgs/io.dart`
-/// carries the `dart:io` transport, kept out of this library so the decoder
-/// itself stays platform-free and usable in a browser.
+/// carries the `dart:io` transport, kept out of this library for the same
+/// reason — so the decoder itself stays platform-free and usable in a browser.
 ///
 /// The normative specification is at <https://github.com/avala-ai/4dgs>.
 library;
@@ -32,6 +46,7 @@ library;
 export 'src/chunk_decoder.dart';
 export 'src/exceptions.dart';
 export 'src/indexed_reader.dart';
+export 'src/inspect.dart';
 export 'src/keyframe_delta.dart';
 export 'src/model.dart';
 export 'src/objects.dart';
@@ -40,12 +55,14 @@ export 'src/provenance.dart';
 export 'src/quantization.dart';
 export 'src/readable.dart';
 export 'src/records.dart';
+export 'src/refusal.dart';
 export 'src/serialization.dart';
 export 'src/stream_reader.dart';
+export 'src/validate.dart';
 
 /// This package's version, and the single source of truth for it.
 ///
 /// The release workflow asserts that this constant, `pubspec.yaml` and the
 /// release tag all agree, and refuses the release when they do not — a version
 /// number is the one mistake that cannot be corrected after publication.
-const String fourdgsPackageVersion = '0.1.0';
+const String fourdgsPackageVersion = '0.2.0';

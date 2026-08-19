@@ -21,7 +21,16 @@
  */
 
 import { crc32 } from "./codec.js";
-import { bandCoefficientRange } from "./sh.js";
+import { MAX_FRONT_MATTER_BYTES } from "./indexedDecoder.js";
+import type { ObjectLayer } from "./objects.js";
+import {
+  checkObjectTable,
+  checkObjectTrack,
+  RECORD_HEADER_BYTES,
+  type ObjectTable,
+  type ObjectTrack,
+} from "./records.js";
+import { SH_MAX_BITS, SH_MIN_BITS, bandCoefficientRange, shBound, shStep } from "./sh.js";
 
 /** The gaussians to encode, structure-of-arrays — the shape a decoder hands back. */
 export interface GaussianInput {
@@ -39,6 +48,8 @@ export interface GaussianInput {
   readonly sh?: Uint8Array | null;
   readonly shDegree?: number;
   readonly shCoefficients?: number;
+  /** Exact per-gaussian object membership, or null when the scene has no object layer. */
+  readonly objectId?: Uint32Array | readonly number[] | null;
 }
 
 /** How a scene is written. The defaults are the reference encoder's own. */
@@ -56,6 +67,8 @@ export interface WriteOptions {
   profile?: string;
   library?: string;
   attributes?: Record<string, string>;
+  /** The Object Table and optional SE(3) tracks to write. */
+  objects?: ObjectLayer | null;
 }
 
 // Opcodes and attribute ids (spec §4.2, §6.1).
@@ -68,6 +81,8 @@ const OP_SH_BAND_STREAM = 0x07;
 const OP_CHUNK_INDEX = 0x08;
 const OP_STATISTICS = 0x0c;
 const OP_SUMMARY_OFFSET = 0x0f;
+const OP_OBJECT_TABLE = 0x24;
+const OP_OBJECT_TRACK = 0x25;
 
 const A_POSITION = 0;
 const A_SCALE = 1;
@@ -80,6 +95,7 @@ const A_MU_T = 7;
 const A_SIGMA_T = 8;
 const A_FLAGS = 9;
 const A_WINDOW_INDEX = 10;
+const A_OBJECT_ID = 14;
 
 const CODEC_DEFLATE = 0;
 const MODE_RAW = 0;
@@ -94,8 +110,6 @@ const LIFE_HALF_MIN = 0.02;
 const LIFE_HALF_MAX = 2.0;
 const MU_REL = 0.05;
 const MU_MIN_CLASS = -10;
-const SH_MIN_BITS = 3;
-const SH_MAX_BITS = 8;
 
 /** The default profile's error bounds and the grid pitches they imply. */
 interface Grid {
@@ -115,8 +129,52 @@ function supportK(cutoff: number): number {
   return Math.sqrt(-2 * Math.log(cutoff));
 }
 
-/** Round half to even, the rule every attribute grid but rotation uses. */
-function rint(v: number): number {
+/**
+ * Refuse a marginal threshold that is not one.
+ *
+ * A threshold outside `(0, 1]` is not a threshold, and it has to be refused here rather
+ * than become a domain error inside a logarithm. `supportK` inverts `Math.log(cutoff)`,
+ * so zero or a negative value yields `Infinity` or `NaN`, and neither stays loud: a `NaN`
+ * half-width makes every containment comparison in `planChunks` false, so the tree
+ * collapses into one degenerate node covering the whole clip and the Chunk Index stops
+ * being a partition anybody can seek with. Python refuses the same domain with the same
+ * sentence (`quantization.support_k`), and Rust with `check_cutoff`.
+ */
+function checkCutoff(cutoff: number): void {
+  if (!(cutoff > 0 && cutoff <= 1)) {
+    throw new Error(`the Header's cutoff is ${cutoff}; a marginal threshold must be in (0, 1]`);
+  }
+}
+
+const adjacentFloat = new DataView(new ArrayBuffer(8));
+
+/** The adjacent binary64 value toward positive infinity. */
+function nextUp(value: number): number {
+  if (Number.isNaN(value) || value === Infinity) return value;
+  if (value === 0) return Number.MIN_VALUE;
+  adjacentFloat.setFloat64(0, value);
+  const bits = adjacentFloat.getBigUint64(0);
+  adjacentFloat.setBigUint64(0, value > 0 ? bits + 1n : bits - 1n);
+  return adjacentFloat.getFloat64(0);
+}
+
+/** The adjacent binary64 value toward negative infinity. */
+function nextDown(value: number): number {
+  if (Number.isNaN(value) || value === -Infinity) return value;
+  if (value === 0) return -Number.MIN_VALUE;
+  adjacentFloat.setFloat64(0, value);
+  const bits = adjacentFloat.getBigUint64(0);
+  adjacentFloat.setBigUint64(0, value > 0 ? bits - 1n : bits + 1n);
+  return adjacentFloat.getFloat64(0);
+}
+
+/**
+ * Round half to even, the rule every attribute grid but rotation uses.
+ *
+ * @internal shared with the `keyframe-delta` writer, so one arithmetic serves both
+ * encoders. Not part of the package's API.
+ */
+export function rint(v: number): number {
   const nearest = v < 0 ? -Math.round(-v) : Math.round(v); // half away from zero
   const frac = Math.abs(v - Math.trunc(v));
   if (frac === 0.5 && nearest % 2 !== 0) {
@@ -130,8 +188,8 @@ function roundTiesAway(v: number): number {
   return v >= 0 ? Math.floor(v + 0.5) : Math.ceil(v - 0.5);
 }
 
-/** The median of a slice, the way NumPy takes it. */
-function median(values: ArrayLike<number>): number {
+/** The median of a slice, the way NumPy takes it. @internal */
+export function median(values: ArrayLike<number>): number {
   const n = values.length;
   if (n === 0) return 1e-3;
   const sorted = Array.from(values, (v) => v).sort((a, b) => a - b);
@@ -185,8 +243,15 @@ const REST: readonly (readonly [number, number, number])[] = [
   [0, 1, 2],
 ];
 
-/** The forward smallest-three quaternion transform: largest index and three residual bins. */
-function quantizeRotation(
+/**
+ * The forward smallest-three quaternion transform: largest index and three residual bins.
+ *
+ * @internal Ties round away from zero, which is the Rust reference's rule; Python's
+ * `quantize_rotation` reaches for `np.rint` and rounds them to even. The two disagree only
+ * on a residual that lands exactly on a half-step, and both encoders here take the Rust
+ * rule so that one SDK does not hold two opinions about the same input.
+ */
+export function quantizeRotation(
   q0: number,
   q1: number,
   q2: number,
@@ -207,17 +272,9 @@ function quantizeRotation(
   return [largest, bins];
 }
 
-/** The forward reversible colour transform: store `(g, r - g, b - g)`. */
-function rctForward(r: number, g: number, b: number): [number, number, number] {
+/** The forward reversible colour transform: store `(g, r - g, b - g)`. @internal */
+export function rctForward(r: number, g: number, b: number): [number, number, number] {
   return [g, r - g, b - g];
-}
-
-function shStep(bits: number): number {
-  return 1 << (SH_MAX_BITS - Math.min(Math.max(bits, SH_MIN_BITS), SH_MAX_BITS));
-}
-
-function shBound(bits: number): number {
-  return shStep(bits) >> 1;
 }
 
 /** Round one coefficient byte onto the grid `bits` names, at bin centres. */
@@ -229,7 +286,8 @@ function quantizeSh(value: number, bits: number): number {
 
 // --- little-endian byte writer -------------------------------------------
 
-class ByteWriter {
+/** @internal a little-endian byte sink, shared by both encoders. */
+export class ByteWriter {
   private buf: Uint8Array;
   private view: DataView;
   private len = 0;
@@ -258,6 +316,12 @@ class ByteWriter {
     this.buf[this.len++] = v & 0xff;
   }
 
+  u16(v: number): void {
+    this.ensure(2);
+    this.view.setUint16(this.len, v & 0xffff, true);
+    this.len += 2;
+  }
+
   u32(v: number): void {
     this.ensure(4);
     this.view.setUint32(this.len, v >>> 0, true);
@@ -274,6 +338,12 @@ class ByteWriter {
     this.ensure(8);
     this.view.setFloat64(this.len, v, true);
     this.len += 8;
+  }
+
+  f32(v: number): void {
+    this.ensure(4);
+    this.view.setFloat32(this.len, v, true);
+    this.len += 4;
   }
 
   bytes(b: Uint8Array): void {
@@ -298,8 +368,8 @@ class ByteWriter {
   }
 }
 
-/** A sorted-key string map, matching the Rust `put_str_map` a determinism gate depends on. */
-function putStrMap(w: ByteWriter, map: Record<string, string>): void {
+/** A sorted-key string map, matching the Rust `put_str_map` a determinism gate depends on. @internal */
+export function putStrMap(w: ByteWriter, map: Record<string, string>): void {
   const body = new ByteWriter();
   for (const key of Object.keys(map).sort()) {
     body.string(key);
@@ -310,7 +380,8 @@ function putStrMap(w: ByteWriter, map: Record<string, string>): void {
   w.bytes(bytes);
 }
 
-function record(opcode: number, content: Uint8Array): Uint8Array {
+/** @internal one opcode-tagged, length-prefixed record. */
+export function record(opcode: number, content: Uint8Array): Uint8Array {
   const w = new ByteWriter(content.length + 9);
   w.u8(opcode);
   w.u64(content.length);
@@ -359,7 +430,7 @@ async function deflate(raw: Uint8Array): Promise<Uint8Array> {
  * chosen. Picking the smallest is a size optimization this encoder forgoes for simplicity —
  * what it must get exactly right is the decoded integers, not the byte count.
  */
-async function encodeStream(
+export async function encodeStream(
   attributeId: number,
   values: number[],
   channels: number,
@@ -552,16 +623,34 @@ interface Plan {
   members: number[];
 }
 
-function support(g: GaussianInput, cutoff: number): { lo: number[]; hi: number[] } {
-  const k = supportK(cutoff);
-  const lo = new Array<number>(g.count);
-  const hi = new Array<number>(g.count);
-  for (let i = 0; i < g.count; i++) {
-    const sigma = g.sigmaT[i]!;
-    const mu = g.muT[i]!;
-    const half = Number.isFinite(sigma) ? k * sigma : Infinity;
-    lo[i] = Math.max(mu - half, g.winLo[i]!);
-    hi[i] = Math.min(mu + half, g.winHi[i]!);
+/** Containment bounds for the public temporal state this file reconstructs. */
+function planningSupport(q: Quantized, cutoff: number): { lo: number[]; hi: number[] } {
+  const lo = new Array<number>(q.mu.length);
+  const hi = new Array<number>(q.mu.length);
+  // `cutoff` is already known to be in `(0, 1]` (`checkCutoff`), so the predecessor is
+  // zero for exactly one input: the smallest positive subnormal. There the only finite
+  // conservative inverse is the whole timeline. Every other threshold has a positive
+  // predecessor and a real `supportK`.
+  const marginalFloor = nextDown(cutoff);
+  // `stateAt` rounds subtraction and division before the marginal comparison. Gamma(2)
+  // bounds those two binary64 operations in ratio space.
+  const unitRoundoff = Number.EPSILON / 2;
+  const arithmeticGuard = (2 * unitRoundoff) / (1 - 2 * unitRoundoff);
+  for (let i = 0; i < q.mu.length; i++) {
+    const neverFades = (q.flags[i]! & 1) !== 0;
+    const sigma = neverFades ? Infinity : Math.fround(Math.exp(q.sigma[i]! * q.steps.sigmaLog));
+    const tStep = muStep(q.sigma[i]!, q.steps.sigmaLog, neverFades, q.grid.stepTime);
+    const mu = Math.fround(q.mu[i]! * tStep);
+    const half =
+      neverFades || marginalFloor === 0
+        ? Infinity
+        : nextUp(supportK(marginalFloor) * Math.max(sigma, 1e-30) * (1 + arithmeticGuard));
+    const [storedLo, storedHi] = q.windows[q.windowIndex[i]!]!;
+    // Window records are f64, while the public GaussianSet lanes used by `stateAt` are f32.
+    const windowLo = Math.fround(storedLo);
+    const windowHi = Math.fround(storedHi);
+    lo[i] = Math.max(nextDown(mu - half), windowLo);
+    hi[i] = Math.min(nextUp(mu + half), windowHi);
   }
   return { lo, hi };
 }
@@ -608,8 +697,13 @@ function planChunks(
     const a = tops[w]!;
     const b = tops[w + 1]!;
     const pool: number[] = [];
+    // Exact containment, with no tolerance either side. A chunk's `[t0, t1)` is the whole
+    // promise an indexed seek reads: support that reaches 1e-9 past `t1` is support the
+    // chunk does not cover, and admitting it makes `chunksForTime(t1)` return a chunk that
+    // omits a gaussian `stateAt(t1)` reports visible. The bounds arriving here are already
+    // directed outwards by `planningSupport`, so slack here would only undo that.
     for (let i = 0; i < n; i++) {
-      if (lo[i]! >= a - 1e-9 && hi[i]! <= b + 1e-9 && assigned[i] === -1) pool.push(i);
+      if (lo[i]! >= a && hi[i]! <= b && assigned[i] === -1) pool.push(i);
     }
     const kept = descend(a, b, 0, pool);
     if (kept.length > 0) {
@@ -658,6 +752,104 @@ function gather(values: number[], members: number[], channels: number): number[]
   return out;
 }
 
+function checkedObjectIds(g: GaussianInput): ArrayLike<number> | null {
+  const ids = g.objectId ?? null;
+  if (ids === null) return null;
+  if (ids.length !== g.count) {
+    throw new Error(`object_id has ${ids.length} values, expected ${g.count}`);
+  }
+  for (let i = 0; i < ids.length; i++) {
+    const value = ids[i]!;
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      throw new Error(`object_id[${i}] is ${value}; expected an exact integer in [0, 4294967295]`);
+    }
+  }
+  return ids;
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x7f) {
+      bytes += 1;
+    } else if (code <= 0x7ff) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else {
+        bytes += 3; // TextEncoder replaces a lone surrogate with U+FFFD.
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function checkObjectTableRecordSize(table: ObjectTable): void {
+  let framedBytes = RECORD_HEADER_BYTES + 4 + 2;
+  const add = (bytes: number, objectId: number): void => {
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > MAX_FRONT_MATTER_BYTES - framedBytes) {
+      throw new Error(
+        `ObjectTable record exceeds the ${MAX_FRONT_MATTER_BYTES} byte indexed ` +
+          `front-matter ceiling while encoding object ${objectId}`,
+      );
+    }
+    framedBytes += bytes;
+  };
+
+  for (const entry of table.entries) {
+    add(4 + 4 + utf8ByteLength(entry.label), entry.objectId); // object_id and label
+    add(entry.anchor.length * 4 + 1, entry.objectId); // anchor and dynamics flag
+    if (entry.dynamics !== null) {
+      for (const vector of entry.dynamics) add(vector.length * 4, entry.objectId);
+    }
+    if (table.embeddingDim > 0) {
+      add(1, entry.objectId); // has_embedding
+      if (entry.embedding !== null) add(entry.embedding.length * 4, entry.objectId);
+    }
+  }
+}
+
+function encodeObjectTable(table: ObjectTable): Uint8Array {
+  checkObjectTable(table);
+  const body = new ByteWriter();
+  body.u32(table.entries.length);
+  body.u16(table.embeddingDim);
+  for (const entry of table.entries) {
+    body.u32(entry.objectId);
+    body.string(entry.label);
+    for (const value of entry.anchor) body.f32(value);
+    body.u8(entry.dynamics === null ? 0 : 1);
+    if (entry.dynamics !== null) {
+      for (const vector of entry.dynamics) for (const value of vector) body.f32(value);
+    }
+    if (table.embeddingDim > 0) {
+      body.u8(entry.embedding === null ? 0 : 1);
+      if (entry.embedding !== null) for (const value of entry.embedding) body.f32(value);
+    }
+  }
+  return record(OP_OBJECT_TABLE, body.finish());
+}
+
+function encodeObjectTrack(track: ObjectTrack): Uint8Array {
+  checkObjectTrack(track);
+  const body = new ByteWriter();
+  body.u32(track.objectId);
+  body.u8(track.interpolation);
+  body.u32(track.times.length);
+  for (let i = 0; i < track.times.length; i++) {
+    body.f64(track.times[i]!);
+    for (const value of track.rotations[i]!) body.f64(value);
+    for (const value of track.translations[i]!) body.f64(value);
+  }
+  return record(OP_OBJECT_TRACK, body.finish());
+}
+
 /**
  * Encode a set of gaussians into a `.4dgs` byte buffer.
  *
@@ -670,6 +862,7 @@ export async function encodeScene(
   options: WriteOptions = {},
 ): Promise<Uint8Array> {
   const cutoff = options.cutoff ?? 0.05;
+  checkCutoff(cutoff);
   const maxDepth = options.maxDepth ?? 6;
   const minChunk = options.minChunkGaussians ?? 2048;
   const writeIndex = options.writeIndex ?? true;
@@ -681,8 +874,32 @@ export async function encodeScene(
   const profile = options.profile ?? "";
   const library = options.library ?? "4dgs-typescript encoder";
   const attributes = options.attributes ?? {};
+  const objects = options.objects ?? null;
 
   const n = gaussians.count;
+  const objectIds = checkedObjectIds(gaussians);
+  if (profile === "objects") {
+    if (n > 0 && objectIds === null) {
+      throw new Error(
+        "the objects profile requires an object_id stream in every non-empty chunk, " +
+          "but the GaussianInput carries none",
+      );
+    }
+    if (objects?.table == null) {
+      throw new Error("the objects profile requires one ObjectTable record, but none was supplied");
+    }
+  }
+  if (objects !== null) {
+    objects.check();
+    if (objects.table !== null) {
+      // The indexed object path applies this ceiling before allocating a record
+      // from its declared range. Enforce the same bound from lengths alone before
+      // validation walks an embedding or the writer materializes its bytes.
+      checkObjectTableRecordSize(objects.table);
+      checkObjectTable(objects.table);
+    }
+    for (const track of objects.tracks) checkObjectTrack(track);
+  }
   const q = quantizeScene(gaussians, cutoff);
 
   // Window boundaries are the top level of the partition.
@@ -693,7 +910,7 @@ export async function encodeScene(
   let topsArr = Array.from(tops).sort((a, b) => a - b);
   if (topsArr.length < 2) topsArr = [0, Math.max(durationSec, 1e-9)];
 
-  const { lo, hi } = support(gaussians, cutoff);
+  const { lo, hi } = planningSupport(q, cutoff);
   let plans = n === 0 ? [] : planChunks(lo, hi, topsArr, maxDepth, minChunk);
   if (n > 0 && plans.length === 0) {
     plans = [
@@ -779,6 +996,15 @@ export async function encodeScene(
   }
   out.bytes(record(OP_WINDOW_TABLE, wt.finish()));
 
+  // Advisory object front matter. Membership is still an attribute stream in each Chunk;
+  // the table only names those ids, and the tracks transport their reconstructed state.
+  if (objects?.table !== null && objects?.table !== undefined) {
+    out.bytes(encodeObjectTable(objects.table));
+  }
+  if (objects !== null) {
+    for (const track of objects.tracks) out.bytes(encodeObjectTrack(track));
+  }
+
   // Chunks, each followed by its SH band records.
   interface IndexEntry {
     t0: number;
@@ -809,6 +1035,18 @@ export async function encodeScene(
     ];
     for (const [id, values, channels] of columns) {
       streams.bytes(await encodeStream(id, values, channels));
+    }
+    if (objectIds !== null) {
+      // Attribute symbols are signed i32. Reinterpret each u32 label as its two's-
+      // complement code so every bit pattern survives exactly; the decoder reverses
+      // the view without quantization.
+      streams.bytes(
+        await encodeStream(
+          A_OBJECT_ID,
+          members.map((i) => objectIds[i]! | 0),
+          1,
+        ),
+      );
     }
 
     const chunkOffset = out.length; // absolute byte offset of the record
@@ -869,6 +1107,7 @@ export async function encodeScene(
       }
       out.bytes(record(OP_CHUNK_INDEX, e.finish()));
     }
+    const indexGroupLength = out.length - groupStart;
     if (writeStatistics) {
       const s = new ByteWriter();
       s.u64(n);
@@ -882,7 +1121,7 @@ export async function encodeScene(
       const s = new ByteWriter();
       s.u8(OP_CHUNK_INDEX);
       s.u64(groupStart);
-      s.u64(out.length - groupStart);
+      s.u64(indexGroupLength);
       out.bytes(record(OP_SUMMARY_OFFSET, s.finish()));
     }
     summaryLen = out.length - summaryStart;

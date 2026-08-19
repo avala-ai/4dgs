@@ -24,13 +24,17 @@ export { BytesReadable, type IReadable } from "./readable.js";
 export {
   FourdgsError,
   MalformedFile,
+  Refusal,
   TruncatedFile,
   UnsupportedCodec,
   UnsupportedVersion,
+  type FourdgsErrorOptions,
+  type RefusalCode,
 } from "./errors.js";
 
 export {
   Attribute,
+  ATTRIBUTE_CHANNELS,
   FROZEN_OPCODES,
   GAUSSIAN_FLAG_NEVER_FADES,
   HEADER_FLAG_CHUNKS_COMPRESSED,
@@ -57,6 +61,7 @@ export {
   type Decompressor,
   codecName,
   crc32,
+  decompressorFor,
   inflateZlib,
 } from "./codec.js";
 
@@ -106,6 +111,7 @@ export {
   type Statistics,
   type SummaryOffset,
   BACKGROUND_OBJECT,
+  bytesEqual,
   checkCoordinateFrame,
   checkGeodeticAnchor,
   checkMagic,
@@ -195,11 +201,15 @@ export {
 
 export {
   MAX_SH_DEGREE,
+  SH_MAX_BITS,
+  SH_MIN_BITS,
   type ShCoefficients,
   bandCoefficientRange,
   coefficientsForDegree,
   coefficientsInBand,
   mergeBands,
+  shBound,
+  shStep,
 } from "./sh.js";
 
 export {
@@ -225,6 +235,8 @@ export { type AudioPayloadChunk, type DecodeOptions, type Scene, decodeScene } f
 
 export {
   HEAD_PROBE_BYTES,
+  MAX_DEFERRED_RECORDS,
+  MAX_FRONT_MATTER_BYTES,
   IndexedDecoder,
   type IndexedChunk,
   type OpenIndexedOptions,
@@ -234,14 +246,29 @@ export {
 export {
   KEYFRAME_DELTA_BIN_MAX,
   KEYFRAME_DELTA_BIN_MIN,
+  MAX_KEYFRAME_DELTA_INDEX_ENTRIES,
+  MAX_KEYFRAME_DELTA_SUMMARY_BYTES,
+  KeyframeDeltaIndexedDecoder,
   KeyframeDeltaState,
   type Interval,
   type KeyframeDeltaChunkInfo,
+  type KeyframeDeltaGaussians,
   type KeyframeDeltaIndexedResult,
   type KeyframeDeltaSequence,
+  type OpenKeyframeDeltaIndexedOptions,
   chainFor,
   checkTiling,
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
+  keyframeDeltaChunkAt,
+  keyframeDeltaValidationRecordOffset,
+  validateKeyframeDeltaStreamed,
   keyframeDeltaStatesJson,
+  reconstructKeyframeDelta,
 } from "./keyframeDelta.js";
+
+export {
+  type KeyframeDeltaSample,
+  type KeyframeDeltaWriteOptions,
+  encodeKeyframeDeltaSequence,
+} from "./keyframeDeltaWriter.js";

@@ -2,13 +2,8 @@
  * Copyright 2026 Avala AI
  * SPDX-License-Identifier: Apache-2.0
  *
- * A C program that exercises the C ABI the way a binding does.
- *
- * It exists to prove three things a Rust test cannot: that include/fourdgs.h compiles as
- * C, that every symbol it declares actually links, and that the documented null and
- * error behaviour holds when the caller is a C compiler rather than Rust pretending to be
- * one. The C++ and Swift packages bind to this surface, so a drift between the header and
- * the library is their outage, not ours to discover later.
+ * Exercises the C ABI as a binding does: the header compiles as C, every declared symbol
+ * links, and null/error behavior follows the contract.
  *
  * Usage: capi_smoke <file.4dgs>
  */
@@ -48,6 +43,16 @@ static void check_null_safety(void) {
     fourdgs_scene_free(NULL);
     fourdgs_state_free(NULL);
     check(fourdgs_last_error() != NULL, "the last error is never a null pointer");
+    check(fourdgs_last_refusal_code(NULL, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
+          "a null refusal-code out parameter is an invalid argument");
+    check(fourdgs_last_error_offset(NULL, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
+          "a null error-offset out parameter is an invalid argument");
+    fourdgs_reader missing_reader = {0};
+    uint64_t declared_count = 0;
+    check(fourdgs_validate_keyframe_delta_reader(missing_reader, FOURDGS_OPEN_INDEXED,
+                                                 NULL, NULL, &declared_count) ==
+              FOURDGS_STATUS_INVALID_ARGUMENT,
+          "the bounded keyframe-delta validator rejects a missing reader");
     check(strcmp(fourdgs_status_message(FOURDGS_STATUS_OK), "ok") == 0,
           "status 0 is named ok");
 }
@@ -61,6 +66,28 @@ static void check_bad_magic(void) {
           "a buffer that is not a 4dgs file is an unsupported version");
     check(scene == NULL, "a failed open leaves the out parameter untouched");
     check(strlen(fourdgs_last_error()) > 0, "a failure leaves a message behind");
+
+    /* And which refusal it was, which the status code cannot say. Length-carrying, not
+     * NUL-terminated: compare on the length the accessor gave. */
+    const char *code = NULL;
+    size_t code_len = 0;
+    check(fourdgs_last_refusal_code(&code, &code_len) == FOURDGS_STATUS_OK,
+          "the refusal identifier is readable after a refusal");
+    check(code != NULL && code_len == strlen("magic-mismatch") &&
+              memcmp(code, "magic-mismatch", code_len) == 0,
+          "a bad magic is refused as magic-mismatch");
+
+    /* An error the refusal table does not name exposes none rather than the previous one:
+     * three bytes are shorter than the magic, which is a truncation, not a mismatch. */
+    const uint8_t stub[3] = {0};
+    check(fourdgs_open_memory(stub, sizeof stub, &scene) == FOURDGS_STATUS_TRUNCATED,
+          "a buffer shorter than the magic is truncated");
+    code = NULL;
+    code_len = 1;
+    check(fourdgs_last_refusal_code(&code, &code_len) == FOURDGS_STATUS_OK,
+          "the refusal identifier is readable after any error");
+    check(code == NULL && code_len == 0,
+          "an error the refusal table does not name exposes no identifier");
 }
 
 /* Everything a binding needs to state what it read, exercised the way one would. */
@@ -315,8 +342,17 @@ static void check_writer(void) {
         const char *states = NULL;
         size_t states_len = 0;
         check(fourdgs_keyframe_delta_states_json(data, length, 0, &states, &states_len) ==
-                  FOURDGS_STATUS_MALFORMED,
+                  FOURDGS_STATUS_UNSUPPORTED_CODEC,
               "the keyframe-delta decoder refuses a gaussian-birth file on the streamed path");
+        const char *wrong_model_code = NULL;
+        size_t wrong_model_code_len = 0;
+        check(fourdgs_last_refusal_code(&wrong_model_code, &wrong_model_code_len) ==
+                  FOURDGS_STATUS_OK,
+              "the wrong temporal-model refusal identifier is readable");
+        check(wrong_model_code != NULL &&
+                  wrong_model_code_len == strlen("unknown-temporal-model") &&
+                  memcmp(wrong_model_code, "unknown-temporal-model", wrong_model_code_len) == 0,
+              "the wrong keyframe-delta reader reports unknown-temporal-model");
 
         /* Null out parameters are refused; null frees are ignored. */
         check(fourdgs_peek_temporal_model(data, length, NULL, NULL) ==

@@ -17,7 +17,13 @@ import {
   BytesReadable,
   Crc32,
   Cursor,
+  FourdgsError,
   MalformedFile,
+  Refusal,
+  checkQuantizationScheme,
+  checkTemporalModel,
+  checkWindowIndex,
+  decompressorFor,
   MAX_TRAJECTORY_SAMPLES,
   TruncatedFile,
   parseRigTrajectory,
@@ -30,10 +36,12 @@ import {
   poseAt,
   UnsupportedVersion,
   StreamDecoder,
+  assembleGaussians,
   audioSourceStateAt,
   bandCoefficientRange,
   decodeScene,
   encodeScene,
+  IndexedDecoder,
   checkMagic,
   coefficientsForDegree,
   coefficientsInBand,
@@ -145,6 +153,72 @@ test("magic checking separates a foreign file from a future version", () => {
   assert.throws(() => checkMagic(future), /major version 9 is not supported/);
   assert.throws(() => checkMagic(new Uint8Array(8)), /not a 4dgs file/);
   assert.throws(() => checkMagic(new Uint8Array(3)), TruncatedFile);
+
+  // Only the version byte may differ for this to be a version problem. A corrupted
+  // sentinel used to read as "unsupported version 1", which sends the file's holder
+  // looking for a newer reader that would not have helped.
+  const guard = Uint8Array.from(MAGIC);
+  guard[0] = 0x88;
+  assert.throws(() => checkMagic(guard), /not a 4dgs file/);
+  const lineEnding = Uint8Array.from(MAGIC);
+  lineEnding[6] = 0x0a;
+  assert.throws(() => checkMagic(lineEnding), /not a 4dgs file/);
+});
+
+test("a named refusal carries the identifier every SDK is compared on", () => {
+  // The identifier, not the class: `UnsupportedCodec` covers an unknown temporal model,
+  // an unknown quantization scheme and an unknown stream codec alike, so "it threw
+  // UnsupportedCodec" cannot tell a decoder that refused for the right reason from one
+  // that refused for the wrong one. These are the strings the invalid corpus diffs.
+  const refusalOf = (fn: () => unknown): string | undefined => {
+    try {
+      fn();
+    } catch (error) {
+      assert.ok(error instanceof FourdgsError, `not a FourdgsError: ${String(error)}`);
+      return error.refusalCode;
+    }
+    return assert.fail("expected a refusal");
+  };
+
+  const guard = Uint8Array.from(MAGIC);
+  guard[0] = 0x88;
+  assert.equal(
+    refusalOf(() => checkMagic(guard)),
+    Refusal.MagicMismatch,
+  );
+  const future = Uint8Array.from(MAGIC);
+  future[5] = 0x39;
+  assert.equal(
+    refusalOf(() => checkMagic(future)),
+    Refusal.UnsupportedMajorVersion,
+  );
+  assert.equal(
+    refusalOf(() => checkTemporalModel("frame-sequence")),
+    Refusal.UnknownTemporalModel,
+  );
+  assert.equal(
+    refusalOf(() => checkTemporalModel("")),
+    Refusal.UnknownTemporalModel,
+  );
+  assert.equal(
+    refusalOf(() => checkQuantizationScheme("uniform-v9")),
+    Refusal.UnknownQuantizationScheme,
+  );
+  assert.equal(
+    refusalOf(() => decompressorFor(9, DEFAULT_CODECS)),
+    Refusal.UnknownStreamCodec,
+  );
+  assert.equal(
+    refusalOf(() => checkWindowIndex(3, 1)),
+    Refusal.WindowIndexOutOfRange,
+  );
+
+  // An error the refusal table does not name carries no identifier — that is "not one of
+  // the refusals the corpus compares", not "no error".
+  assert.equal(
+    refusalOf(() => checkMagic(new Uint8Array(3))),
+    undefined,
+  );
 });
 
 test("CRC-32 matches the IEEE values the footer is written with", () => {
@@ -428,6 +502,9 @@ test("rounding matches Python's round, including the ties a float32 can hit", ()
     [640.0078125, 640.007812],
     [2.5e-6, 3e-6],
     [1.5e-6, 2e-6],
+    // Re-parsing the rounded decimal is significant here: scaling the binary64 and
+    // rounding that product directly picks the adjacent, more-negative unit.
+    [-1816130890.8634775, -1816130890.863477],
   ];
   for (const [input, expected] of cases) {
     assert.equal(roundHalfEven(input, 6), expected, `round(${input}, 6)`);
@@ -473,6 +550,378 @@ test("the encoder writes a file that decodes back to what went in", async () => 
   for (let i = 0; i < count * 3; i++) {
     assert.ok(Math.abs(scene.gaussians.positions[i]! - gaussians.positions[i]!) < 0.05);
   }
+});
+
+function objectGaussianInput(objectId?: readonly number[]) {
+  const count = objectId?.length ?? 2;
+  return {
+    count,
+    positions: Array.from({ length: count * 3 }, (_, i) => (i % 3 === 0 ? i / 3 : 0)),
+    scales: Array.from({ length: count * 3 }, () => 0.1),
+    rotations: Array.from({ length: count }, () => [0, 0, 0, 1]).flat(),
+    colors: Array.from({ length: count }, () => [0.2, 0.4, 0.6, 1]).flat(),
+    motions: Array.from({ length: count * 3 }, () => 0),
+    muT: Array.from({ length: count }, () => 0.5),
+    sigmaT: Array.from({ length: count }, () => Number.POSITIVE_INFINITY),
+    winLo: Array.from({ length: count }, () => 0),
+    winHi: Array.from({ length: count }, () => 1),
+    ...(objectId === undefined ? {} : { objectId }),
+  };
+}
+
+const objectTable = {
+  embeddingDim: 0,
+  entries: [
+    {
+      objectId: 1,
+      label: "object one",
+      anchor: [0, 0, 0],
+      dynamics: null,
+      embedding: null,
+    },
+  ],
+};
+
+test("the objects profile requires object_id on every non-empty Chunk", async () => {
+  const options = { profile: "objects", objects: new ObjectLayer(objectTable) };
+  await assert.rejects(
+    () => encodeScene(objectGaussianInput(), 1, options),
+    /the objects profile requires an object_id stream in every non-empty chunk/,
+  );
+});
+
+test("the objects profile requires exactly one Object Table", async () => {
+  const gaussians = objectGaussianInput([1, 1]);
+  await assert.rejects(
+    () => encodeScene(gaussians, 1, { profile: "objects" }),
+    /the objects profile requires one ObjectTable record/,
+  );
+});
+
+test("object_id preserves the complete unsigned 32-bit domain", async () => {
+  const ids = [0, 0x7fffffff, 0x80000000, 0xffffffff];
+  const gaussians = objectGaussianInput(ids);
+  const options = {
+    profile: "objects",
+    minChunkGaussians: 1,
+    objects: new ObjectLayer(objectTable),
+  };
+  const scene = await decodeScene(new BytesReadable(await encodeScene(gaussians, 1, options)));
+
+  assert.deepEqual([...scene.gaussians.objectId!], ids);
+  assert.equal(scene.objects.table?.entries[0]?.label, "object one");
+});
+
+test("an empty objects-profile scene still requires and writes one Object Table", async () => {
+  const gaussians = objectGaussianInput([]);
+  await assert.rejects(
+    () => encodeScene(gaussians, 0, { profile: "objects" }),
+    /the objects profile requires one ObjectTable record/,
+  );
+
+  const options = { profile: "objects", objects: new ObjectLayer(objectTable) };
+  const scene = await decodeScene(new BytesReadable(await encodeScene(gaussians, 0, options)));
+  assert.equal(scene.gaussians.count, 0);
+  assert.equal(scene.objects.table?.entries.length, 1);
+});
+
+test("object_id length is the gaussian population", async () => {
+  const gaussians = objectGaussianInput([1, 2]);
+  const wrong = { ...gaussians, objectId: [1] };
+  const options = { writeCrc: true, objects: new ObjectLayer(objectTable) };
+  await assert.rejects(() => encodeScene(wrong, 1, options), /object_id has 1 values, expected 2/);
+});
+
+test("the writer preserves Object Table values and Object Tracks", async () => {
+  const table = {
+    embeddingDim: 2,
+    entries: [
+      {
+        objectId: 1,
+        label: "moving object",
+        anchor: [0.25, -0.5, 0.75],
+        dynamics: [
+          [1, 2, 3],
+          [4, 5, 6],
+          [7, 8, 9],
+        ] as [[number, number, number], [number, number, number], [number, number, number]],
+        embedding: [0.125, -0.25],
+      },
+    ],
+  };
+  const track = {
+    objectId: 1,
+    interpolation: 0,
+    times: [0, 1],
+    rotations: [
+      [0, 0, 0, 1],
+      [0, 0, 1, 0],
+    ],
+    translations: [
+      [0, 0, 0],
+      [1, 2, 3],
+    ],
+  };
+  const options = { profile: "objects", objects: new ObjectLayer(table, [track]) };
+  const bytes = await encodeScene(objectGaussianInput([1]), 1, options);
+  const scene = await decodeScene(new BytesReadable(bytes));
+
+  assert.deepEqual(scene.objects.table?.entries[0]?.dynamics, table.entries[0]!.dynamics);
+  assert.deepEqual(scene.objects.table?.entries[0]?.embedding, table.entries[0]!.embedding);
+  assert.deepEqual(scene.objects.tracks, [track]);
+});
+
+test("the writer rejects an Object Track past the decoder sample ceiling", async () => {
+  // Sparse arrays make the declared shape cheap. The ceiling must win before
+  // validation walks them or diagnoses their intentionally absent rows.
+  const declared = MAX_TRAJECTORY_SAMPLES + 1;
+  const track = {
+    objectId: 1,
+    interpolation: 0,
+    times: new Array<number>(declared),
+    rotations: new Array<number[]>(declared),
+    translations: new Array<number[]>(declared),
+  };
+  await assert.rejects(
+    () =>
+      encodeScene(objectGaussianInput([1]), 1, {
+        profile: "objects",
+        objects: new ObjectLayer(objectTable, [track]),
+      }),
+    /ObjectTrack for object 1 declares 1000001 samples, past the 1000000 ceiling/,
+  );
+});
+
+function oneTemporalGaussian(muT: number, sigmaT: number, winHi = 1) {
+  return {
+    count: 1,
+    positions: [0, 0, 0],
+    scales: [0.01, 0.01, 0.01],
+    rotations: [0, 0, 0, 1],
+    colors: [0.5, 0.5, 0.5, 1],
+    motions: [0, 0, 0],
+    muT: [muT],
+    sigmaT: [sigmaT],
+    winLo: [0],
+    winHi: [winHi],
+  };
+}
+
+function adjacent(value: number, upward: boolean): number {
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, value);
+  const bits = view.getBigUint64(0);
+  const increment = upward ? value > 0 : value < 0;
+  view.setBigUint64(0, increment ? bits + 1n : bits - 1n);
+  return view.getFloat64(0);
+}
+
+async function assertIndexedGaussianVisible(bytes: Uint8Array, t: number): Promise<void> {
+  const full = await decodeScene(new BytesReadable(bytes));
+  assert.equal(full.gaussians.stateAt(t, full.header.cutoff).indices.length, 1);
+  const indexed = await IndexedDecoder.open(new BytesReadable(bytes));
+  const covering = indexed.chunksForTime(t);
+  assert.equal(covering.length, 1, `no indexed chunk covers visible t=${t}`);
+  assert.equal((await indexed.readChunk(covering[0]!)).gaussians.count, 1);
+}
+
+test("chunk planning covers support after temporal quantization", async () => {
+  const cutoff = Math.exp(-0.5);
+  const gaussian = oneTemporalGaussian(0.2541, 0.2452);
+  const bytes = await encodeScene(gaussian, 1, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+
+  assert.ok(gaussian.muT[0]! + gaussian.sigmaT[0]! < 0.5);
+  assert.ok(Math.abs(decoded.gaussians.muT[0]! - 0.256) < 1e-7);
+  assert.ok(Math.abs(decoded.gaussians.sigmaT[0]! - 0.25002763) < 1e-7);
+  await assertIndexedGaussianVisible(bytes, 0.5);
+});
+
+test("an inclusive support endpoint stays in an indexed half-open chunk", async () => {
+  const cutoff = Math.exp(-0.5);
+  const gaussian = oneTemporalGaussian(0.2541, 0.2452);
+  const seed = await encodeScene(gaussian, 1, { cutoff, maxDepth: 0 });
+  const reconstructed = await decodeScene(new BytesReadable(seed));
+  const boundary = reconstructed.gaussians.muT[0]! + reconstructed.gaussians.sigmaT[0]!;
+  const duration = 2 * boundary;
+  gaussian.winHi[0] = duration;
+
+  const bytes = await encodeScene(gaussian, duration, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mu = decoded.gaussians.muT[0]!;
+  const sigma = decoded.gaussians.sigmaT[0]!;
+  assert.equal(mu + sigma, boundary);
+  assert.ok(Math.exp(-0.5 * ((boundary - mu) / sigma) ** 2) >= cutoff);
+  await assertIndexedGaussianVisible(bytes, boundary);
+});
+
+test("rounded visibility below a lower support endpoint stays indexed", async () => {
+  const cutoff = 0.9;
+  const gaussian = oneTemporalGaussian(0.5, 1);
+  const seed = await encodeScene(gaussian, 1, { cutoff, maxDepth: 0 });
+  const reconstructed = await decodeScene(new BytesReadable(seed));
+  const mu = reconstructed.gaussians.muT[0]!;
+  const sigma = reconstructed.gaussians.sigmaT[0]!;
+  const boundary = mu - supportK(cutoff) * sigma;
+  const duration = 2 * boundary;
+  gaussian.winHi[0] = duration;
+
+  const bytes = await encodeScene(gaussian, duration, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const below = adjacent(boundary, false);
+  const z = (below - mu) / sigma;
+  assert.ok(Math.exp(-0.5 * z * z) >= cutoff);
+  await assertIndexedGaussianVisible(bytes, below);
+});
+
+test("cutoff one planning covers both binary64 neighbors of the mean", async () => {
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    cutoff: 1,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mean = decoded.gaussians.muT[0]!;
+
+  await assertIndexedGaussianVisible(bytes, adjacent(mean, false));
+  await assertIndexedGaussianVisible(bytes, adjacent(mean, true));
+});
+
+test("chunk planning covers a cancellation-prone rounded visibility endpoint", async () => {
+  const cutoff = 0.5;
+  const endpoint = 6_042_103.559_942_351;
+  const gaussian = oneTemporalGaussian(-6_222_906, 10_416_940, 20_000_000);
+  const bytes = await encodeScene(gaussian, 2 * endpoint, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mu = decoded.gaussians.muT[0]!;
+  const sigma = decoded.gaussians.sigmaT[0]!;
+  const z = (endpoint - mu) / Math.max(sigma, 1e-30);
+
+  assert.equal(mu, -6_222_906);
+  assert.equal(sigma, 10_416_940);
+  assert.equal(Math.exp(-0.5 * z * z), cutoff);
+  await assertIndexedGaussianVisible(bytes, endpoint);
+});
+
+/** Every gaussian `stateAt(t)` reports visible is reachable through the index at `t`. */
+async function assertIndexedStateAgrees(bytes: Uint8Array, t: number): Promise<void> {
+  const full = await decodeScene(new BytesReadable(bytes));
+  const expected = full.gaussians.stateAt(t, full.header.cutoff).indices.length;
+  assert.ok(expected > 0, `the scene must have something visible at t=${t} to prove anything`);
+  const indexed = await IndexedDecoder.open(new BytesReadable(bytes));
+  let reached = 0;
+  for (const entry of indexed.chunksForTime(t)) {
+    const chunk = await indexed.readChunk(entry);
+    // Assembled rather than counted by hand, so the indexed side answers "visible" with
+    // exactly the rule the streamed side used.
+    const seekable = assembleGaussians([chunk.gaussians], indexed.windows, 0);
+    reached += seekable.stateAt(t, full.header.cutoff).indices.length;
+  }
+  assert.equal(reached, expected, `the indexed seek at t=${t} reached ${reached} of ${expected}`);
+}
+
+test("top-level containment does not tolerate support past its t1", async () => {
+  // Gaussian 1 contributes an exact 0.5 top-level split but is absent at that instant. At
+  // cutoff one, gaussian 0 stays visible across a tiny rounded plateau around its mean,
+  // and its conservative upper support lands less than 1e-9 past that split. A containment
+  // test with 1e-9 of slack admits it into [0, 0.5), and then chunksForTime(0.5) returns a
+  // chunk without it while stateAt(0.5) still reports it visible.
+  //
+  // `sigmaT` is load-bearing, not decoration. The plateau's half-width is
+  // `supportK(nextDown(1)) * sigma`, and `supportK(nextDown(1))` is about 1.49e-8, so the
+  // endpoint lands inside a 1e-9 tolerance only while sigma stays under about 0.067. At
+  // `sigmaT = 0.1` it is 1.5e-9 past the split, wide enough that even a tolerant
+  // containment test rejects it and this stops proving anything.
+  const gaussians = {
+    count: 2,
+    positions: [0, 0, 0, 1, 0, 0],
+    scales: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+    rotations: [0, 0, 0, 1, 0, 0, 0, 1],
+    colors: [0.5, 0.5, 0.5, 1, 0.25, 0.25, 0.25, 1],
+    motions: [0, 0, 0, 0, 0, 0],
+    muT: [0.5, 0.25],
+    sigmaT: [0.05, Infinity],
+    winLo: [0, 0],
+    winHi: [1.0, 0.5],
+  };
+  const bytes = await encodeScene(gaussians, 1, {
+    cutoff: 1,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  await assertIndexedStateAgrees(bytes, 0.5);
+});
+
+test("the writer refuses a cutoff outside (0, 1]", async () => {
+  // `supportK` inverts `Math.log(cutoff)`. Zero and negative thresholds are a domain error
+  // there, and the NaN half-width that comes back does not stay loud: every containment
+  // comparison in `planChunks` goes false, the tree collapses into one degenerate node,
+  // and the Chunk Index stops being a partition anybody can seek with. A threshold outside
+  // (0, 1] is not a threshold; it is refused before it is inverted, the same domain and
+  // the same sentence as Python's `quantization.support_k` and Rust's `check_cutoff`.
+  for (const bad of [0, -0.05, 1.5, Infinity, NaN]) {
+    await assert.rejects(
+      () => encodeScene(oneTemporalGaussian(0.5, 0.1), 1, { cutoff: bad }),
+      /a marginal threshold must be in \(0, 1\]/,
+      `cutoff ${bad} must be refused`,
+    );
+  }
+});
+
+test("the smallest positive cutoff plans the whole timeline", async () => {
+  // The one legal threshold whose predecessor is zero, and so the boundary of the refusal
+  // above. There is no finite `supportK` to invert; the conservative bound is the whole
+  // timeline, not the NaN an unchecked negative predecessor would produce.
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    cutoff: Number.MIN_VALUE,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  for (const t of [0, 0.25, 0.5, 0.75]) await assertIndexedGaussianVisible(bytes, t);
+});
+
+test("the Chunk Index Summary Offset excludes following Statistics", async () => {
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    writeIndex: true,
+    writeStatistics: true,
+    writeSummaryOffsets: true,
+  });
+  const scene = await decodeScene(new BytesReadable(bytes));
+
+  assert.equal(scene.summaryOffsets.length, 1);
+  const summaryOffset = scene.summaryOffsets[0]!;
+  assert.equal(summaryOffset.groupOpcode, Opcode.ChunkIndex);
+  const group = bytes.subarray(
+    summaryOffset.groupStart,
+    summaryOffset.groupStart + summaryOffset.groupLength,
+  );
+  let offset = 0;
+  let records = 0;
+  while (offset < group.length) {
+    assert.equal(group[offset], Opcode.ChunkIndex);
+    const length = Number(
+      new DataView(group.buffer, group.byteOffset + offset + 1, 8).getBigUint64(0, true),
+    );
+    offset += 9 + length;
+    records++;
+  }
+  assert.equal(offset, group.length);
+  assert.ok(records > 0);
 });
 
 /** Little-endian record bytes for the trajectory tests below. */
@@ -623,6 +1072,37 @@ test("an object table embedding must match the space the table declares", () => 
   assert.throws(
     () => checkObjectTable({ embeddingDim: 0, entries: [{ ...entry, embedding: [1, 2, 3] }] }),
     MalformedFile,
+  );
+});
+
+test("the writer rejects an Object Table past the indexed front-matter ceiling", async () => {
+  const embedding = new Proxy(new Array<number>(0xffff), {
+    get(target, property, receiver) {
+      if (property === "length") return 0xffff;
+      if (typeof property === "string" && /^\d+$/.test(property)) {
+        throw new Error("the oversized embedding was materialized");
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const table = {
+    embeddingDim: 0xffff,
+    entries: Array.from({ length: 256 }, (_, index) => ({
+      objectId: index + 1,
+      label: "",
+      anchor: [0, 0, 0],
+      dynamics: null,
+      embedding,
+    })),
+  };
+
+  await assert.rejects(
+    () =>
+      encodeScene(objectGaussianInput([1]), 1, {
+        profile: "objects",
+        objects: new ObjectLayer(table),
+      }),
+    /ObjectTable record exceeds the 67108864 byte indexed front-matter ceiling/,
   );
 });
 

@@ -198,6 +198,16 @@ test("a track transforms the base state; it does not replace it", () => {
   assert.deepEqual([...orientations.slice(4)], [0, 0, 0, 1]);
 });
 
+test("object tracks compose onto Float64 keyframe-delta reconstruction arrays", () => {
+  const layer = new ObjectLayer(null, [parseObjectTrack(quarterTurnTrack(7))]);
+  const centers = Float64Array.from([1, 0, 0]);
+  const orientations = Float64Array.from([0, 0, 0, 1]);
+  layer.apply(centers, orientations, Uint32Array.from([7]), 2);
+  assert.ok(Math.abs(centers[0]! - 5) < 1e-12);
+  assert.ok(Math.abs(centers[1]! - 3) < 1e-12);
+  assert.ok(Math.abs(orientations[2]! - Math.SQRT1_2) < 1e-12);
+});
+
 test("composition refuses arrays that do not match the gaussian count", () => {
   const layer = new ObjectLayer(null, [parseObjectTrack(quarterTurnTrack(7))]);
   assert.throws(

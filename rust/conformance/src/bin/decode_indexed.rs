@@ -12,14 +12,14 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use fourdgs::indexed_reader::{
-    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, read_objects,
-    IndexedScene,
+    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, read_chunk_within,
+    read_objects, IndexedScene, ResidentBudget,
 };
 use fourdgs::keyframe_delta_file::decode_indexed as decode_keyframe_delta_indexed;
 use fourdgs::opcode;
 use fourdgs::readable::{FileReadable, Readable};
 use fourdgs::records::{ChunkIndexEntry, Header};
-use fourdgs::serialization::{check_magic, Records, MAGIC};
+use fourdgs::serialization::{Records, MAGIC};
 use fourdgs_conformance::{keyframe_delta_states_json, refusal_json, summarize, Extras, Failure};
 
 fn main() -> ExitCode {
@@ -64,9 +64,18 @@ impl<R: Readable> Readable for Counting<R> {
     }
 }
 
-/// The Header's temporal model, read without decoding the gaussians.
+/// The Header's temporal model, read only to choose the indexed decoder.
+///
+/// This is dispatch, not validation. In particular it must not check the magic: the
+/// selected indexed decoder owns that rule, so the invalid corpus can prove that the
+/// indexed path enforces it independently of the streamed path.
 fn temporal_model(path: &str, data: &[u8]) -> Result<Option<String>, Failure> {
-    check_magic(data).map_err(|e| Failure::from_error(path, &e))?;
+    // Only a known version-1 file is safe to parse with the version-1 record and Header
+    // layouts. Every other prefix goes straight to the indexed opener, which diagnoses a
+    // foreign magic separately from a future major version before it touches any record.
+    if data.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
+        return Ok(None);
+    }
     for record in Records::new(data, MAGIC.len()) {
         let record = record.map_err(|e| Failure::from_error(path, &e))?;
         if record.opcode == opcode::HEADER {
@@ -97,10 +106,15 @@ fn run(path: &str) -> Result<String, Failure> {
     };
     let scene = open_indexed(&mut source).map_err(|e| Failure::from_error(path, &e))?;
 
+    // Every chunk stays resident until the scene is assembled, so the ceiling is carried
+    // between the reads rather than reset by each one.
+    let mut budget =
+        ResidentBudget::for_scene(&scene).map_err(|e| Failure::from_error(path, &e))?;
     let mut chunks = Vec::with_capacity(scene.index.len());
     for entry in &scene.index {
         chunks.push(
-            read_chunk(&mut source, &scene, entry, 3).map_err(|e| Failure::from_error(path, &e))?,
+            read_chunk_within(&mut source, &scene, entry, 3, &mut budget)
+                .map_err(|e| Failure::from_error(path, &e))?,
         );
     }
     let audio_sources =

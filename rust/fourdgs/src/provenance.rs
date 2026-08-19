@@ -17,6 +17,8 @@
 //! never touches a [`Provenance`], and a file that carries none produces an empty one —
 //! which is a value, not an error.
 
+use std::collections::HashSet;
+
 use crate::error::{Error, Result};
 use crate::records::{
     CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration, POSE_TO_RIG, POSE_TO_SCENE,
@@ -291,6 +293,33 @@ pub struct Provenance {
     pub anchors: Vec<GeodeticAnchor>,
 }
 
+fn check_unique_record_names<T>(
+    values: &[T],
+    label: &str,
+    section: &str,
+    name: impl Fn(&T) -> &str,
+) -> Result<()> {
+    // A set rather than a scan of everything already seen. The record-count ceiling bounds
+    // how many of these there can be, which bounds memory; it only bounds the CPU spent on
+    // them if the work per record is constant, and rescanning the prefix is not.
+    let mut seen: HashSet<&str> = HashSet::new();
+    seen.try_reserve(values.len()).map_err(|error| {
+        Error::UnsupportedOperation(format!(
+            "the {label} name set could not reserve {} entries: {error}",
+            values.len()
+        ))
+    })?;
+    for value in values {
+        let value_name = name(value);
+        if !seen.insert(value_name) {
+            return Err(Error::Malformed(format!(
+                "two {label} records are named {value_name:?}; these records are referred to by name and nothing else (section {section})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Provenance {
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
@@ -384,40 +413,18 @@ impl Provenance {
     /// complete is not one of them — no byte after the cut can make two
     /// `SensorCalibration` records with one name unambiguous — so those still refuse.
     pub fn check_with(&self, truncated: bool) -> Result<()> {
-        let groups: [(&str, Vec<&str>, &str); 4] = [
-            (
-                "CoordinateFrame",
-                self.frames.iter().map(|f| f.name.as_str()).collect(),
-                "5.15.2",
-            ),
-            (
-                "SensorCalibration",
-                self.sensors.iter().map(|s| s.name.as_str()).collect(),
-                "5.15.3",
-            ),
-            (
-                "RigTrajectory",
-                self.trajectories.iter().map(|t| t.name.as_str()).collect(),
-                "5.15.4",
-            ),
-            (
-                "GeodeticAnchor",
-                self.anchors.iter().map(|a| a.frame_name.as_str()).collect(),
-                "5.15.5",
-            ),
-        ];
-        for (label, names, section) in groups {
-            let mut seen: Vec<&str> = Vec::with_capacity(names.len());
-            for name in names {
-                if seen.contains(&name) {
-                    return Err(Error::Malformed(format!(
-                        "two {label} records are named {name:?}; these records are referred to \
-                         by name and nothing else (section {section})"
-                    )));
-                }
-                seen.push(name);
-            }
-        }
+        check_unique_record_names(&self.frames, "CoordinateFrame", "5.15.2", |value| {
+            &value.name
+        })?;
+        check_unique_record_names(&self.sensors, "SensorCalibration", "5.15.3", |value| {
+            &value.name
+        })?;
+        check_unique_record_names(&self.trajectories, "RigTrajectory", "5.15.4", |value| {
+            &value.name
+        })?;
+        check_unique_record_names(&self.anchors, "GeodeticAnchor", "5.15.5", |value| {
+            &value.frame_name
+        })?;
 
         // The registry defines two pose references and no more. An unrecognized value is
         // not a future extension a reader may ignore: it says the extrinsic maps into some
@@ -483,6 +490,7 @@ impl Provenance {
 // shared canonical: six-decimal floats, integers as strings, sorted object keys, and the
 // probe poses that exercise clamp and shortest-arc slerp rather than only the stored samples.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -504,6 +512,7 @@ pub(crate) enum Json {
     Null,
     Bool(bool),
     Num(f64),
+    ExactNum(String),
     Str(String),
     Arr(Vec<Json>),
     Obj(BTreeMap<String, Json>),
@@ -518,9 +527,8 @@ impl Json {
         match self {
             Json::Null => out.push_str("null"),
             Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-            Json::Num(v) => {
-                let _ = write!(out, "{v:.*}", PROVENANCE_JSON_DECIMALS);
-            }
+            Json::Num(v) => push_canonical_decimal(out, *v),
+            Json::ExactNum(token) => out.push_str(token),
             Json::Str(s) => write_json_string(out, s),
             Json::Arr(items) => {
                 out.push('[');
@@ -552,6 +560,158 @@ impl Json {
         self.write(&mut out);
         out
     }
+}
+
+/// Append one finite value at the canonical decimal precision, without the sign of a zero.
+///
+/// The canonical form's first rule is that a zero is `0.0` and never `-0.0` — the sign
+/// records which side of zero the arithmetic landed on, which is a property of the platform
+/// rather than of the scene. `{:.6}` keeps it: `-4e-7` renders as `-0.000000`, and a
+/// composed centre at the noise floor is exactly the value that lands there.
+///
+/// This is the one place it can be erased for the core's canonical members, and erasing it
+/// here also settles it for the C ABI's consumers: `fourdgs_scene_objects_json` and
+/// `fourdgs_scene_object_states_json` hand these strings straight to the C++ and Swift
+/// bindings, which splice them into their summaries verbatim, so a sign left here would
+/// have been three SDKs' output rather than one.
+///
+/// A rendered fixed-point value is a zero exactly when it holds no digit from one to nine,
+/// which is cheaper and less fragile than comparing against a spelled-out `"-0.000000"`
+/// that would silently stop matching if the precision ever changed.
+fn push_canonical_decimal(out: &mut String, value: f64) {
+    let start = out.len();
+    let _ = write!(out, "{value:.*}", PROVENANCE_JSON_DECIMALS);
+    let rendered = &out[start..];
+    if rendered.starts_with('-') && !rendered.bytes().any(|byte| (b'1'..=b'9').contains(&byte)) {
+        out.remove(start);
+    }
+}
+
+#[derive(Default)]
+struct DecimalAccumulator {
+    negative: bool,
+    // Base ten, least-significant digit first. Six canonical decimal places plus a
+    // finite binary64 value do not fit a machine integer in the general case.
+    digits: Vec<u8>,
+}
+
+impl DecimalAccumulator {
+    fn add_fixed(&mut self, fixed: &str) {
+        let (negative, magnitude) = fixed
+            .strip_prefix('-')
+            .map_or((false, fixed), |s| (true, s));
+        let mut incoming: Vec<u8> = magnitude
+            .bytes()
+            .filter(|byte| byte.is_ascii_digit())
+            .map(|byte| byte - b'0')
+            .rev()
+            .collect();
+        trim_decimal_zeros(&mut incoming);
+        if incoming.is_empty() {
+            return;
+        }
+        if self.digits.is_empty() {
+            self.negative = negative;
+            self.digits = incoming;
+            return;
+        }
+        if self.negative == negative {
+            add_decimal_magnitude(&mut self.digits, &incoming);
+            return;
+        }
+        match compare_decimal_magnitude(&self.digits, &incoming) {
+            Ordering::Greater => subtract_decimal_magnitude(&mut self.digits, &incoming),
+            Ordering::Equal => {
+                self.digits.clear();
+                self.negative = false;
+            }
+            Ordering::Less => {
+                subtract_decimal_magnitude(&mut incoming, &self.digits);
+                self.digits = incoming;
+                self.negative = negative;
+            }
+        }
+    }
+
+    fn token(&self) -> String {
+        let mut digits: String = if self.digits.is_empty() {
+            "0".into()
+        } else {
+            self.digits
+                .iter()
+                .rev()
+                .map(|digit| char::from(b'0' + digit))
+                .collect()
+        };
+        if digits.len() <= PROVENANCE_JSON_DECIMALS {
+            digits.insert_str(0, &"0".repeat(PROVENANCE_JSON_DECIMALS + 1 - digits.len()));
+        }
+        let split = digits.len() - PROVENANCE_JSON_DECIMALS;
+        let mut fraction = digits.split_off(split);
+        while fraction.len() > 1 && fraction.ends_with('0') {
+            fraction.pop();
+        }
+        let sign = if self.negative && !self.digits.is_empty() {
+            "-"
+        } else {
+            ""
+        };
+        format!("{sign}{digits}.{fraction}")
+    }
+}
+
+fn trim_decimal_zeros(digits: &mut Vec<u8>) {
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+}
+
+fn compare_decimal_magnitude(a: &[u8], b: &[u8]) -> Ordering {
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.iter().rev().cmp(b.iter().rev()))
+}
+
+fn add_decimal_magnitude(accumulator: &mut Vec<u8>, addend: &[u8]) {
+    let mut carry = 0u8;
+    let width = accumulator.len().max(addend.len());
+    accumulator.resize(width, 0);
+    for (index, slot) in accumulator.iter_mut().enumerate() {
+        let sum = *slot + addend.get(index).copied().unwrap_or(0) + carry;
+        *slot = sum % 10;
+        carry = sum / 10;
+    }
+    if carry != 0 {
+        accumulator.push(carry);
+    }
+}
+
+fn subtract_decimal_magnitude(accumulator: &mut Vec<u8>, subtrahend: &[u8]) {
+    debug_assert!(compare_decimal_magnitude(accumulator, subtrahend) != Ordering::Less);
+    let mut borrow = 0i8;
+    for (index, slot) in accumulator.iter_mut().enumerate() {
+        let value = *slot as i8 - subtrahend.get(index).copied().unwrap_or(0) as i8 - borrow;
+        if value < 0 {
+            *slot = (value + 10) as u8;
+            borrow = 1;
+        } else {
+            *slot = value as u8;
+            borrow = 0;
+        }
+    }
+    debug_assert_eq!(borrow, 0);
+    trim_decimal_zeros(accumulator);
+}
+
+pub(crate) fn exact_sum_token(values: impl IntoIterator<Item = f64>) -> Option<String> {
+    let mut total = DecimalAccumulator::default();
+    for value in values {
+        if !value.is_finite() {
+            return None;
+        }
+        total.add_fixed(&format!("{value:.PROVENANCE_JSON_DECIMALS$}"));
+    }
+    Some(total.token())
 }
 
 fn write_json_string(out: &mut String, s: &str) {
@@ -796,6 +956,37 @@ mod tests {
     fn empty_provenance_serializes_to_empty_string() {
         let json = canonical_json(&Provenance::default()).expect("empty is always ok");
         assert_eq!(json, "");
+    }
+
+    #[test]
+    fn exact_decimal_sums_keep_canonical_units() {
+        assert_eq!(
+            exact_sum_token([1e20, -1e20, 3.25]).as_deref(),
+            Some("3.25")
+        );
+        assert_eq!(exact_sum_token([-0.0]).as_deref(), Some("0.0"));
+        assert_eq!(exact_sum_token([f64::NAN]), None);
+        let enormous = exact_sum_token([1e308; 10]).expect("finite values have a sum");
+        assert!(enormous.starts_with("1000000000000000"));
+        assert!(enormous.ends_with(".0"));
+        assert!(enormous.len() > 309);
+    }
+
+    /// The canonical form has no signed zero, and `{:.6}` has one for every value in
+    /// `(-5e-7, -0.0]`. Rendering is where it has to be erased: `exact_sum_token` already
+    /// erased it, `num` cannot (a signed zero is a perfectly finite `f64`), and the same
+    /// `Json` writes the object layer's members — the ones the C ABI hands to the C++ and
+    /// Swift bindings verbatim.
+    #[test]
+    fn a_rendered_zero_is_never_signed() {
+        let render = |v: f64| Json::Num(v).to_json();
+        assert_eq!(render(-0.0), "0.000000");
+        assert_eq!(render(-1e-9), "0.000000");
+        assert_eq!(render(-4e-7), "0.000000");
+        assert_eq!(render(0.0), "0.000000");
+        // Only a zero loses its sign; the smallest value that survives rounding keeps it.
+        assert_eq!(render(-1e-6), "-0.000001");
+        assert_eq!(render(-1.5), "-1.500000");
     }
 
     #[test]

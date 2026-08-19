@@ -152,6 +152,7 @@ FourdgsScene readFourdgsBytes(
   bool? summaryCrcOk;
   bool truncated = false;
   bool sawFooter = false;
+  bool sawWindowTable = false;
   final provenance = FourdgsProvenance();
   final objects = FourdgsObjectLayer();
 
@@ -159,10 +160,29 @@ FourdgsScene readFourdgsBytes(
     for (final record in iterRecords(data, fourdgsMagic.length)) {
       switch (record.opcode) {
         case opHeader:
-          header = FourdgsHeader.parse(record.content);
+          if (header != null) {
+            throw duplicateStructuralRecord('Header', record.offset);
+          }
+          header = FourdgsHeader.parse(
+            record.content,
+            fileOffset: record.offset + recordHeaderBytes,
+          );
         case opQuantization:
-          quantization = FourdgsQuantization.parse(record.content);
+          if (quantization != null) {
+            throw duplicateStructuralRecord('Quantization', record.offset);
+          }
+          quantization = FourdgsQuantization.parse(
+            record.content,
+            fileOffset: record.offset + recordHeaderBytes,
+          );
         case opWindowTable:
+          // Tracked with a flag rather than by testing `windows` for emptiness:
+          // a file may legitimately carry a Window Table with no entries, and
+          // that is not the same thing as carrying no table at all.
+          if (sawWindowTable) {
+            throw duplicateStructuralRecord('Window Table', record.offset);
+          }
+          sawWindowTable = true;
           windows = FourdgsWindowTable.parse(record.content).windows;
         case opChunk:
           if (quantization == null) {
@@ -180,6 +200,9 @@ FourdgsScene readFourdgsBytes(
               windows,
               cutoff: header?.cutoff ?? fourdgsDefaultCutoff,
               compression: body.header.compression,
+              chunkOffset: record.offset,
+              streamsOffset:
+                  record.offset + recordHeaderBytes + body.streamsOffset,
             ),
           );
           chunkCounts.add(body.header.count);
@@ -198,6 +221,7 @@ FourdgsScene readFourdgsBytes(
                 record.content,
                 expectedBand: band,
                 expectedCount: chunkCounts.last,
+                fileOffset: record.offset + recordHeaderBytes,
               );
               if (decoded != null) chunkBands.last[band] = decoded;
             }
@@ -252,7 +276,10 @@ FourdgsScene readFourdgsBytes(
           }
           audioPayloads[payload.sourceId] = payload.data;
         case opCamera:
-          final c = FourdgsCamera.parse(record.content);
+          final c = FourdgsCamera.parse(
+            record.content,
+            fileOffset: record.offset + recordHeaderBytes,
+          );
           camera = FourdgsCameraTrajectory(
             fovYDeg: c.fovYDeg,
             position: c.position,
@@ -687,6 +714,10 @@ FourdgsGaussianSet assembleGaussians(
   final sigmaT = Float32List(total);
   final winLo = Float32List(total);
   final winHi = Float32List(total);
+  final haveSourceGroup = chunks.every(
+    (FourdgsDecodedChunk c) => c.sourceGroup != null,
+  );
+  final sourceGroup = haveSourceGroup ? Int32List(total) : null;
   final haveSource = chunks.every(
     (FourdgsDecodedChunk c) => c.sourceIndex != null,
   );
@@ -710,6 +741,9 @@ FourdgsGaussianSet assembleGaussians(
     sigmaT.setRange(at, at + chunk.count, chunk.sigmaT);
     winLo.setRange(at, at + chunk.count, chunk.winLo);
     winHi.setRange(at, at + chunk.count, chunk.winHi);
+    if (sourceGroup != null) {
+      sourceGroup.setRange(at, at + chunk.count, chunk.sourceGroup!);
+    }
     if (sourceIndex != null) {
       sourceIndex.setRange(at, at + chunk.count, chunk.sourceIndex!);
     }
@@ -732,6 +766,7 @@ FourdgsGaussianSet assembleGaussians(
     shDegree: shDegree,
     sh: sh?.values,
     shCoefficients: sh?.coefficients ?? 0,
+    sourceGroup: sourceGroup,
     sourceIndex: sourceIndex,
     objectId: objectId,
   );

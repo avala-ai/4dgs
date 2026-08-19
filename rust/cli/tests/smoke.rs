@@ -224,7 +224,380 @@ fn the_usage_message_is_served_rather_than_run() {
     assert_eq!(out.status.code(), Some(0));
     assert!(stdout(&out).contains("4dgs info"));
     assert_eq!(run(&["--version"]).status.code(), Some(0));
-    assert_eq!(run(&["frobnicate", "x"]).status.code(), Some(1));
+    // 3, not 1: a command nobody can parse is the absence of an answer about a file, and
+    // exit 1 is an answer about a file. See `EXIT_TOOL`.
+    assert_eq!(run(&["frobnicate", "x"]).status.code(), Some(3));
+}
+
+#[test]
+fn a_file_the_tool_cannot_read_is_told_apart_from_a_file_it_refuses() {
+    // The distinction the exit codes exist for. A pipeline that saw 1 for both could not
+    // tell a corrupt asset from a typo in a path, which makes the tool indistinguishable
+    // from a broken one on the day it matters.
+    let missing = std::env::temp_dir().join("fourdgs-cli-no-such-file.4dgs");
+    std::fs::remove_file(&missing).ok();
+    for command in ["info", "validate", "inspect", "decode"] {
+        let out = run(&[command, missing.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "`{command}` reported a missing file as a verdict on its contents"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The refusal corpus knows the right answer; this is the tool checked against it.
+
+/// The refusal identifier the corpus says a reader must produce for this variant.
+///
+/// The expectation is read from the corpus rather than written here, so a test that
+/// asserted the wrong identifier would have to be wrong in the same way the generator is.
+/// The file is `{"refused": "<id>"}` and nothing else, which is under the bar for a JSON
+/// dependency in a tool whose whole point is a small dependency tree.
+fn expected_refusal(json_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(json_path).ok()?;
+    let rest = text.split("\"refused\"").nth(1)?;
+    let rest = rest.split(':').nth(1)?;
+    let start = rest.find('"')? + 1;
+    let end = rest[start..].find('"')? + start;
+    Some(rest[start..end].to_string())
+}
+
+/// Every file in the invalid corpus, with the identifier it must be refused for.
+fn invalid_corpus() -> Vec<(String, PathBuf, String)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/invalid");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf, String)> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "4dgs"))
+        .filter_map(|p| {
+            let code = expected_refusal(&p.with_extension("json"))?;
+            let name = p.file_stem()?.to_string_lossy().into_owned();
+            Some((name, p, code))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn every_invalid_variant_is_refused_by_its_own_identifier() {
+    // The strongest evidence there is that this tool is right, because the corpus already
+    // knows the answer and the tool had no hand in writing it. "Refused" alone is not the
+    // property: a reader that refuses every one of these for the wrong reason passes a
+    // test that only checks the exit code, and that is precisely the failure the invalid
+    // corpus was built to catch.
+    let corpus = invalid_corpus();
+    if corpus.is_empty() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI generates the corpus before this suite, so an empty one is a test that \
+             silently did not run"
+        );
+        return;
+    }
+    for (name, path, code) in &corpus {
+        let out = run(&["validate", path.to_str().unwrap()]);
+        let text = stdout(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{name} must be refused, and non-zero is how a pipeline learns it: {text}"
+        );
+        assert!(
+            text.contains(&format!("refusal {code}")),
+            "{name} must be refused as `{code}`, and the tool said: {text}"
+        );
+        // And the byte, which is the question its holder actually has. Every one of these
+        // is placeable: four in the front matter, two inside a chunk the tool decodes.
+        assert!(
+            text.contains(&format!("refusal {code} at byte ")),
+            "{name} named the refusal but not where it fired: {text}"
+        );
+    }
+    assert_eq!(
+        corpus.len(),
+        7,
+        "the invalid corpus is seven variants; a run that saw a different number is \
+         checking a corpus this test has not been read against"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// A fault inside a stream, in each of the places a stream can be.
+//
+// The framing walk steps over a record by its declared length, so nothing above this line
+// can see inside one. These take a conforming corpus file, make exactly one stream
+// undecodable, and require the tool to say so — with the identifier the corpus uses for
+// that fault and the byte of the record the fault is actually in.
+
+/// Every top-level record: its opcode, where it starts, and how long its content is.
+///
+/// The framing, done by hand, because the point of these tests is to reach a byte inside a
+/// record and the tool's own walk is one of the things under test.
+fn framing(data: &[u8]) -> Vec<(u8, usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = 8usize;
+    while at + 9 <= data.len().saturating_sub(8) {
+        let opcode = data[at];
+        let length = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap()) as usize;
+        out.push((opcode, at, length));
+        let Some(next) = at.checked_add(9 + length).filter(|n| *n <= data.len()) else {
+            break;
+        };
+        at = next;
+    }
+    out
+}
+
+/// Make the first record with this opcode declare a stream codec no build implements.
+///
+/// Returns the record's offset. A stream header is `attribute_id, width, mode,
+/// stream_codec, channels`, so this is one byte — the same fault the corpus's
+/// `UnknownStreamCodec` variant carries, moved into whichever record the caller names.
+fn break_the_codec_in(data: &mut [u8], opcode: u8) -> Option<u64> {
+    let (_, at, length) = framing(data).into_iter().find(|(o, ..)| *o == opcode)?;
+    let content = &data[at + 9..at + 9 + length];
+    let stream_at = match opcode {
+        // A Chunk's streams follow its header, whose length varies with the compression
+        // name it carries — so the library is what says where they start.
+        0x05 => {
+            let (_, streams) = fourdgs::records::parse_chunk(content).ok()?;
+            content.len() - streams.len()
+        }
+        // An SH Band Stream record is the band index, then the stream (spec §5.7).
+        0x07 => 1,
+        _ => return None,
+    };
+    data[at + 9 + stream_at + 3] = 9;
+    Some(at as u64)
+}
+
+/// A corpus file with one byte changed, written where a test can hand it to the tool.
+fn broken_copy(source: &Path, name: &str, opcode: u8) -> Option<(PathBuf, u64)> {
+    let mut data = std::fs::read(source).ok()?;
+    let at = break_the_codec_in(&mut data, opcode)?;
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, &data).ok()?;
+    Some((path, at))
+}
+
+#[test]
+fn a_fault_inside_a_spherical_harmonic_band_is_not_reported_valid() {
+    // Bands were fetched at a cap of 0 — a rendering choice, applied to a question that is
+    // not about rendering. An SH Band Stream is a stream like any other, so a band record
+    // carrying a codec this build does not implement is a file that does not decode; with
+    // the cap in place the tool decoded the base chunk, found it healthy, and printed
+    // `valid`. And the byte names the band record, not the Chunk it belongs to: the two
+    // are thousands of bytes apart, and the Chunk's own streams are fine.
+    let Some(source) = file(SH_DEGREE_2) else {
+        return;
+    };
+    let Some((path, at)) = broken_copy(&source, "fourdgs-cli-bad-band.4dgs", 0x07) else {
+        panic!("the SHDegree2 variant carries SH Band Stream records");
+    };
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {at} ")),
+        "{text}"
+    );
+    assert!(text.contains("SH Band Stream for band"), "{text}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_file_with_no_index_names_the_chunk_it_could_not_decode() {
+    // Without an index there is nothing to seek with, so this file used to be decoded in
+    // one call that either succeeded or failed — which meant the whole scene resident, and
+    // a refusal with no byte at all to report. It is walked record by record now, so the
+    // Chunk that refused is the Chunk the report names, and nothing is held past it.
+    let Some(source) = file(NO_INDEX) else {
+        return;
+    };
+    let Some((path, at)) = broken_copy(&source, "fourdgs-cli-bad-unindexed.4dgs", 0x05) else {
+        panic!("every corpus variant carries Chunk records");
+    };
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {at} ")),
+        "{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_keyframe_delta_chunk_that_does_not_decode_is_named_and_placed() {
+    // The keyframe-delta branch composed the whole sequence in one call, so a refusal
+    // inside one chunk's streams arrived with no entry to attribute it to and printed the
+    // identifier with no byte — below the contract the rest of this tool now holds. It
+    // composes one chain at a time, which is what the report needs and what keeps a long
+    // sequence from being resident all at once.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/keyframe");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        assert!(std::env::var_os("CI").is_none(), "CI generates the corpus");
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "4dgs"))
+        .collect();
+    paths.sort();
+    let source = paths.first().expect("a keyframe-delta variant");
+    let Some((path, at)) = broken_copy(source, "fourdgs-cli-bad-keyframe.4dgs", 0x05) else {
+        panic!("a keyframe-delta file carries Chunk records; they are its keyframes");
+    };
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {at} ")),
+        "{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_file_cut_inside_its_own_footer_is_still_reported_record_by_record() {
+    // The one truncation point that used to take `inspect` out through the error path
+    // before it printed a row. The Footer is where the summary checksum is declared, so
+    // the tool reads it to say which records that checksum covers — and asking for a
+    // record the file was cut inside returns `Truncated`, losing the intact-prefix report
+    // for precisely the file the report exists for.
+    let Some(source) = file(INDEXED) else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    // The Footer's content is 20 bytes and the trailing magic is 8; cutting four bytes
+    // into that content leaves the record framed and its content missing.
+    let footer_at = data.len() - (9 + 20 + 8);
+    assert_eq!(data[footer_at], 0x02, "the last record is the Footer");
+    let path = std::env::temp_dir().join("fourdgs-cli-cut-footer.4dgs");
+    std::fs::write(&path, &data[..footer_at + 9 + 4]).unwrap();
+
+    let out = run(&["inspect", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "a cut file is not a whole one");
+    assert!(text.contains("Header"), "{text}");
+    assert!(text.contains("Footer"), "{text}");
+    assert!(text.contains("truncated at byte"), "{text}");
+    assert!(text.contains("intact prefix"), "{text}");
+    // And no checksum verdict is invented for a Footer nobody could read.
+    assert!(text.contains("declares no summary checksum"), "{text}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_conforming_keyframe_delta_file_is_valid() {
+    // It was not, in either validator: every structural check assumed the gaussian-birth
+    // chunk shape, so a file whose Chunks are keyframes and whose Delta Chunks are
+    // differences came back with seven errors and an INVALID. The Rust core implements the
+    // model — the conformance suite proves it — so refusing a file for declaring it was
+    // never a statement about the file.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/keyframe");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        assert!(std::env::var_os("CI").is_none(), "CI generates the corpus");
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "4dgs"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no keyframe-delta variants to check");
+    for path in &paths {
+        let out = run(&["validate", path.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{} is a conforming file: {}",
+            path.display(),
+            stdout(&out)
+        );
+        assert_eq!(stdout(&out).trim(), "valid");
+    }
+}
+
+#[test]
+fn inspect_reports_the_crc_status_of_every_record() {
+    let Some(path) = file(INDEXED) else {
+        return;
+    };
+    let text = stdout(&run(&["inspect", path.to_str().unwrap()]));
+    // The only checksum the format defines covers the summary, so the index rows are
+    // covered and the Header is not — and saying so per record is what tells a reader
+    // whether the checksum has anything to say about the row they are looking at.
+    let cell = |record: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(&format!(" {record} ")))
+            .and_then(|l| l.split_whitespace().last())
+            .unwrap_or_else(|| panic!("no {record} row in {text}"))
+            .to_string()
+    };
+    assert_eq!(cell("ChunkIndex"), "ok", "{text}");
+    assert_eq!(cell("Header"), "-", "{text}");
+    assert!(
+        text.contains("crc: the Footer's summary checksum covers"),
+        "{text}"
+    );
+
+    let json = stdout(&run(&["inspect", "--json", path.to_str().unwrap()]));
+    assert!(json.contains("\"crc\": \"ok\""), "{json}");
+    assert!(json.contains("\"crc\": null"), "{json}");
+    assert!(json.contains("\"ok\": true"), "{json}");
+}
+
+#[test]
+fn a_corrupted_summary_is_reported_against_the_records_it_covers() {
+    let Some(path) = file(INDEXED) else {
+        return;
+    };
+    let mut data = std::fs::read(&path).unwrap();
+    // Inside the first summary record's content rather than its framing: the walk still
+    // ends where it should, and the checksum is the only thing that can notice.
+    let tail = data.len() - (9 + 20 + 8);
+    let summary_start = u64::from_le_bytes(data[tail + 9..tail + 17].try_into().unwrap()) as usize;
+    assert!(summary_start > 0, "the variant was selected for its index");
+    data[summary_start + 9 + 4] ^= 0xFF;
+    let broken = std::env::temp_dir().join("fourdgs-cli-bad-summary.4dgs");
+    std::fs::write(&broken, &data).unwrap();
+
+    let text = stdout(&run(&["inspect", broken.to_str().unwrap()]));
+    assert!(text.contains("MISMATCH"), "{text}");
+    // And the framing is still whole, which is the distinction: a checksum that disagrees
+    // says the index is untrustworthy, not that the file stopped being a 4dgs file.
+    assert!(!text.contains("truncated at byte"), "{text}");
+    std::fs::remove_file(&broken).ok();
+}
+
+#[test]
+fn a_cut_file_reports_what_was_decodable_rather_than_only_that_it_stopped() {
+    let Some(path) = file(INDEXED) else {
+        return;
+    };
+    let data = std::fs::read(&path).unwrap();
+    let cut = std::env::temp_dir().join("fourdgs-cli-cut.4dgs");
+    std::fs::write(&cut, &data[..data.len() / 2]).unwrap();
+
+    let out = run(&["inspect", cut.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert!(text.contains("truncated at byte"), "{text}");
+    assert!(text.contains("intact prefix"), "{text}");
+    // Records, not one error line. Reporting only that the file stopped leaves its holder
+    // to guess whether anything is salvageable, which is the question they had.
+    assert!(text.contains("Header"), "{text}");
+    assert!(text.contains("Quantization"), "{text}");
+    assert_eq!(out.status.code(), Some(1), "a cut file is not a whole one");
+
+    let notes = stdout(&run(&["validate", cut.to_str().unwrap()]));
+    assert!(notes.contains("a streamed reader recovers them"), "{notes}");
+    std::fs::remove_file(&cut).ok();
 }
 
 #[test]
@@ -280,6 +653,369 @@ fn the_corpus_is_present_in_ci() {
             "no corpus variant matches {name}; the corpus was renamed under this suite"
         );
     }
+    assert!(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/conformance/data/invalid/UnknownStreamCodec.4dgs")
+            .exists(),
+        "no invalid corpus; the refusal tests below would skip themselves green"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Files no encoder writes.
+
+/// Where a file's summary region begins and ends.
+///
+/// Both read out of the file: the Footer names `summary_start`, and the Footer record is
+/// the last one before the trailing magic.
+fn summary_bounds(data: &[u8]) -> (usize, usize) {
+    let footer_at = data.len() - (9 + 20 + 8);
+    assert_eq!(data[footer_at], 0x02, "the last record is the Footer");
+    let footer = fourdgs::records::Footer::parse(&data[footer_at + 9..]).unwrap();
+    (footer.summary_start as usize, footer_at)
+}
+
+/// A file made of this front matter and this summary, with a Footer that describes them.
+///
+/// An empty summary produces a file with no index at all — `summary_start` zero, no
+/// checksum — which is the legal stream-only shape and not something the encoder emits.
+fn rebuilt(front: &[u8], summary: &[u8]) -> Vec<u8> {
+    let mut out = front.to_vec();
+    out.extend_from_slice(summary);
+    out.extend_from_slice(
+        &fourdgs::records::Footer {
+            summary_start: if summary.is_empty() {
+                0
+            } else {
+                front.len() as u64
+            },
+            summary_offset_start: 0,
+            summary_crc: if summary.is_empty() {
+                0
+            } else {
+                fourdgs::serialization::crc32(summary)
+            },
+        }
+        .encode(),
+    );
+    out.extend_from_slice(&fourdgs::serialization::MAGIC);
+    out
+}
+
+/// The index entries of a file, and whatever else its summary region holds after them.
+///
+/// The remainder is returned verbatim rather than re-encoded — it is the Statistics record
+/// on every variant that has one — so a fixture changes the entries and nothing else.
+fn summary_parts(data: &[u8]) -> (Vec<fourdgs::records::ChunkIndexEntry>, Vec<u8>) {
+    let (start, end) = summary_bounds(data);
+    let mut entries = Vec::new();
+    let mut at = start;
+    for record in fourdgs::serialization::Records::new(&data[..end], start) {
+        let record = record.expect("the summary region parses");
+        if record.opcode != 0x08 {
+            break;
+        }
+        entries.push(fourdgs::records::ChunkIndexEntry::parse(record.content).expect("an entry"));
+        at = record.offset + 9 + record.content.len();
+    }
+    // Re-encoding has to be byte-stable, or every offset a fixture computes is wrong.
+    let re: Vec<u8> = entries.iter().flat_map(|e| e.encode()).collect();
+    assert_eq!(
+        re.as_slice(),
+        &data[start..at],
+        "an index entry does not round-trip; the fixtures below rely on it"
+    );
+    (entries, data[at..end].to_vec())
+}
+
+/// A writer-produced one-keyframe file rewritten into a hostile zero-duration timeline.
+///
+/// Every copy of the interval and duration is changed together, and the summary checksum
+/// is rebuilt, so its only fault is a populated state over `[0, 0)`.
+fn populated_zero_width_keyframe() -> Vec<u8> {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions, Sample};
+
+    let sample = Sample {
+        t0: 0.0,
+        ids: vec![7],
+        gaussians: fourdgs::GaussianSet {
+            positions: vec![0.0; 3],
+            scales: vec![0.1; 3],
+            rotations: vec![0.0, 0.0, 0.0, 1.0],
+            colors: vec![0.5, 0.5, 0.5, 1.0],
+            motions: vec![0.0; 3],
+            mu_t: vec![0.0],
+            sigma_t: vec![1.0],
+            win_lo: vec![0.0],
+            win_hi: vec![1.0],
+            ..Default::default()
+        },
+    };
+    let mut data = write_sequence(&[sample], 1.0, &KeyframeDeltaOptions::default())
+        .expect("the populated seed file encodes");
+    let (summary_start, _) = summary_bounds(&data);
+
+    let mut header_duration = None;
+    let mut keyframe_t1 = None;
+    for record in fourdgs::serialization::Records::new(&data[..summary_start], fourdgs::MAGIC.len())
+    {
+        let record = record.expect("the writer produced framed records");
+        match record.opcode {
+            fourdgs::opcode::HEADER => {
+                let mut content = fourdgs::serialization::Cursor::new(record.content);
+                content.string().unwrap();
+                content.string().unwrap();
+                header_duration = Some(
+                    record.offset + fourdgs::serialization::RECORD_HEADER_SIZE + content.position(),
+                );
+            }
+            fourdgs::opcode::CHUNK => {
+                keyframe_t1 = Some(record.offset + fourdgs::serialization::RECORD_HEADER_SIZE + 8);
+            }
+            _ => {}
+        }
+    }
+    for at in [header_duration.unwrap(), keyframe_t1.unwrap()] {
+        data[at..at + 8].copy_from_slice(&0.0f64.to_le_bytes());
+    }
+
+    let (mut entries, rest) = summary_parts(&data);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].live_count, 1);
+    entries[0].t1 = 0.0;
+    let statistics_record = fourdgs::serialization::Records::new(&rest, 0)
+        .next()
+        .expect("the writer emits Statistics")
+        .expect("Statistics is framed");
+    assert_eq!(statistics_record.opcode, fourdgs::opcode::STATISTICS);
+    let mut statistics =
+        fourdgs::records::Statistics::parse(statistics_record.content).expect("Statistics parses");
+    statistics.duration_sec = 0.0;
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(statistics.encode())
+        .collect();
+    rebuilt(&data[..summary_start], &summary)
+}
+
+fn populated_sequence(sample_times: &[f64], duration_sec: f64) -> Vec<u8> {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions, Sample};
+
+    let samples: Vec<_> = sample_times
+        .iter()
+        .copied()
+        .map(|t0| Sample {
+            t0,
+            ids: vec![7],
+            gaussians: fourdgs::GaussianSet {
+                positions: vec![0.0; 3],
+                scales: vec![0.1; 3],
+                rotations: vec![0.0, 0.0, 0.0, 1.0],
+                colors: vec![0.5, 0.5, 0.5, 1.0],
+                motions: vec![0.0; 3],
+                mu_t: vec![t0 as f32],
+                sigma_t: vec![1.0],
+                win_lo: vec![0.0],
+                win_hi: vec![duration_sec as f32],
+                ..Default::default()
+            },
+        })
+        .collect();
+    write_sequence(&samples, duration_sec, &KeyframeDeltaOptions::default())
+        .expect("the populated seed sequence encodes")
+}
+
+fn rewrite_first_keyframe_t1(data: &mut [u8], t1: f64) {
+    let (summary_start, _) = summary_bounds(data);
+    let record = fourdgs::serialization::Records::new(&data[..summary_start], fourdgs::MAGIC.len())
+        .map(|record| record.expect("the writer produced framed records"))
+        .find(|record| record.opcode == fourdgs::opcode::CHUNK)
+        .expect("the sequence begins with a keyframe");
+    let at = record.offset + fourdgs::serialization::RECORD_HEADER_SIZE + 8;
+    data[at..at + 8].copy_from_slice(&t1.to_le_bytes());
+}
+
+#[test]
+fn a_populated_zero_width_keyframe_is_refused_by_both_read_modes_and_validate() {
+    let data = populated_zero_width_keyframe();
+    let error = fourdgs::keyframe_delta_file::decode_indexed(&data)
+        .expect_err("no instant can select the populated state");
+    assert!(
+        error.to_string().contains("zero-width interval [0, 0)"),
+        "{error}"
+    );
+
+    let error = fourdgs::keyframe_delta_file::decode_streamed(&data)
+        .expect_err("the front-to-back reader enforces the same half-open invariant");
+    assert!(
+        error.to_string().contains("zero-width interval [0, 0)"),
+        "{error}"
+    );
+
+    let path = fixture("fourdgs-cli-kd-populated-zero-width.4dgs", &data);
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("zero-width interval [0, 0)"), "{text}");
+    std::fs::remove_file(path).ok();
+
+    let (summary_start, _) = summary_bounds(&data);
+    let unindexed = rebuilt(&data[..summary_start], &[]);
+    let path = fixture(
+        "fourdgs-cli-kd-streamed-populated-zero-width.4dgs",
+        &unindexed,
+    );
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("zero-width interval [0, 0)"), "{text}");
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn indexed_decode_requires_live_count_to_match_the_composed_state() {
+    let data = populated_zero_width_keyframe();
+    let (summary_start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+    entries[0].live_count = 0;
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(rest)
+        .collect();
+    let data = rebuilt(&data[..summary_start], &summary);
+
+    let error = fourdgs::keyframe_delta_file::decode_indexed(&data)
+        .expect_err("the index population must agree with composition");
+    let text = error.to_string();
+    assert!(text.contains("declares live_count 0"), "{text}");
+    assert!(text.contains("yields 1 gaussians"), "{text}");
+}
+
+#[test]
+fn indexed_composition_requires_the_state_record_interval_to_match() {
+    let mut data = populated_sequence(&[0.0], 1.0);
+    rewrite_first_keyframe_t1(&mut data, 0.0);
+
+    let error = fourdgs::keyframe_delta_file::decode_indexed(&data)
+        .expect_err("the index cannot hide a populated zero-width state record");
+    let text = error.to_string();
+    assert!(text.contains("index entry"), "{text}");
+    assert!(text.contains("declares interval [0, 1)"), "{text}");
+    assert!(text.contains("state record declares [0, 0)"), "{text}");
+}
+
+#[test]
+fn a_direct_delta_seek_checks_every_composed_link() {
+    use fourdgs::keyframe_delta_file::{compose_chain, open_indexed};
+
+    let mut data = populated_sequence(&[0.0, 1.0], 2.0);
+    let mut source = fourdgs::BytesReadable::new(&data);
+    let mut sequence = open_indexed(&mut source).expect("the writer's index opens");
+    assert_eq!(sequence.index.len(), 2);
+    assert_eq!(sequence.index[1].kind, 1, "the selected state is a delta");
+
+    rewrite_first_keyframe_t1(&mut data, 0.0);
+    sequence.index[0].t1 = 0.0;
+    let selected = sequence.index[1].clone();
+    let mut source = fourdgs::BytesReadable::new(&data);
+    let error = compose_chain(
+        &mut source,
+        &sequence.index,
+        &selected,
+        &sequence.quantization,
+        &sequence.windows,
+    )
+    .expect_err("a direct seek must validate its populated zero-width reference");
+    let text = error.to_string();
+    assert!(text.contains("index entry"), "{text}");
+    assert!(text.contains("zero-width interval [0, 0)"), "{text}");
+}
+
+/// Write a fixture to the temporary directory and hand back its path.
+fn fixture(name: &str, data: &[u8]) -> PathBuf {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, data).unwrap();
+    path
+}
+
+#[test]
+fn a_file_cut_on_a_record_boundary_is_reported_as_cut_rather_than_noted() {
+    // The simplest truncation there is: remove only the eight-byte trailing magic. Every
+    // record is whole, so the walk reached the end with nothing left over and recorded no
+    // cut — `inspect` printed a note about the missing magic and exited **0** for an
+    // incomplete file, and `validate` left off the note that says how much of it survives.
+    let Some(source) = file(INDEXED) else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let path = fixture(
+        "fourdgs-cli-no-magic.4dgs",
+        &data[..data.len() - fourdgs::serialization::MAGIC.len()],
+    );
+
+    let out = run(&["inspect", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an incomplete file is not a whole one: {text}"
+    );
+    assert!(text.contains("truncated at byte"), "{text}");
+    assert!(text.contains("intact prefix"), "{text}");
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("does not end with the magic"), "{text}");
+    assert!(
+        text.contains("complete records before it are intact"),
+        "the recovery note says how much survives: {text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn decode_places_a_refusal_that_lives_inside_a_chunk() {
+    // `decode` refused an unknown stream codec with the identifier and no byte: the table
+    // that places a refusal from the framing has no entry for a chunk-level code, because
+    // the framing walk steps over a chunk by its declared length and never looks inside it.
+    // The file is scanned front to back instead, one record at a time, and the first record
+    // raising *this same refusal* is the site.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/invalid");
+    let variant = dir.join("UnknownStreamCodec.4dgs");
+    if !variant.exists() {
+        assert!(std::env::var_os("CI").is_none(), "CI generates the corpus");
+        return;
+    }
+    // The identifier is read out of the corpus rather than restated here, so this test and
+    // the expectation every SDK is scored against cannot drift apart.
+    let expectation = std::fs::read_to_string(dir.join("UnknownStreamCodec.json")).unwrap();
+    let code = expectation
+        .split("\"refused\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').nth(1))
+        .expect("the expectation names the refusal")
+        .to_string();
+
+    let out = run(&["decode", variant.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a file that was read and refused: {text}"
+    );
+    let placed = text
+        .lines()
+        .find(|l| l.contains(&format!("refusal {code}")))
+        .unwrap_or_else(|| panic!("no `{code}` refusal in {text}"));
+    assert!(
+        placed.contains(" at byte "),
+        "the refusal is named but not placed: {placed}"
+    );
+    // And the byte names a record, not the top of the file.
+    assert!(!placed.contains(" at byte 0 "), "{placed}");
 }
 
 /// One unsigned field out of the tool's own JSON. Enough for `{"key": 123}` one per line,
@@ -487,17 +1223,24 @@ fn both_validators_refuse_the_invalid_corpus_the_same_way() {
         // anything. That is the property this file exists to hold, and it is what a check
         // present in one implementation and missing from the other breaks.
         //
-        // Two classes are exempt from the wording comparison for now, and both are
-        // recorded as gaps rather than quietly skipped:
+        // One class is exempt from the wording comparison for now, and it is recorded as
+        // a gap rather than quietly skipped:
         //
-        // * the magic and version refusals, which the two word differently — this crate
-        //   prefixes its error kind and Python does not. Closing that means changing
-        //   messages in both languages.
         // * files whose only fault is inside a chunk's streams, such as an unimplemented
-        //   stream codec. NEITHER validator reports those, because `validate` walks the
-        //   framing and opens the file the way a seeking client would; it never decodes a
-        //   stream. The decoders do refuse them — the conformance runners prove that —
-        //   so this is a thinness in the validators, not a hole in the readers.
+        //   stream codec. This validator now decodes the chunks and reports them, named
+        //   and placed; the Python one still walks the framing and opens the file the way
+        //   a seeking client would, so it never sees inside a stream and calls those files
+        //   clean. That is the direction a divergence is allowed to run — this reader says
+        //   more, and nothing it says contradicts the other — and #125's Python-side
+        //   counterpart is what closes it. `every_invalid_variant_is_refused_by_its_own_-
+        //   identifier` is where the added reporting is held to the corpus.
+        //
+        // The magic and version refusals used to be exempt too, because this crate put
+        // its error KIND in front of the sentence and Python did not. That is closed:
+        // `validate.rs` now prints the error's message rather than its `Display`, which
+        // is where the prefix came from, so the two word those refusals identically. The
+        // wording comparison below could widen to every file once the stream-fault class
+        // above is closed as well.
         let wording_is_contract =
             name.contains("TemporalModel") || name.contains("QuantizationScheme");
         if wording_is_contract {

@@ -22,14 +22,14 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import MalformedFile
+from .exceptions import MalformedFile, duplicate_structural_record
 from .model import AudioSource, AudioSourceKeyframe
 from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .readable import Readable
 from .registry import check_quantization_scheme, check_temporal_model
 from .serialization import MAGIC, Cursor, check_magic, crc32, iter_records, read_record
-from .stream_reader import chunk_stream_bytes, decode_streams, steps_from
+from .stream_reader import check_sh_codes, chunk_stream_bytes, decode_streams, steps_from
 
 #: One read of this size from the front covers the header records of every scene measured
 #: so far. A larger header costs one extra round trip, never a wrong parse.
@@ -206,6 +206,7 @@ def open_indexed(source: Readable) -> IndexedScene:
 
     header = quant = None
     windows: list[tuple[float, float]] = []
+    saw_window_table = False
     source_ranges: dict[int, tuple[int, int]] = {}
     data_ranges: dict[int, tuple[int, int]] = {}
     legacy_audio: IndexedAudioSource | None = None
@@ -217,12 +218,21 @@ def open_indexed(source: Readable) -> IndexedScene:
         if record.opcode == op.CHUNK:
             break
         if record.opcode == op.HEADER:
+            if header is not None:
+                raise duplicate_structural_record("Header", record.offset)
             header = rec.Header.parse(front.content(record))
             check_temporal_model(header.temporal_model)
         elif record.opcode == op.QUANTIZATION:
+            if quant is not None:
+                raise duplicate_structural_record("Quantization", record.offset)
             quant = rec.Quantization.parse(front.content(record))
             check_quantization_scheme(quant.scheme)
         elif record.opcode == op.WINDOW_TABLE:
+            # A file may legitimately carry a table with no entries, so emptiness does
+            # not answer "was there a table"; a flag does.
+            if saw_window_table:
+                raise duplicate_structural_record("Window Table", record.offset)
+            saw_window_table = True
             windows = rec.WindowTable.parse(front.content(record)).windows
         elif record.opcode == op.AUDIO:
             # The track's bytes are not read here, and the record is not stepped into: a
@@ -344,7 +354,37 @@ def open_indexed(source: Readable) -> IndexedScene:
 def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry, *, max_sh_band: int = 0) -> dict:
     """Fetch and decode one chunk, plus only the SH bands asked for."""
     blob = _read_range(source, entry.chunk_offset, entry.chunk_length, "a chunk index entry")
-    head, streams = rec.parse_chunk(Cursor(blob, 9).take(len(blob) - 9))
+    framed = Cursor(blob)
+    opcode = framed.u8()
+    content_length = framed.u64()
+    # Two faults, and they were reported as one. An entry pointing at a Delta Chunk whose
+    # framing happens to match its declared length produced "declares 512 bytes; the record
+    # there frames exactly 512" — a complaint that contradicts itself, and never names the
+    # thing that is actually wrong.
+    if opcode != op.CHUNK:
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} points at "
+            f"{op.name(opcode)} rather than {op.name(op.CHUNK)}",
+            code="index-record-mismatch",
+        )
+    if content_length + 9 != len(blob):
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} declares {entry.chunk_length} "
+            f"bytes; the record there frames exactly {content_length + 9}",
+            code="index-record-mismatch",
+        )
+    head, streams = rec.parse_chunk(framed.take(content_length))
+    for field_name, indexed, actual in (
+        ("t0", entry.t0, head.t0),
+        ("t1", entry.t1, head.t1),
+        ("gaussian_count", entry.gaussian_count, head.count),
+    ):
+        if indexed != actual:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares {field_name} "
+                f"{indexed}; the Chunk record there declares {actual}",
+                code="index-record-mismatch",
+            )
     decoded = decode_streams(
         chunk_stream_bytes(head, streams),
         head.count,
@@ -357,12 +397,55 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
     for band, offset, length in entry.bands:
         if band > max_sh_band:
             continue
+        # A range too short to hold a record header is not a record, and saying so here
+        # rather than letting the read fail is what keeps the two paths speaking the same
+        # vocabulary: the scan refuses this as `index-record-mismatch`, and this one used
+        # to surface whatever the short read raised, with no refusal identifier at all.
+        if offset < 0 or length < 9:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} points SH band {band} at "
+                f"[{offset}, {offset + length}), which is too short to be a record",
+                code="index-record-mismatch",
+            )
         band_blob = _read_range(source, offset, length, f"index band {band}")
-        cur = Cursor(band_blob, 9)
-        cur.u8()  # band index, already known from the index
+        # The frame, before its contents. The scan path checks all three of these and this
+        # one checked none, so an entry pointing at a record that is not an SH Band Stream,
+        # or whose declared length runs past the record and into the next one, was refused
+        # by `validate` and read here — the same scan-versus-seek split the rest of this
+        # reader closes. Skipping nine bytes is not the same as reading a record header.
+        framed = Cursor(band_blob)
+        opcode = framed.u8()
+        content_length = framed.u64()
+        if opcode != op.SH_BAND_STREAM or content_length + 9 != len(band_blob):
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} points SH band {band} at "
+                f"{offset}, which is not one complete SH Band Stream record",
+                code="index-record-mismatch",
+            )
+        cur = Cursor(framed.take(content_length))
+        record_band = cur.u8()
+        if record_band != band:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares SH band {band}; "
+                f"the record at {offset} declares band {record_band}",
+                code="index-record-mismatch",
+            )
         from .serialization import decode_stream
 
-        _, values = decode_stream(cur)
+        attribute, values = decode_stream(cur)
+        if attribute != op.SH_BAND_STREAM:
+            raise MalformedFile(
+                f"the SH Band Stream at {offset} declares inner attribute_id {attribute}; "
+                f"version 1 fixes it at {op.SH_BAND_STREAM}"
+            )
+        expected_shape = (int(head.count), 3 * (2 * band + 1))
+        if values.shape != expected_shape:
+            raise MalformedFile(
+                f"the SH Band Stream at {offset} for band {band} decodes to shape "
+                f"{values.shape}; its owning Chunk requires {expected_shape}",
+                code="stream-element-count-mismatch",
+            )
+        check_sh_codes(values, f"the SH Band Stream at {offset}")
         decoded["sh"][band] = values
     return decoded
 

@@ -52,6 +52,23 @@ class Json {
   std::map<std::string, Json> object_;
 };
 
+namespace detail {
+
+/// Rewrite a rendered fixed-point number's radix to `.`, and back.
+///
+/// `snprintf` and `strtod` both take the radix from `LC_NUMERIC`, and a canonical summary may
+/// not: JSON spells a radix `.` and nothing else. These two are how the rendering and the
+/// reading back are pinned to that regardless of the locale the process is running under.
+///
+/// Declared here rather than kept to the translation unit so the substitution can be tested
+/// on a machine with no comma-radix locale installed, which is most CI images. `radix` is a
+/// string and not a character because `localeconv()->decimal_point` is one: a locale may
+/// spell its radix in several bytes, and taking only the first would corrupt the number.
+std::string radixToJson(std::string rendered, const char* radix);
+std::string radixFromJson(std::string json, const char* radix);
+
+}  // namespace detail
+
 /// A float rounded for comparison; a non-finite value becomes `null`.
 Json num(double value);
 /// An integer as a string, so it survives a parser backed by doubles.
@@ -62,8 +79,16 @@ Json integer(std::int64_t value);
 /// and not merely their length.
 std::string crc32String(const std::uint8_t* data, std::size_t length);
 
-/// The content order both implementations reproduce: the gaussian's whole decoded state,
-/// rounded exactly as the summary rounds it, with its spherical harmonic coefficients last.
+/// The content order: the gaussian's whole decoded state, rounded exactly as the summary
+/// rounds it, followed by SH, membership, and exact decoded floats as the final tiebreaker.
+///
+/// The first three are the order every implementation reproduces. The fourth is this
+/// binding's alone — `canonical.py`'s `_stable_keys` declines to use exact decoded values on
+/// the grounds that independently implemented decoders may differ in their last bits, and
+/// reaches order-independence instead by making every emitted value a function of the rounded
+/// key. Both give the same document today, because a rounded-key tie is a tie in everything
+/// this binding emits. They stop agreeing the moment C++ claims `canonicalStateOrder`, whose
+/// state rows the reference orders by the rounded row they emit rather than by the gaussian.
 std::vector<std::size_t> stableOrder(const GaussianView& gaussians);
 
 /// What a summary needs beyond the gaussians. A record that changes nothing here is a record
@@ -89,6 +114,15 @@ struct SceneSummary {
 
 /// The statement every implementation must agree on for a variant.
 std::string canonical(const SceneSummary& summary);
+
+/// The canonical answer for a file this reader refused: `{"refused": "<identifier>"}`.
+///
+/// A refusal is a result, not a crash. The runner prints this on stdout and exits 0, and the
+/// harness diffs it against the committed expectation like any other answer — which is what
+/// separates "refused the file" from "refused it for the right reason". A decoder that
+/// rejects a bad-magic file because it mis-parsed the version would pass a bare-refusal test
+/// and fail this one.
+std::string refusalJson(const std::string& identifier);
 
 }  // namespace conformance
 }  // namespace fourdgs

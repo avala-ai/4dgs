@@ -36,7 +36,7 @@ const config = {
       ({
         docs: {
           path: "docs",
-          routeBasePath: "docs",
+          routeBasePath: "/",
           sidebarPath: "./sidebars.js",
           editUrl: `${repositoryUrl}/tree/main/website/`,
         },
@@ -48,6 +48,25 @@ const config = {
         gtag: undefined,
         googleTagManager: undefined,
       }),
+    ],
+  ],
+
+  // Documentation used to live below /docs. Keep those addresses working, but make
+  // the shorter routes canonical so a guide is /guides/<name>, not /docs/guides/<name>.
+  plugins: [
+    [
+      "@docusaurus/plugin-client-redirects",
+      {
+        redirects: [{ from: "/docs", to: "/guides/" }],
+        createRedirects(existingPath) {
+          if (
+            ["/guides", "/spec", "/reference"].some((prefix) => existingPath.startsWith(prefix))
+          ) {
+            return `/docs${existingPath}`;
+          }
+          return undefined;
+        },
+      },
     ],
   ],
 
@@ -103,10 +122,10 @@ const config = {
             title: "Documentation",
             items: [
               { label: "Viewer", to: "/viewer" },
-              { label: "Guides", to: "/docs/guides/" },
-              { label: "Specification", to: "/docs/spec/" },
-              { label: "Feature support matrix", to: "/docs/reference/" },
-              { label: "Conformance suite", to: "/docs/reference/conformance" },
+              { label: "Guides", to: "/guides/" },
+              { label: "Specification", to: "/spec/" },
+              { label: "Feature support matrix", to: "/reference/" },
+              { label: "Conformance suite", to: "/reference/conformance" },
             ],
           },
           {

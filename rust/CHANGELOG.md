@@ -6,6 +6,293 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Changed
+
+- **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
+  at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
+  already the intent, but no sentence made it a refusal and both read paths quietly guessed —
+  differently. The streamed reader walked every record and kept whichever copy came last; the
+  indexed opener parses the front matter and kept the first. A file with two Quantization records
+  declaring different steps therefore decoded to two different scenes depending on which reader
+  opened it, with nothing raised on either path. §4 now states the multiplicity rule and requires
+  the refusal, which names the record and the byte. A Window Table is tracked with a flag rather
+  than by testing the window list for emptiness: a file may legitimately carry a table with no
+  entries, which is not the same thing as carrying no table at all.
+
+## [0.7.0] - 2026-08-14
+
+### Fixed
+
+- **The canonical object-layer JSON no longer spells the sign of a zero.**
+  `fourdgs_scene_objects_json` and `fourdgs_scene_object_states_json` rendered every value in
+  `(-5e-7, -0.0]` as `-0.000000`, where the reference canonical form emits `0.0` — the canonical
+  form treats the sign of a zero as a property of the arithmetic path rather than of the scene.
+  Three of the committed corpus's object variants carried one, and nothing failed: the conformance
+  harness compared parsed values, and `-0.0 == 0.0`. The C++ and Swift bindings splice these strings
+  into their summaries verbatim, so the same sign was three SDKs' output. No wire-format change; the
+  affected member is a summary the conformance suite consumes.
+- **Scene reading now enforces fixed validated working-set envelopes.** Header, Quantization, Window
+  Table, and lazy descriptor records are parsed from progressively fetched prefixes so legal
+  extension suffixes are stepped over rather than allocated on indexed and streamed paths. Encoded
+  Chunk and SH Band Stream ranges and contiguous summaries are capped before their reads; decoded
+  wire symbols and their wider resident values, gaussian-row amplification, aggregate scene state,
+  streamed retained bytes, and repeatable record counts are checked before the corresponding
+  decompression, output allocation, or collection growth. Indexed state ranges must frame exactly
+  one record. Audio Source bodies are validated without fetching Audio Data payloads, and
+  record-byte-aware incomplete-versus-malformed diagnoses cross the C ABI. Indexed camera, metadata,
+  attachment, provenance, object, and Audio Source parsing now shares the opened scene's diminishing
+  allowance, and replacement loads charge every retained lazy and pose-validation cache before
+  decoding beside the previous gaussian state. Header attribute maps and streamed audio map nodes
+  are checked before allocation, lazy Audio Source descriptors include all `SceneReader` caches, and
+  the public decompressor grows only as validated output actually arrives. Quantization bounds,
+  Metadata maps, Window Table rows, indexed range collections, and assembly scratch storage receive
+  the same pre-allocation checks; truncated orphan audio payloads leave the budget when dropped.
+- **Indexed Chunk and SH Band Stream ranges are checked against the resource before they are read.**
+  A Chunk Index entry is two numbers with no framing around them, so nothing but this check stands
+  between a declared range and the buffer sized from it. `BytesReadable` and `FileReadable` refuse
+  an out-of-range read on their own and hid the gap; a caller-supplied range source — which is what
+  every C, C++ and Swift consumer provides — sizes the host's buffer before the host sees the
+  offset, so a 512 MiB entry in a 933-byte file allocated 512 MiB, once per index entry and once per
+  SH band range.
+- **A Window Table that arrives after a Chunk is refused rather than applied retroactively.** A
+  window index is validated against the table in force when its Chunk is decoded; a second, shorter
+  table left indices already accepted pointing outside the table assembly was handed, which indexed
+  a `Vec` out of bounds and panicked — `FOURDGS_STATUS_INTERNAL` across the C ABI, an abort under
+  `panic=abort`. Assembly now checks the index it is given as well, so a malformed file is a refusal
+  on both paths.
+- **The indexed decode ceiling accumulates across the chunks a caller keeps.** `read_chunk` gave
+  every call the whole shared scene ceiling, so N reads a caller retains cost N ceilings. It now
+  bounds one read against the opened scene's remaining budget, and `read_chunk_within` carries a
+  `ResidentBudget` across a loop that keeps what it reads.
+- **Duplicate provenance record names are found in linear time.** The check rescanned every earlier
+  name per record, so the record-count ceiling bounded memory but not CPU: 200,000 `CoordinateFrame`
+  records — 6.0 MB of input — took 15.4 s in `read_bytes`, and the ceiling admitted about 26 s. The
+  same file now takes 26 ms.
+
+### Changed
+
+- **`4dgs validate` reads a per-band SH bound by the grammar spec §5.3 writes down.** The comparison
+  began with `value.trim()`, which removes Unicode `White_Space` — a set that is neither Python's,
+  which additionally accepts U+001C through U+001F, nor JavaScript's, which additionally accepts
+  U+FEFF. It then removed underscores and folded every Unicode `Nd` digit to ASCII, and refused
+  exponents outside CPython's build-dependent `Decimal` range, all to mirror one interpreter's
+  string syntax. §5.3 now states the grammar instead: an optional sign, ASCII digits, an optional
+  point and an optional exponent, with nothing around it. The trim, the 68-entry digit table and the
+  exponent range check are gone. `1_6`, `١٦` and a space-padded bound are now reported as bounds
+  that disagree with the record; `0e999999999999999999999999` is accepted as the zero it spells.
+  Equivalent spellings such as `5e-05`, `5e-5` and `0.00005` remain one bound.
+- `WriteOptions.cutoff` outside `(0, 1]` is refused as `InvalidInput` rather than written. A
+  marginal threshold of zero or less has no logarithm to invert, and the `NaN` support half-width
+  that came back was discarded by `f64::max`/`f64::min`, silently planning every chunk as though
+  each gaussian filled its whole validity window.
+- **A counted record is fetched at the size it declares instead of by doubling towards it.** The
+  prefix loop grew 8 KiB, 16 KiB, 32 KiB … re-reading from the same offset each time, so a lazily
+  read 100,000-sample Object Track cost `2 + log2(L / 8 KiB)` range requests and moved roughly `2L`
+  bytes. Records that declare a row count already state their own length; the prefix now jumps to
+  it, which is two requests and `L` bytes. Records with no counted rows still double.
+- **The canonical object-layer JSON no longer spells the sign of a zero.**
+  `fourdgs_scene_objects_json` and `fourdgs_scene_object_states_json` rendered every value in
+  `(-5e-7, -0.0]` as `-0.000000`, where the reference canonical form emits `0.0` — the canonical
+  form treats the sign of a zero as a property of the arithmetic path rather than of the scene.
+  Three of the committed corpus's object variants carried one, and nothing failed: the conformance
+  harness compared parsed values, and `-0.0 == 0.0`. The C++ and Swift bindings splice these strings
+  into their summaries verbatim, so the same sign was three SDKs' output. No wire-format change; the
+  affected member is a summary the conformance suite consumes.
+
+## [0.6.0] - 2026-08-13
+
+### Added
+
+- **Bounded `keyframe-delta` validation on the C ABI.** `fourdgs_validate_keyframe_delta_reader`
+  certifies either the sequential or indexed read path over the existing range-reader abstraction,
+  retaining only the current population and GOP keyframe. Lifetime identity introductions are
+  streamed to a caller-owned sink so a CLI can prove uniqueness with bounded scratch storage at its
+  I/O edge; the declared lifetime count is returned only after the complete path validates. The
+  validator checks the physical ownership and exact set of SH Band Streams as well as their inner
+  attribute, shape, and unsigned-byte coefficient domain. `fourdgs_last_error_offset` exposes the
+  offending record byte without making bindings parse an error sentence. Both symbols are additive,
+  and transferred reader contexts are released exactly once on every success and failure path.
+
+- **A `keyframe-delta` encoder on the C ABI.** `write_sequence` has been the reference for this
+  model since 0.3.0 and no binding could reach it, which is why the feature matrix recorded C++ and
+  Swift as Planned for encoding it. Eleven additive symbols close that:
+  `fourdgs_kd_writer_new`/`_free`, `_set_duration`, `_set_cutoff`, `_set_cadence`,
+  `_add_keyframe_at`, `_set_profile`, `_set_library`, `_set_compression`, `_add_sample`,
+  `_sample_count` and `_encode`, which returns the same owned `fourdgs_buffer` the gaussian-birth
+  writer does.
+
+  A second handle rather than a mode on `fourdgs_writer`, for the same reason a Delta Chunk is its
+  own record and not a flag on Chunk (spec §5.18): that writer takes one population, and this model
+  is a population restated at a sequence of instants with identity. The handle accumulates samples
+  and encodes once, because a delta is a difference of bins and never a quantization of a difference
+  (§11.7) and that holds only if every sample was quantized on grids derived from the whole sequence
+  — so a binding that assembled deltas itself would be a second encoder with its own rounding rather
+  than a shim. Strings are length-delimited like every other one here.
+  `tests/capi_keyframe_delta_writer.rs` drives the surface the way a binding does, including that
+  the id column is carried rather than invented from row order, that null is safe on every entry
+  point, and that a delta mode which is not a mode is refused before it reaches a file.
+
+## [0.5.0] - 2026-08-12
+
+### Added
+
+- **The refusal identifier on the C ABI.**
+  `fourdgs_last_refusal_code(const char **out, size_t *out_len)` returns the identifier the
+  specification's refusal table gives the last error on this thread — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — or NULL with length 0 when the error is not
+  one of them, which is an answer rather than a gap: a truncated transport and an I/O failure are
+  real errors the table does not name. The nine `FOURDGS_STATUS_*` codes say what _kind_ of thing
+  went wrong and `FOURDGS_STATUS_UNSUPPORTED_CODEC` alone covers three of the six, so this is the
+  only way a binding can say _which_ refusal it met. Additive — no existing signature moved —
+  because two bindings and a downstream application consume this ABI. Length-delimited like every
+  other string here, never NUL-terminated. Thread-local and written beside the message, so the
+  identifier and `fourdgs_last_error()` always describe one failure and a later error never inherits
+  an earlier identifier. `tests/capi_refusal.rs` reads it the way C does and `capi_smoke.c` proves
+  it links and compiles as C.
+- **Inspect and validate, to the diagnostic bar the format asks for.** The `4dgs` tool already
+  walked records and checked files; what it could not do is the thing its holder actually wants,
+  which is to be told _which_ rule a file broke and _where_. It now is.
+
+  - **`4dgs validate` names the refusal and the byte.** Findings still read word for word as the
+    Python validator's — the identifier arrives on a line of its own beneath the finding it belongs
+    to, so anything filtering on `error:`/`warning:`/`note:` sees exactly what it saw before. The
+    identifier is `Error::refusal_code`'s, the same string the conformance corpus is written
+    against; the byte comes from the tool's own framing walk, since an error is raised where a value
+    was parsed rather than where its bytes sit.
+  - **It decodes the chunks, one at a time — every chunk, and every band each one declares.** A
+    framing walk steps over a chunk by its declared length, so a fault inside a chunk's streams is
+    invisible to it — two of the invalid corpus's seven variants are exactly that, and both used to
+    validate clean. All seven are now refused, by the identifier the corpus names, with the byte.
+    Exactly one chunk is resident at a time on **both** paths: the indexed one reads chunk by chunk
+    through the index, and a file with no index is walked record by record rather than decoded in
+    one call, which is what used to make the resident set the whole scene. Spherical-harmonic bands
+    are decoded rather than capped at band 0 — capping is a rendering choice, and an SH Band Stream
+    carrying a codec this build does not implement is a file that does not decode — and the byte
+    names the band record itself, not the Chunk it belongs to.
+  - **It knows `keyframe-delta`.** Every structural check assumed the gaussian-birth chunk shape, so
+    a conforming keyframe-delta file came back with seven errors and an `INVALID`. The Header's
+    declared model now selects the reader, and the model's own reader is what opens it. Validation
+    walks the timeline once, retaining only the current state and GOP keyframe, so a refusal names
+    its index entry without repeatedly decoding chained prefixes or retaining the sequence.
+  - **A refusal is placed at the record that carries the refused value.** Nothing in the framing
+    forbids a second Header or a second Quantization record, and both read paths check every copy
+    they meet — so a file whose first Header is fine and whose second declares a model this build
+    does not implement is refused at the second. The byte now says so; it used to name the first
+    record of that kind, which is an offset pointing at a record with nothing wrong with it.
+  - **A provenance record is no longer reported as an unknown one.** `0x20`-`0x25` are defined, so
+    they are skipped in silence; `0x26`-`0x2F` is reserved and keeps the note. The note names that
+    range and §5.15.8, where both validators said `0x24-0x2F, section 5.15.6` — true before the
+    object layer was assigned `0x24` and `0x25` out of it, and since then a citation pointing at two
+    records that exist. Both tools still note the same opcodes. Four spurious notes about a
+    conforming capture are gone.
+
+- **`4dgs inspect` reports CRC status per record.** The only checksum the format defines is the
+  Footer's `summary_crc`, so the new column says whether the checksum covers a given record and
+  whether it agrees — `ok`, `MISMATCH`, or `-` for a record nothing covers — with the covered byte
+  range named beneath the table. `--json` carries the same as a per-record `"crc"` and a
+  `"summary_crc"` object.
+
+- **A truncated file is reported rather than refused at the first byte that failed.** `inspect`
+  lists every record it could frame, then names the cut, the byte, and how many complete records
+  before it a streamed reader keeps; `validate` adds the same as a note. Records are
+  length-prefixed, so that prefix is genuinely intact — saying only that the file stopped reading
+  left its holder to guess whether anything was salvageable.
+
+  This holds for a file cut inside its own **Footer** too. The Footer is where the summary checksum
+  is declared, so `inspect` reads it to say which records that checksum covers; asking for a record
+  the file was cut inside returned `Truncated` and ended the command before a single row was
+  printed. Coverage is now read only from a whole Footer, and a file cut inside one reports its
+  records and declares no checksum rather than nothing at all.
+
+- **The summary checksum is computed over bounded reads.** `summary_start` is eight bytes off an
+  untrusted file and may name byte 8, which made verifying the checksum a single allocation of
+  essentially the whole file. `serialization::Crc32` is the same CRC-32 fed in pieces, and `inspect`
+  feeds it a megabyte at a time.
+
+- **Additive library items for callers that want the verdict rather than the whole sequence.**
+  `serialization::Crc32`, above. `keyframe_delta_file::open_indexed` returns an `IndexedSequence` —
+  a file's front matter and index with nothing composed — and `keyframe_delta_file::compose_chain`
+  composes the chain ending at one index entry. Both use the core `Readable` range abstraction.
+  `read_keyframe_entry` and `read_delta_entry` support a linear full-file walk without accumulating
+  states. `decode_indexed` is those two in a loop and is unchanged; what it cannot do is answer
+  "does every chunk decode?" without keeping every state it decoded.
+  `keyframe_delta_file::check_keyframe_chunk` and `check_delta_chunk` answer the same question for
+  one record of a file that has no index to seek in, and keep nothing.
+
+### Fixed
+
+- **`keyframe-delta` validation now checks the model's complete structural contract.** Indexed
+  fields must agree with the Chunk or Delta Chunk they name; keyframe and delta-group stream counts
+  must agree with their record headers; keyframe-mode deltas reference the GOP keyframe and chained
+  deltas reference the immediately preceding state; SH band numbers must be in `1..3` and agree with
+  the index. Stream-only files compose deltas, check their timeline, and decode their SH bands too.
+  The Header's `gaussian_count` is checked against distinct identities using a fixed-memory,
+  disk-partitioned counter rather than a scene-sized identity map.
+
+- **`inspect` refuses an impossible checksum range.** A nonzero summary checksum whose start lies
+  after the Footer is malformed; it is no longer described as a file that intentionally omitted a
+  checksum.
+
+- **A `keyframe-delta` file declaring an unknown quantization scheme is refused.** The model's
+  reader parsed its Quantization record and never asked the registry about it, so a scheme this
+  build does not implement composed all the way to a state and `validate` printed `valid` — while
+  the gaussian-birth reader refuses the same declaration by name at open. `open_indexed` now checks
+  it as the record is read, exactly as `indexed_reader::open_indexed` does.
+
+- **A `keyframe-delta` index must reach both ends of the timeline.** Spec §11.1 fixes three things:
+  each chunk's `t1` is the next chunk's `t0`, the first `t0` is `0`, and the last `t1` is the
+  Header's `duration_sec`. `check_tiling` implemented the first, which says everything about the
+  interior and nothing about either end — an index covering `[0.4, 0.9)` of a one-second clip is
+  internally adjacent and tiles nothing, and a seek to `t=0` on the file it was told was conforming
+  answers "no state chunk covers t=0". New: `keyframe_delta::check_timeline_endpoints`.
+
+- **A `keyframe-delta` file with no chunk index is read front to back rather than reported
+  invalid.** `open_indexed` starts its index walk at `Footer.summary_start`; on a stream-only file
+  that is zero, so it walked from byte 0, read the file magic as record framing, and returned an
+  error. `validate` now warns that the file can only be read front to back — as it always has for
+  `gaussian-birth` — and checks each keyframe and delta chunk on the way past, keeping none of them.
+
+- **Every SH Band Stream a `keyframe-delta` index declares is decoded.** Composing a chain reads
+  Chunk and Delta Chunk records and nothing else, so a band record was a record the verdict never
+  visited: an unimplemented codec in one of them validated clean. The same rule the gaussian-birth
+  path already holds, on the other model.
+
+- **A refusal inside a chunk's streams is placed by `4dgs decode` and `4dgs info` too.** Only
+  `validate` decoded chunks, so `decode` printed `refusal unknown-stream-codec` with no byte at all
+  — the framing walk cannot find a fault inside a chunk, because stepping over one by its declared
+  length is exactly not looking inside it. The tool's error path now scans the file front to back,
+  one record at a time, and names the first record raising that same refusal.
+
+- **Placing a refusal no longer frames the whole file first.** The error path built a `Frame` per
+  record before examining the front matter, so an early refusal on a large file — the case the
+  refusal exists for — cost memory proportional to that file. The search is streamed and stops at
+  the record it is looking for.
+
+- **The Footer is read twenty bytes at a time, whatever it declares.** `Footer::parse` reads three
+  fields and ignores the rest, which is what keeps a Footer a later revision extends readable; the
+  record's declared length is eight bytes off an untrusted file, and `inspect` was sizing an
+  allocation from it. A Footer naming nearly the whole file as its content is now a number in the
+  length column rather than a buffer.
+
+- **The duplicate of an SH band is told apart from the healthy one.** Nothing in an index forbids
+  two ranges for the same band, and `read_chunk` decodes both — so raising a cap until the read
+  failed named whichever sorted first, an offset pointing at a record with nothing wrong with it.
+  Each range is now decoded on its own.
+
+- **A file cut exactly on a record boundary is reported as cut.** Remove only the eight-byte
+  trailing magic and every record is whole, so the walk reached the end with nothing left over and
+  recorded nothing: `inspect` printed a note and exited **0** for an incomplete file, and `validate`
+  left off the note that says how much of it survives.
+
+### Changed
+
+- **Exit code 3: the tool could not run.** A missing file, an unreadable one, or an argument the
+  tool does not understand now exits 3 rather than 1. `1` is an answer about a file — it was read,
+  and it is bad; `3` is the absence of an answer. A pipeline that saw 1 for both could not tell a
+  corrupt asset from a typo in a path, which makes the tool indistinguishable from a broken one on
+  the day it matters. `0`, `1` and `2` are unchanged.
+
 ## [0.4.0] - 2026-08-10
 
 ### Added

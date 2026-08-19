@@ -1,6 +1,6 @@
 {
   "name": "@4dgs/nodejs",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "4dgs nodejs",
   "license": "Apache-2.0",
   "repository": {
@@ -10,6 +10,19 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    }
+  },
+  "bin": {
+    "4dgs": "./dist/cli.js"
+  },
   "files": [
     "dist"
   ],

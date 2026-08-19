@@ -8,8 +8,11 @@
 /// message, borrowed pointers become `Span`s with the lifetime the header states, and a C++
 /// `Readable` becomes the callback struct the decoder reads through.
 
+#include <cmath>
 #include <cstring>
 #include <new>
+#include <optional>
+#include <unordered_set>
 
 #include "backend.hpp"
 #include "fourdgs.h"
@@ -55,16 +58,38 @@ ErrorCode translate(int status) {
   }
 }
 
+/// Which of the specification's named refusals the last error was, or nothing.
+///
+/// NOT NUL-terminated: the ABI returns a pointer and a length, and exactly `length` bytes are
+/// copied. `strlen` or a `std::string` built from the pointer alone reads past the end of a
+/// static string — which is the ABI-string bug this shape exists to prevent, and which showed
+/// up on Windows CI once already.
+///
+/// A null identifier is an answer, not a failure: truncation, an I/O error and a null
+/// argument are real errors that the refusal table does not name, and the accessor reports
+/// them by writing null and still returning OK. The bytes are `'static`, so nothing is freed
+/// — but they name whatever failed last on this thread, so they are copied here and not held.
+std::optional<std::string> lastRefusal() {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Sequenced deliberately, like every two-out-parameter call on this surface: the status is
+  // read first, the out parameters only after it is OK.
+  const int status = fourdgs_last_refusal_code(&data, &length);
+  if (status != FOURDGS_STATUS_OK || data == nullptr || length == 0) return std::nullopt;
+  return std::string(data, length);
+}
+
 /// A failed call, with the core's diagnosis rather than a category name.
 ///
 /// `fourdgs_last_error()` is thread-local and borrowed until the next failure on this
-/// thread, so it is copied here and not held.
+/// thread, so it is copied here and not held. The refusal identifier beside it is written by
+/// the same failing call, so the pair always describes one failure.
 Result<void> failure(int status) {
   const char* message = fourdgs_last_error();
   std::string detail = (message != nullptr && message[0] != '\0')
                            ? std::string(message)
                            : std::string(fourdgs_status_message(status));
-  return Error(translate(status), std::move(detail));
+  return Error(translate(status), std::move(detail), lastRefusal());
 }
 
 Result<void> check(int status) {
@@ -77,13 +102,22 @@ Result<void> check(int status) {
 /// not a member of `Handle`.
 struct ReadableBridge {
   Readable* source = nullptr;
+  std::optional<Error>* error = nullptr;
+};
+
+struct IdentityBridge {
+  const std::function<Result<void>(std::uint64_t, std::uint32_t)>* introduce = nullptr;
+  std::optional<Error> error;
 };
 
 int bridgeSize(void* ctx, std::uint64_t* outSize) {
   ReadableBridge* bridge = static_cast<ReadableBridge*>(ctx);
   if (bridge == nullptr || bridge->source == nullptr) return FOURDGS_STATUS_INVALID_ARGUMENT;
   Result<std::uint64_t> size = bridge->source->size();
-  if (!size) return FOURDGS_STATUS_IO;
+  if (!size) {
+    if (bridge->error != nullptr && !bridge->error->has_value()) *bridge->error = size.error();
+    return FOURDGS_STATUS_IO;
+  }
   *outSize = *size;
   return FOURDGS_STATUS_OK;
 }
@@ -102,9 +136,11 @@ int bridgeRead(void* ctx, std::uint64_t offset, std::uint64_t length, std::uint8
     const std::size_t want = static_cast<std::size_t>(remaining);
     Result<std::size_t> got =
         bridge->source->read(offset + done, Span<std::uint8_t>(out + done, want));
-    if (!got)
+    if (!got) {
+      if (bridge->error != nullptr && !bridge->error->has_value()) *bridge->error = got.error();
       return got.error().code == ErrorCode::kInvalidArgument ? FOURDGS_STATUS_TRUNCATED
                                                              : FOURDGS_STATUS_IO;
+    }
     if (*got == 0) return FOURDGS_STATUS_TRUNCATED;
     done += *got;
   }
@@ -112,6 +148,15 @@ int bridgeRead(void* ctx, std::uint64_t offset, std::uint64_t length, std::uint8
 }
 
 void bridgeRelease(void* ctx) { delete static_cast<ReadableBridge*>(ctx); }
+
+int bridgeIdentity(void* ctx, std::uint64_t recordOffset, std::uint32_t id) {
+  IdentityBridge* bridge = static_cast<IdentityBridge*>(ctx);
+  if (bridge == nullptr || bridge->introduce == nullptr) return FOURDGS_STATUS_INVALID_ARGUMENT;
+  Result<void> added = (*bridge->introduce)(recordOffset, id);
+  if (added) return FOURDGS_STATUS_OK;
+  bridge->error = added.error();
+  return added.error().code == ErrorCode::kIo ? FOURDGS_STATUS_IO : FOURDGS_STATUS_INVALID_ARGUMENT;
+}
 
 /// A borrowed (pointer, length) string from the ABI, copied.
 ///
@@ -168,6 +213,41 @@ Result<void> openReadable(Handle& handle, Readable& source, int mode) {
   if (status != FOURDGS_STATUS_OK) return failure(status);
   handle.scene = scene;
   return Result<void>();
+}
+
+Result<std::uint64_t> validateKeyframeDelta(
+    Readable& source, int mode,
+    const std::function<Result<void>(std::uint64_t, std::uint32_t)>& introduce,
+    std::optional<std::uint64_t>* failureOffset) {
+  if (failureOffset != nullptr) failureOffset->reset();
+  ReadableBridge* sourceBridge = new (std::nothrow) ReadableBridge();
+  if (sourceBridge == nullptr)
+    return Error(ErrorCode::kInternal, "out of memory opening keyframe-delta validation");
+  sourceBridge->source = &source;
+  std::optional<Error> sourceError;
+  sourceBridge->error = &sourceError;
+  fourdgs_reader reader;
+  reader.ctx = sourceBridge;
+  reader.size = &bridgeSize;
+  reader.read = &bridgeRead;
+  reader.release = &bridgeRelease;
+
+  IdentityBridge identity;
+  identity.introduce = &introduce;
+  std::uint64_t declared = 0;
+  const int status =
+      fourdgs_validate_keyframe_delta_reader(reader, mode, &identity, &bridgeIdentity, &declared);
+  if (status == FOURDGS_STATUS_OK) return declared;
+  if (failureOffset != nullptr) {
+    std::uint64_t offset = 0;
+    int hasOffset = 0;
+    if (fourdgs_last_error_offset(&offset, &hasOffset) == FOURDGS_STATUS_OK && hasOffset != 0)
+      *failureOffset = offset;
+  }
+  if (identity.error.has_value()) return *identity.error;
+  if (sourceError.has_value()) return *sourceError;
+  Result<void> failed = failure(status);
+  return failed.error();
 }
 
 double durationSec(const Handle& handle) { return fourdgs_scene_duration_sec(asScene(handle)); }
@@ -532,8 +612,192 @@ struct WriterGuard {
   WriterGuard& operator=(const WriterGuard&) = delete;
 };
 
+/// The same, for the keyframe-delta sequence writer. A separate ABI type because the model
+/// takes samples rather than gaussians, so it is a separate guard.
+struct KeyframeDeltaWriterGuard {
+  fourdgs_kd_writer* writer = fourdgs_kd_writer_new();
+  KeyframeDeltaWriterGuard() = default;
+  ~KeyframeDeltaWriterGuard() { fourdgs_kd_writer_free(writer); }
+  KeyframeDeltaWriterGuard(const KeyframeDeltaWriterGuard&) = delete;
+  KeyframeDeltaWriterGuard& operator=(const KeyframeDeltaWriterGuard&) = delete;
+};
+
+/// Copy an encoded buffer out and free it.
+///
+/// The bytes are the caller's to keep and the ABI's pointer lives only until
+/// `fourdgs_buffer_free`, so the copy has to happen first. One function rather than one copy
+/// per encode path, because a second hand-written version is a second place to forget the
+/// free.
+std::vector<std::uint8_t> takeBuffer(fourdgs_buffer* buffer) {
+  const std::uint8_t* data = fourdgs_buffer_data(buffer);
+  const std::size_t length = fourdgs_buffer_len(buffer);
+  std::vector<std::uint8_t> out(length);
+  if (length != 0 && data != nullptr) std::memcpy(out.data(), data, length);
+  fourdgs_buffer_free(buffer);
+  return out;
+}
+
+/// Every column of a `GaussianView` holds `count` gaussians, and the count fits the ABI.
+///
+/// `GaussianView::count` is a public field of its own, derived from nothing: the `Span`s
+/// beside it are independent, so `count = 4` over a six-float `positions` is a value any
+/// caller can build without writing `unsafe` anywhere. Both encode entry points then hand
+/// the ABI that count and a bare `data()` per column, and the ABI reads `count × width`
+/// floats from each — so an unchecked count is a heap read past the end of the caller's own
+/// buffer, from a public API. AGENTS.md §1: nothing untrusted sizes a read that was not
+/// validated first. Checked here rather than at the ABI because this is the last place the
+/// lengths still exist; across the boundary there is only a pointer.
+///
+/// `subject` names what is being described — "the gaussians" for a scene, "sample 3" for a
+/// keyframe-delta sample — so a caller staging seventeen samples learns which one is short.
+/// Written as a division rather than a `count * width` comparison because the product is the
+/// thing that could overflow, and an overflowed bound is a check that passes.
+Result<void> checkColumns(const GaussianView& gaussians, const std::string& subject) {
+  // The ABI's count is 32 bits. A `std::size_t` count above that would be truncated on the
+  // way in and the columns re-read against the wrong length, so it is refused by name
+  // instead of silently becoming a different number.
+  if (gaussians.count > 0xFFFFFFFFull) {
+    return Error(ErrorCode::kInvalidArgument,
+                 subject + " declares " + std::to_string(gaussians.count) +
+                     " gaussians, more than the 32-bit count the core's writer takes");
+  }
+  struct Column {
+    const char* name;
+    std::size_t width;  ///< Floats per gaussian.
+    std::size_t size;
+  };
+  const Column columns[] = {
+      {"positions", 3, gaussians.positions.size()}, {"scales", 3, gaussians.scales.size()},
+      {"rotations", 4, gaussians.rotations.size()}, {"colors", 4, gaussians.colors.size()},
+      {"motions", 3, gaussians.motions.size()},     {"mu_t", 1, gaussians.muT.size()},
+      {"sigma_t", 1, gaussians.sigmaT.size()},      {"win_lo", 1, gaussians.winLo.size()},
+      {"win_hi", 1, gaussians.winHi.size()},
+  };
+  for (const Column& column : columns) {
+    if (gaussians.count > column.size / column.width) {
+      return Error(ErrorCode::kInvalidArgument,
+                   subject + " declares " + std::to_string(gaussians.count) +
+                       " gaussians and its " + column.name + " column holds " +
+                       std::to_string(column.size) + " floats; at " + std::to_string(column.width) +
+                       " per gaussian that column needs " +
+                       std::to_string(static_cast<std::uint64_t>(gaussians.count) * column.width) +
+                       ". GaussianView::count is not derived from the columns, so the two have to "
+                       "agree before the count reaches the core");
+    }
+  }
+  return Result<void>();
+}
+
+/// Refuse a sequence the C ABI cannot prove is a conforming keyframe-delta timeline.
+///
+/// The ABI deliberately accepts borrowed pointers and a single count, and its sequence writer
+/// does not validate the timeline endpoints. This is the last layer that can compare each id
+/// span's length with its GaussianView and reject duplicate identities without first copying the
+/// caller's data into the core, so all of those checks happen before a writer is allocated.
+Result<void> checkKeyframeDeltaInputs(Span<const KeyframeDeltaSample> samples, double durationSec) {
+  if (std::isnan(durationSec) || durationSec <= 0.0) {
+    return Error(ErrorCode::kInvalidArgument,
+                 "duration_sec must be positive and not NaN; got " + std::to_string(durationSec));
+  }
+  if (samples.empty()) {
+    return Error(ErrorCode::kInvalidArgument,
+                 "a keyframe-delta sequence needs at least one sample");
+  }
+
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    if (!std::isfinite(samples[i].t0)) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) + " starts at a non-finite instant");
+    }
+  }
+  if (samples[0].t0 != 0.0) {
+    return Error(ErrorCode::kInvalidArgument,
+                 "the first sample starts at " + std::to_string(samples[0].t0) +
+                     ", not 0; a keyframe-delta timeline tiles [0, duration_sec) "
+                     "(spec §11.1)");
+  }
+  for (std::size_t i = 1; i < samples.size(); ++i) {
+    if (!(samples[i].t0 > samples[i - 1].t0)) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) + " starts at " + std::to_string(samples[i].t0) +
+                       ", not after sample " + std::to_string(i - 1) + " at " +
+                       std::to_string(samples[i - 1].t0) +
+                       "; sample instants must be strictly increasing (spec §11.1)");
+    }
+  }
+  if (!(samples[samples.size() - 1].t0 < durationSec)) {
+    return Error(ErrorCode::kInvalidArgument,
+                 "the last sample starts at " + std::to_string(samples[samples.size() - 1].t0) +
+                     ", not before duration_sec " + std::to_string(durationSec) +
+                     "; its interval must have positive width (spec §11.1)");
+  }
+
+  // Retain only the immediately preceding population. When a current id is not live there,
+  // scan the caller-owned earlier samples to tell a genuine birth from reuse after death. This
+  // keeps validation memory bounded by adjacent sample populations rather than by all lifetime
+  // births; the reference encoder accepts the extra work in exchange for the bounded guarantee.
+  std::unordered_set<std::uint32_t> liveIds;
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    const KeyframeDeltaSample& sample = samples[i];
+    Result<void> columns = checkColumns(sample.gaussians, "sample " + std::to_string(i));
+    if (!columns) return columns.error();
+    if (sample.ids.size() != sample.gaussians.count) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) + " carries " +
+                       std::to_string(sample.gaussians.count) + " gaussians and " +
+                       std::to_string(sample.ids.size()) +
+                       " ids; gaussian_id is one per gaussian (spec §11.2)");
+    }
+    if (!sample.ids.empty() && sample.ids.data() == nullptr) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) +
+                       " has a null gaussian_id span for a non-empty population");
+    }
+
+    std::unordered_set<std::uint32_t> uniqueIds;
+    uniqueIds.reserve(sample.ids.size());
+    for (std::size_t row = 0; row < sample.ids.size(); ++row) {
+      const std::uint32_t id = sample.ids[row];
+      if (!uniqueIds.insert(id).second) {
+        return Error(ErrorCode::kInvalidArgument,
+                     "sample " + std::to_string(i) + " names gaussian id " + std::to_string(id) +
+                         " more than once; ids are unique within a state (spec §11.2)");
+      }
+    }
+    // Index the spans rather than range-iterating: an empty sample is legal and its default
+    // Span has a null pointer, for which computing `nullptr + 0` as `end()` is undefined.
+    for (std::size_t row = 0; row < sample.ids.size(); ++row) {
+      const std::uint32_t id = sample.ids[row];
+      bool appearedEarlier = false;
+      if (liveIds.find(id) == liveIds.end()) {
+        for (std::size_t earlier = 0; earlier < i && !appearedEarlier; ++earlier) {
+          for (std::size_t priorRow = 0; priorRow < samples[earlier].ids.size(); ++priorRow) {
+            if (samples[earlier].ids[priorRow] == id) {
+              appearedEarlier = true;
+              break;
+            }
+          }
+        }
+      }
+      if (appearedEarlier) {
+        return Error(ErrorCode::kInvalidArgument,
+                     "sample " + std::to_string(i) + " reuses gaussian id " + std::to_string(id) +
+                         " after it died; gaussian_id is never reused within a sequence "
+                         "(spec §11.2)");
+      }
+    }
+    liveIds.swap(uniqueIds);
+  }
+  return Result<void>();
+}
+
 Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
                                               const WriteOptions& options) {
+  // Before anything is staged: the columns are the caller's memory, and the count is what
+  // decides how much of it the core reads.
+  Result<void> columns = checkColumns(gaussians, "the gaussians");
+  if (!columns) return columns.error();
+
   WriterGuard guard;
   if (guard.writer == nullptr) {
     return Error(ErrorCode::kInternal, "the core could not allocate a writer");
@@ -591,15 +855,60 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, dou
   fourdgs_buffer* buffer = nullptr;
   const int status = fourdgs_writer_encode(writer, &buffer);
   if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  return takeBuffer(buffer);
+}
 
-  // Copied out before the buffer is freed: the bytes are the caller's to keep, and the ABI's
-  // pointer lives only until fourdgs_buffer_free.
-  const std::uint8_t* data = fourdgs_buffer_data(buffer);
-  const std::size_t length = fourdgs_buffer_len(buffer);
-  std::vector<std::uint8_t> out(length);
-  if (length != 0 && data != nullptr) std::memcpy(out.data(), data, length);
-  fourdgs_buffer_free(buffer);
-  return out;
+Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
+    Span<const KeyframeDeltaSample> samples, double durationSec,
+    const KeyframeDeltaOptions& options) {
+  Result<void> inputs = checkKeyframeDeltaInputs(samples, durationSec);
+  if (!inputs) return inputs.error();
+
+  KeyframeDeltaWriterGuard guard;
+  if (guard.writer == nullptr) {
+    return Error(ErrorCode::kInternal, "the core could not allocate a keyframe-delta writer");
+  }
+  fourdgs_kd_writer* writer = guard.writer;
+
+  Result<void> staged = check(fourdgs_kd_writer_set_duration(writer, durationSec));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_kd_writer_set_cutoff(writer, options.cutoff));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_kd_writer_set_cadence(writer, options.keyframeEvery, options.deltaMode));
+  if (!staged) return staged.error();
+  for (std::uint32_t index : options.keyframeAt) {
+    staged = check(fourdgs_kd_writer_add_keyframe_at(writer, index));
+    if (!staged) return staged.error();
+  }
+  if (!options.profile.empty()) {
+    staged = check(
+        fourdgs_kd_writer_set_profile(writer, options.profile.data(), options.profile.size()));
+    if (!staged) return staged.error();
+  }
+  if (!options.library.empty()) {
+    staged = check(
+        fourdgs_kd_writer_set_library(writer, options.library.data(), options.library.size()));
+    if (!staged) return staged.error();
+  }
+  staged = check(fourdgs_kd_writer_set_compression(writer, options.codec, options.level));
+  if (!staged) return staged.error();
+
+  // Every borrowed span and the complete timeline were validated before the writer was
+  // allocated. The ABI can now copy exactly the rows each sample declares.
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    const KeyframeDeltaSample& sample = samples[i];
+    const GaussianView& g = sample.gaussians;
+    staged = check(fourdgs_kd_writer_add_sample(
+        writer, sample.t0, static_cast<std::uint32_t>(g.count), sample.ids.data(),
+        g.positions.data(), g.scales.data(), g.rotations.data(), g.colors.data(), g.motions.data(),
+        g.muT.data(), g.sigmaT.data(), g.winLo.data(), g.winHi.data()));
+    if (!staged) return staged.error();
+  }
+
+  fourdgs_buffer* buffer = nullptr;
+  const int status = fourdgs_kd_writer_encode(writer, &buffer);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  return takeBuffer(buffer);
 }
 
 namespace {

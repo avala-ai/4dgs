@@ -55,6 +55,24 @@ class MalformedFile(FourdgsError):
     outside its legal range."""
 
 
+def duplicate_structural_record(name: str, offset: int) -> MalformedFile:
+    """A second Header, Quantization or Window Table record in one file (section 4).
+
+    These three describe the whole file, and nothing in a .4dgs file says which of two
+    copies wins. A reader that keeps the last silently disagrees with one that keeps the
+    first -- and both of those readers are in this package: the streamed reader walks
+    every record and would keep whichever came last, while the indexed opener parses the
+    front matter and would keep the first. Same bytes, two scenes.
+
+    Spelled once, here, rather than at each of the six call sites: two spellings of one
+    refusal is two chances for one of them to leave out the byte.
+    """
+    return MalformedFile(
+        f"a second {name} record at byte {offset}; a file carries exactly one, and "
+        f"nothing says which of two copies a reader should believe",
+    )
+
+
 class UnsupportedCodec(FourdgsError):
     """A legal but unimplemented codec. The file is fine; this build cannot read it."""
 
@@ -62,6 +80,20 @@ class UnsupportedCodec(FourdgsError):
 class BoundViolation(FourdgsError):
     """An encoder's own verification failed: a decoded value fell outside the bound the
     file was about to declare. Always a bug in the encoder, never in the input."""
+
+
+class ExceedsReaderLimit(FourdgsError):
+    """A legal file whose scale is past a ceiling this reader states in advance.
+
+    Not a fault in the file: it is what a bounded one-pass operation costs. Some questions
+    — how many distinct gaussian ids a sequence carries, and whether any of them was reused
+    — cannot be answered exactly in one pass without space proportional to the answer, so
+    a reader that will not allocate without a limit (AGENTS.md §1) must declare one. It may
+    instead spend more passes on fixed-capacity partitions, as validation does. Past the
+    one-pass limit the honest reply is this, rather than a wrong number or an allocation
+    the file's own contents chose. The fix is a larger limit or the partitioned operation,
+    not a new file.
+    """
 
 
 class InvalidInput(FourdgsError):
