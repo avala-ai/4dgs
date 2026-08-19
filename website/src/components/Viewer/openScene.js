@@ -24,8 +24,10 @@ import {
   HEAD_PROBE_BYTES,
   IndexedDecoder,
   MAGIC,
+  KeyframeDeltaIndexedDecoder,
   MalformedFile,
   Opcode,
+  TruncatedFile,
   RECORD_HEADER_BYTES,
   assembleGaussians,
   checkMagic,
@@ -393,12 +395,12 @@ async function chunkGateOf(scene, source, size) {
   const entries = [...scene.chunkIndex].sort((a, b) => a.chunkOffset - b.chunkOffset);
   const count = scene.gaussians.count;
   if (entries.length === 0) {
-    return {
-      gate: null,
-      why:
-        "This file was read front to back and carries no Chunk Index, so which chunk a " +
-        "gaussian was stored in is not recoverable here.",
-    };
+    // No index is not the same as no intervals. §5.5 puts `t0` and `t1` in the Chunk
+    // record's own header, so a file with no Chunk Index still says where each chunk
+    // belongs on the timeline — it just does not say so in a place a seeking reader can
+    // reach cheaply. Walking the records for them keeps the streamed path applying the
+    // same visibility rule as the indexed one, rather than warning that it cannot.
+    return chunkGateFromRecords(source, size, count);
   }
   let total = 0;
   for (const entry of entries) total += entry.gaussianCount;
@@ -434,6 +436,81 @@ async function chunkGateOf(scene, source, size) {
  * is the indexed reader's own check on the streamed reader's data, not a second opinion
  * about what a Chunk record contains.
  */
+/**
+ * The chunk gate built from the Chunk records themselves, for a file with no index.
+ *
+ * No index is not the same as no intervals. §5.5 puts `t0` and `t1` at the very front of
+ * a Chunk record's content, ahead of everything that makes a chunk large, so a file with
+ * no Chunk Index still says where each chunk belongs on the timeline. Walking for them
+ * keeps the streamed path applying the same visibility rule as the indexed one.
+ *
+ * Bounded, as §1 requires: one 9-byte framing read per record and one short prefix per
+ * Chunk, stepping over every payload by its declared length. Nothing here reads a chunk's
+ * attribute streams — those were already decoded, once, by `decodeScene`.
+ *
+ * Returns the same `{gate, why}` shape as the indexed path. A file whose records cannot be
+ * walked, or whose chunk counts do not add up to what was decoded, yields a `null` gate
+ * and a sentence saying so — the same outcome as before, but now only when the file really
+ * cannot support the gate.
+ */
+async function chunkGateFromRecords(source, size, count) {
+  // `parseChunk` reads f64 t0, f64 t1, u32 level, u32 count, a length-prefixed compression
+  // name, then u64 uncompressed_size: 36 bytes plus the name. 128 covers every name the
+  // registry defines with room to spare, and a name longer than that lands in the catch
+  // below as a file this gate declines rather than as a wrong answer.
+  const CHUNK_PREFIX_BYTES = 128;
+  const t0 = new Float64Array(count);
+  const t1 = new Float64Array(count);
+  let at = MAGIC.length;
+  let filled = 0;
+  try {
+    while (at + RECORD_HEADER_BYTES <= size) {
+      const head = await source.read(BigInt(at), BigInt(RECORD_HEADER_BYTES));
+      if (head.length < RECORD_HEADER_BYTES) break;
+      // Framed by hand rather than through `readRecord`, which takes the whole content:
+      // the point here is to not read it.
+      const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+      const opcode = view.getUint8(0);
+      const contentLength = Number(view.getBigUint64(1, true));
+      if (contentLength < 0 || at + RECORD_HEADER_BYTES + contentLength > size) break;
+      if (opcode === Opcode.Chunk) {
+        const wanted = Math.min(contentLength, CHUNK_PREFIX_BYTES);
+        const prefix = await source.read(BigInt(at + RECORD_HEADER_BYTES), BigInt(wanted));
+        const { header } = parseChunk(prefix);
+        if (filled + header.count > count) {
+          return {
+            gate: null,
+            why:
+              `This file's Chunk records account for more than the ${count} gaussians that ` +
+              "were decoded, so which chunk each one came from is not recoverable.",
+          };
+        }
+        t0.fill(header.t0, filled, filled + header.count);
+        t1.fill(header.t1, filled, filled + header.count);
+        filled += header.count;
+      }
+      at += RECORD_HEADER_BYTES + contentLength;
+    }
+  } catch (error) {
+    return {
+      gate: null,
+      why:
+        "This file was read front to back and its Chunk records could not be walked for " +
+        `their intervals (${error.message}), so which chunk a gaussian was stored in is ` +
+        "not recoverable here.",
+    };
+  }
+  if (filled !== count) {
+    return {
+      gate: null,
+      why:
+        `This file's Chunk records account for ${filled} gaussians and ${count} were ` +
+        "decoded, so they cannot say which chunk each one came from.",
+    };
+  }
+  return { gate: { t0, t1 }, why: "" };
+}
+
 async function chunkDisagreement(entry, source, size) {
   const { chunkOffset, chunkLength } = entry;
   if (chunkOffset < 0 || chunkLength < RECORD_HEADER_BYTES || chunkOffset + chunkLength > size) {
@@ -505,13 +582,81 @@ function concatSh(chunks) {
 // --------------------------------------------------------------------------
 
 /**
- * The `keyframe-delta` model, composed front to back.
+ * A `keyframe-delta` file opened by byte range, through `@4dgs/core`'s indexed decoder.
  *
- * This path is the one exception to the bounded-memory reading above: `@4dgs/core`
- * composes a `keyframe-delta` file from a byte array rather than from an `IReadable`, so
- * the whole resource is read before anything is composed. The page says so.
+ * The decoder reads the front matter and the summary, then fetches only the chunks an
+ * instant needs — for a chained delta, the keyframe at the head of its group and the
+ * deltas between. Nothing composes the file whole, so there is no size ceiling on this
+ * path and none of the retention the streamed one pays for.
+ */
+async function openKeyframeDeltaIndexed(source) {
+  const decoder = await KeyframeDeltaIndexedDecoder.open(source);
+  const index = decoder.index;
+  if (index.length === 0) {
+    throw new MalformedFile(
+      "this keyframe-delta file carries no Chunk Index, so it cannot be read by range",
+    );
+  }
+  // §11.10, as on the streamed path: the timeline ends at the largest `t1`, which is not
+  // necessarily the last entry — chunks tile in time order and may be stored in any order.
+  let covered = index[0].t1;
+  let earliest = index[0].t0;
+  for (const entry of index) {
+    covered = Math.max(covered, entry.t1);
+    earliest = Math.min(earliest, entry.t0);
+  }
+  const duration = Math.min(decoder.header.durationSec, covered);
+  const notes = [
+    "This file is read by byte range: the Footer, the Chunk Index, then only the chunks " +
+      "the instant on screen is reconstructed from.",
+    "The composed population carries no spherical harmonics: SH bands live in their own " +
+      "records, which this temporal model's read path does not visit.",
+  ];
+  if (duration < decoder.header.durationSec) {
+    notes.push(
+      `The indexed chunks cover [${earliest}, ${covered}), short of the Header's ` +
+        `duration_sec ${decoder.header.durationSec}: the timeline here ends where the ` +
+        "chunks do rather than extrapolating.",
+    );
+  }
+  return {
+    readMode: "keyframe-delta",
+    header: decoder.header,
+    duration,
+    frameAt: async (t) => frameFromKeyframeDelta(await decoder.reconstructAt(t)),
+    intervalsAt: (t) => {
+      for (const entry of index) {
+        if (entry.t0 <= t && t < entry.t1) return [{ t0: entry.t0, t1: entry.t1 }];
+      }
+      return [];
+    },
+    notes,
+  };
+}
+
+/**
+ * The `keyframe-delta` model, read by byte range when the file carries an index.
+ *
+ * `KeyframeDeltaIndexedDecoder` opens over an `IReadable` and reconstructs an instant from
+ * the chunks that instant needs, which is the same bargain the gaussian-birth indexed path
+ * makes and the reason §1's bounded-memory rule is satisfiable here at all. An earlier
+ * version of this page composed every keyframe-delta file whole, behind a size limit,
+ * because that decoder did not exist yet; a fixed ceiling is not bounded memory, it is a
+ * larger unbounded read.
+ *
+ * The whole-file path below survives for files this one cannot open — no Chunk Index, or
+ * one cut before its Footer — where there is nothing to seek with. That case keeps the
+ * limit, and the page still says so.
  */
 async function openKeyframeDelta(source, size) {
+  try {
+    return await openKeyframeDeltaIndexed(source);
+  } catch (error) {
+    // Not a swallow: the streamed composition below re-reads the same bytes and refuses
+    // them in its own words if they are genuinely bad. What this catch covers is a file
+    // with no usable index, which is a legal file and the reason the other path exists.
+    if (!(error instanceof MalformedFile) && !(error instanceof TruncatedFile)) throw error;
+  }
   if (size > KEYFRAME_DELTA_BYTE_LIMIT) {
     throw new MalformedFile(
       `this keyframe-delta resource is ${size} bytes, and this page composes a keyframe-delta ` +

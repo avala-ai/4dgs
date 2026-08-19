@@ -5,6 +5,14 @@ on:
     branches: [main]
     paths:
       - "website/**"
+      # The viewer imports @4dgs/core and @4dgs/browser as workspace dependencies and is
+      # tested against real corpus files, so an SDK-only change can break the page — its
+      # imports, or what it decodes — without touching website/. Watched here so that
+      # break shows up on the PR that causes it rather than on the next unrelated one.
+      - "typescript/**"
+      # The viewer's tests decode the generated corpus, so a generator change moves what
+      # they are checked against.
+      - "tests/conformance/**"
       - "package.json"
       - "yarn.lock"
       - ".github/workflows/website.yml"
@@ -13,6 +21,14 @@ on:
   pull_request:
     paths:
       - "website/**"
+      # The viewer imports @4dgs/core and @4dgs/browser as workspace dependencies and is
+      # tested against real corpus files, so an SDK-only change can break the page — its
+      # imports, or what it decodes — without touching website/. Watched here so that
+      # break shows up on the PR that causes it rather than on the next unrelated one.
+      - "typescript/**"
+      # The viewer's tests decode the generated corpus, so a generator change moves what
+      # they are checked against.
+      - "tests/conformance/**"
       - "package.json"
       - "yarn.lock"
       - ".github/workflows/website.yml"
