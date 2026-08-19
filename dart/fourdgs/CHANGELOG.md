@@ -6,6 +6,16 @@ All notable changes to the Dart package are documented here, following
 
 ## [0.2.0] - 2026-08-17
 
+### Fixed
+
+- **A sigma that underflows `exp()` decodes instead of crashing the reader.** `muStep` computed
+  `_log2(target / stepRef).floor().clamp(...)`. When the sigma bin and step drive `exp()` to exactly
+  zero, `log2` is `-Infinity` and Dart's `floor()` throws `UnsupportedError` — before the clamp
+  beside it, which already holds the right answer, can run. So this decoder crashed on a file every
+  other SDK reads: the reference floors to `-inf` in numpy and clips, and both now return
+  `3.90625e-06` for `muStep(-100000, 1.0, false, 0.004)`. An infinite step still throws, and the
+  `NaN` a zero or negative step produces is unchanged and still open.
+
 ### Changed
 
 - **BREAKING: the encoder moved out of `package:fourdgs/fourdgs.dart` and into
