@@ -34,9 +34,8 @@ import {
   parseChunk,
   parseHeader,
   readRecord,
+  reconstructKeyframeDelta,
 } from "@4dgs/core";
-
-import { reconstructKeyframeDelta } from "./keyframeDelta.js";
 
 /**
  * The gaussians alive at one instant, in the layout the renderer uploads.
@@ -283,6 +282,36 @@ async function streamedPlayable(scene, source, size, notes) {
  * gaussian was stored in, which is not part of a `GaussianSet` and so has to be carried
  * alongside it.
  */
+/**
+ * `@4dgs/core`'s reconstructed keyframe-delta state, in this page's frame shape.
+ *
+ * The two disagree on colour and on width, and both differences are the core's call
+ * rather than this page's: it hands back `rgb` and `opacity` as separate `Float64Array`s
+ * where a renderer wants one interleaved RGBA buffer, and it works in float64 where the
+ * GPU takes float32. Converting here keeps that seam in one function instead of spreading
+ * it across the renderer.
+ *
+ * No visibility filtering: `reconstructKeyframeDelta` has already applied the window test
+ * and the file's own cutoff, which is why the cutoff argument this used to take is gone.
+ */
+function frameFromKeyframeDelta(state) {
+  const count = state.count;
+  const colors = new Float32Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    colors[i * 4] = state.rgb[i * 3];
+    colors[i * 4 + 1] = state.rgb[i * 3 + 1];
+    colors[i * 4 + 2] = state.rgb[i * 3 + 2];
+    colors[i * 4 + 3] = state.opacity[i];
+  }
+  return {
+    count,
+    centers: Float32Array.from(state.centers),
+    rotations: Float32Array.from(state.rotations),
+    scales: Float32Array.from(state.scales),
+    colors,
+  };
+}
+
 function frameFromSet(set, t, cutoff, gate) {
   const state = set.stateAt(t, cutoff);
   const total = state.indices.length;
@@ -548,7 +577,10 @@ async function openKeyframeDelta(source, size) {
                 `decoded cover [${earliest}, ${covered})`,
         );
       }
-      return reconstructKeyframeDelta(sequence, chunk, t, cutoff);
+      // No cutoff argument: `@4dgs/core` reads `sequence.header.cutoff` itself, which
+      // is the same number `cutoffOf` was passing and one fewer place for the two to
+      // disagree.
+      return frameFromKeyframeDelta(reconstructKeyframeDelta(sequence, chunk, t));
     },
     intervalsAt: (t) => {
       const chunk = covering(t);

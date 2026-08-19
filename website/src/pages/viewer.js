@@ -59,8 +59,8 @@ export default function ViewerPage() {
             <li>there is no WebAssembly, no GPU radix sort and no worker.</li>
           </ul>
           <p>
-            Benchmark your renderer, not this one. The <Link to="/docs/spec/">specification</Link>{" "}
-            is deliberately renderer-agnostic: decoding ends at gaussian state at a time, and
+            Benchmark your renderer, not this one. The <Link to="/spec/">specification</Link> is
+            deliberately renderer-agnostic: decoding ends at gaussian state at a time, and
             everything after that line is a choice this page makes rather than one the format makes.
           </p>
         </section>

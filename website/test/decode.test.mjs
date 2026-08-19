@@ -29,7 +29,6 @@ import {
 } from "@4dgs/core";
 
 import { openScene } from "../src/components/Viewer/openScene.js";
-import { reconstructKeyframeDelta } from "../src/components/Viewer/keyframeDelta.js";
 import {
   BytesReadable,
   FAMILIES,
@@ -85,8 +84,31 @@ describe("the corpus decodes to the same scene on both read paths", () => {
 
       // The Header, against the expectation every SDK is diffed on.
       assert.equal(indexed.header.temporalModel, expected.temporalModel);
-      assert.equal(indexed.duration, expected.durationSec);
-      assert.equal(indexed.header.cutoff, expected.cutoff);
+      // Rounded on both sides, because `expected` is the canonical statement and the
+      // canonical statement rounds to six decimals — `corpus.mjs`'s own `round`. Some
+      // corpus files declare a duration that is not exactly representable
+      // (`ObjectOpacityOrder` declares 4.000000021908035, which the expectation states as
+      // 4.0), so comparing the raw header against the rounded statement asserts that the
+      // generator wrote a round number rather than that this page read the file
+      // correctly.
+      assert.equal(
+        Math.round(indexed.duration * 1e6) / 1e6,
+        Math.round(expected.durationSec * 1e6) / 1e6,
+      );
+      // Rounded for the same reason as the duration above, and this one shows why it
+      // matters: `ObjectOpacityOrder` declares a cutoff of 1e-20, which is legal — §5.1
+      // requires (0, 1] — and which the canonical statement rounds to 0. Comparing raw
+      // against rounded would demand this page report a cutoff the format forbids.
+      assert.equal(
+        Math.round(indexed.header.cutoff * 1e6) / 1e6,
+        Math.round(expected.cutoff * 1e6) / 1e6,
+      );
+      // The rounding above can hide a genuinely wrong cutoff, so the legality of what was
+      // actually read is asserted directly rather than through the statement.
+      assert.ok(
+        indexed.header.cutoff > 0 && indexed.header.cutoff <= 1,
+        `cutoff ${indexed.header.cutoff} is outside the (0, 1] §5.1 requires`,
+      );
       assert.equal(String(indexed.header.gaussianCount), expected.gaussianCount);
       assert.equal(indexed.header.shDegree, expected.shDegree);
 
@@ -106,13 +128,28 @@ describe("the corpus decodes to the same scene on both read paths", () => {
 
         const a = digest(await indexed.frameAt(t));
         const b = digest(await streamed.frameAt(t));
-        assert.ok(a.finite, `t = ${t}: every centre is finite`);
-        assert.ok(a.positiveScales, `t = ${t}: every scale is positive`);
-        assert.ok(a.opacityInRange, `t = ${t}: every opacity is within [0, 1]`);
-        assert.ok(
-          a.worstQuaternion < 1e-3,
-          `t = ${t}: quaternions are unit (${a.worstQuaternion})`,
-        );
+        // The sanity assertions below say "a conforming file decodes to drawable
+        // numbers". The corpus has since grown variants for which that is deliberately
+        // false — `ObjectTiedNonFiniteRows` carries non-finite rows on purpose, to pin
+        // what a reader does with them — so asserting finiteness across every variant
+        // would be asserting that the corpus does not contain the cases it was extended
+        // to contain.
+        //
+        // Scoped by name rather than by catching the failure, so a variant that starts
+        // decoding to infinities WITHOUT saying so in its name still fails here.
+        //
+        // The both-paths-agree check below is NOT scoped, and that is the one that
+        // matters most for this page: whatever a hostile file decodes to, the indexed
+        // and streamed paths must decode it the same way, non-finite rows included.
+        if (!name.includes("NonFinite")) {
+          assert.ok(a.finite, `t = ${t}: every centre is finite`);
+          assert.ok(a.positiveScales, `t = ${t}: every scale is positive`);
+          assert.ok(a.opacityInRange, `t = ${t}: every opacity is within [0, 1]`);
+          assert.ok(
+            a.worstQuaternion < 1e-3,
+            `t = ${t}: quaternions are unit (${a.worstQuaternion})`,
+          );
+        }
         assert.deepEqual(
           b,
           a,
@@ -152,12 +189,31 @@ describe("keyframe-delta reconstruction matches the canonical statement", () => 
           pz += frame.centers[i * 3 + 2];
           opacity += frame.colors[i * 4 + 3];
         }
-        assert.deepEqual(
-          [round(px), round(py), round(pz)],
-          row.aggregate.positionSum.map(round),
-          `positionSum at t = ${row.t}`,
+        // Compared with a tolerance rather than exactly, because the two sides are not
+        // the same precision and are not supposed to be. The canonical statement is
+        // computed in float64; this page's frame is float32, because that is what it
+        // hands a GPU. Summing `count` float32 values and demanding the total match a
+        // float64 sum to six decimals is asserting a property neither format nor
+        // renderer offers — it held only while the numbers happened to be small.
+        //
+        // The bound scales with the population: each term carries up to a float32 ulp of
+        // error, and they accumulate. Anything larger than that is a real disagreement
+        // about what is in the frame, which is what this test is for.
+        const tolerance = Math.max(1e-6, frame.count * 1e-6);
+        for (const [axis, got, want] of [
+          ["x", px, row.aggregate.positionSum[0]],
+          ["y", py, row.aggregate.positionSum[1]],
+          ["z", pz, row.aggregate.positionSum[2]],
+        ]) {
+          assert.ok(
+            Math.abs(got - want) <= tolerance * Math.max(1, Math.abs(want)),
+            `positionSum.${axis} at t = ${row.t}: ${got} vs ${want}`,
+          );
+        }
+        assert.ok(
+          Math.abs(opacity - Number(row.aggregate.opacitySum)) <= tolerance,
+          `opacitySum at t = ${row.t}: ${opacity} vs ${row.aggregate.opacitySum}`,
         );
-        assert.equal(round(opacity), round(row.aggregate.opacitySum), `opacitySum at t = ${row.t}`);
       }
     });
   }
@@ -248,92 +304,25 @@ describe("§5.5: a chunk's gaussians are invisible outside its interval", () => 
   });
 });
 
-describe("§3: a keyframe-delta gaussian exists only inside its window and above the cutoff", () => {
-  const source = "keyframe/KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics.4dgs";
-
-  /** One composed chunk of a corpus file, and the marginal of each of its gaussians at `t`. */
-  async function chunkAt(t) {
-    const sequence = await decodeKeyframeDeltaStreamed(variant(source).bytes);
-    const chunk = sequence.chunks.find((c) => c.t0 <= t && t < c.t1);
-    assert.ok(chunk !== undefined);
-    const steps = stepsFrom(sequence.quantization);
-    const k = supportK(sequence.header.cutoff);
-    const windows =
-      sequence.windows.length > 0
-        ? sequence.windows
-        : new Float64Array([0, sequence.header.durationSec]);
-    const state = chunk.state;
-    const sigmaBins = state.column(Attribute.SigmaT).values;
-    const muBins = state.column(Attribute.MuT).values;
-    const flags = state.column(Attribute.Flags).values;
-    const windowBins = state.column(Attribute.WindowIndex).values;
-    const marginals = [];
-    for (let i = 0; i < state.count; i++) {
-      const neverFades = (flags[i] & GAUSSIAN_FLAG_NEVER_FADES) !== 0;
-      const sigma = neverFades ? Infinity : Math.exp(sigmaBins[i] * steps.sigmaLog);
-      const windowIndex = windowBins[i];
-      const length = windows[windowIndex * 2 + 1] - windows[windowIndex * 2];
-      // Referenced so the pitch derivation is exercised exactly as the reconstruction does.
-      motionStep(lifeClass(sigmaBins[i], steps.sigmaLog, neverFades, length, k), steps.motion);
-      const mu = muBins[i] * muStep(sigmaBins[i], steps.sigmaLog, neverFades, steps.time);
-      const dt = t - mu;
-      marginals.push(sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma)));
-    }
-    return { sequence, chunk, marginals };
-  }
-
-  it("the marginal cutoff drops exactly the gaussians below it", async () => {
-    const t = 2;
-    const { sequence, chunk, marginals } = await chunkAt(t);
-    assert.ok(marginals.length > 0, "this chunk composes a population");
-    const lowest = Math.min(...marginals);
-    const highest = Math.max(...marginals);
-    // Every threshold is one of the file's own marginals, or just past the largest of them.
-    // The last of these is what makes the test about `marginal >= cutoff` rather than about
-    // some cutoff: it is the smallest value no gaussian in this file can reach.
-    const thresholds = [0, lowest, (lowest + highest) / 2, highest, highest * (1 + 1e-9)];
-    for (const cutoff of thresholds) {
-      const expected = marginals.filter((m) => m >= cutoff).length;
-      const frame = reconstructKeyframeDelta(sequence, chunk, t, cutoff);
-      assert.equal(frame.count, expected, `cutoff ${cutoff}`);
-      assert.equal(frame.centers.length, expected * 3);
-      assert.equal(frame.colors.length, expected * 4);
-      assert.equal(frame.rotations.length, expected * 4);
-      assert.equal(frame.scales.length, expected * 3);
-    }
-    // The two ends of that list are the ones that would go unnoticed: the whole population
-    // and none of it.
-    assert.equal(reconstructKeyframeDelta(sequence, chunk, t, 0).count, marginals.length);
-    assert.equal(reconstructKeyframeDelta(sequence, chunk, t, highest * (1 + 1e-9)).count, 0);
-  });
-
-  it("a validity window that has ended removes the gaussian entirely", async () => {
-    const t = 2;
-    const { sequence, chunk } = await chunkAt(t);
-    const windowBins = chunk.state.column(Attribute.WindowIndex).values;
-    const total = chunk.state.count;
-    assert.ok(total > 1);
-    // A second window that closed before `t`, pointed at by every other gaussian. The
-    // window table is the file's, plus one entry; nothing else about the file changes.
-    const base =
-      sequence.windows.length > 0 ? [...sequence.windows] : [0, sequence.header.durationSec];
-    const windows = Float64Array.from([...base, 0, t]);
-    const moved = [];
-    for (let i = 0; i < total; i += 2) {
-      moved.push(i);
-      windowBins[i] = base.length / 2;
-    }
-    const gated = reconstructKeyframeDelta({ ...sequence, windows }, chunk, t, 0);
-    assert.equal(
-      gated.count,
-      total - moved.length,
-      "gaussians whose window has closed must not be in the frame at all",
-    );
-    // The window is half-open, so the gaussians are back one instant earlier.
-    const before = reconstructKeyframeDelta({ ...sequence, windows }, chunk, t - 0.5, 0);
-    assert.equal(before.count, total);
-  });
-});
+// §3's keyframe-delta window and cutoff gating used to be checked here, by composing a
+// chunk and reading its raw bin columns through `state.column()` to compute the expected
+// marginals independently.
+//
+// `@4dgs/core` has since made composed bins private — deliberately, and it says why at
+// `binsOf`: "Composed bins are not public API. A consumer reads reconstructed values
+// through reconstructKeyframeDelta, and this file is the only holder of this reader. The
+// class used to publish a `column()` method marked `@internal`, which is a comment where
+// a language feature will do."
+//
+// Both properties are now core's own, and core tests them on its own terms:
+// `typescript/conformance/src/keyframeDeltaHardening.test.ts` has "a gaussian whose
+// validity window has closed is absent, not transparent" and "a gaussian below the
+// temporal marginal cutoff is absent inside its window".
+//
+// Reaching around a privacy boundary to re-test someone else's invariant is how a suite
+// ends up pinned to another module's internals, so these are dropped rather than ported.
+// What belongs here is what the VIEWER does with a reconstructed frame, which the
+// surrounding blocks cover.
 
 describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
   const source = "keyframe/KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics.4dgs";
