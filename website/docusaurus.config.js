@@ -99,7 +99,7 @@ const config = {
             label: "Reference",
           },
           {
-            to: "/viewer",
+            href: "https://viewer.4dgs.dev",
             label: "Viewer",
             position: "left",
           },
@@ -121,7 +121,7 @@ const config = {
           {
             title: "Documentation",
             items: [
-              { label: "Viewer", to: "/viewer" },
+              { label: "Viewer", href: "https://viewer.4dgs.dev" },
               { label: "Guides", to: "/guides/" },
               { label: "Specification", to: "/spec/" },
               { label: "Feature support matrix", to: "/reference/" },
