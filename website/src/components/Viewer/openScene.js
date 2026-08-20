@@ -181,13 +181,9 @@ async function openGaussianBirth(source, size) {
   const notes = [];
   try {
     const decoder = await IndexedDecoder.open(source);
-    // A summary CRC that does not match is a reason to stop trusting the index, not a
-    // footnote to render underneath it. The dangerous corruption is the quiet one: an
-    // index whose chunk offsets still resolve but whose `[t0, t1)` have moved selects the
-    // wrong chunks for an instant, and the page draws a scene that looks entirely
-    // plausible and is not the file's. The chunks themselves are untouched in that case,
-    // so reading front to back recovers the real scene — the CRC exists precisely to say
-    // when to do that.
+    // A mismatched summary CRC means the index is not trustworthy: offsets may still
+    // resolve while intervals have moved, selecting the wrong chunks for an instant. The
+    // chunks themselves are unaffected, so front-to-back recovers the scene.
     if (decoder.summaryCrcOk === false) {
       notes.push(
         "The Footer's summary CRC does not match the index it covers, so the index is not " +
@@ -679,9 +675,6 @@ async function openKeyframeDeltaIndexed(source) {
       }
       return [];
     },
-    // Required by the playable contract and read every frame by the readout, so omitting
-    // it is not a missing statistic — it throws in the animation loop and freezes
-    // playback on the first frame.
     transfer: () => transferOf(source),
     notes,
   };
@@ -691,23 +684,18 @@ async function openKeyframeDeltaIndexed(source) {
  * The `keyframe-delta` model, read by byte range when the file carries an index.
  *
  * `KeyframeDeltaIndexedDecoder` opens over an `IReadable` and reconstructs an instant from
- * the chunks that instant needs, which is the same bargain the gaussian-birth indexed path
- * makes and the reason §1's bounded-memory rule is satisfiable here at all. An earlier
- * version of this page composed every keyframe-delta file whole, behind a size limit,
- * because that decoder did not exist yet; a fixed ceiling is not bounded memory, it is a
- * larger unbounded read.
+ * the chunks that instant needs, the same way the gaussian-birth indexed path does.
  *
- * The whole-file path below survives for files this one cannot open — no Chunk Index, or
- * one cut before its Footer — where there is nothing to seek with. That case keeps the
- * limit, and the page still says so.
+ * The whole-file path below handles files this one cannot open — no Chunk Index, or one
+ * cut before its Footer — where there is nothing to seek with. It keeps a size limit, and
+ * the page says so in its notes.
  */
 async function openKeyframeDelta(source, size) {
   try {
     return await openKeyframeDeltaIndexed(source);
   } catch (error) {
-    // Not a swallow: the streamed composition below re-reads the same bytes and refuses
-    // them in its own words if they are genuinely bad. What this catch covers is a file
-    // with no usable index, which is a legal file and the reason the other path exists.
+    // A file with no usable index is legal; the streamed path below re-reads the same
+    // bytes and refuses them in its own words if they are genuinely bad.
     if (!(error instanceof MalformedFile) && !(error instanceof TruncatedFile)) throw error;
   }
   if (size > KEYFRAME_DELTA_BYTE_LIMIT) {
@@ -778,9 +766,7 @@ async function openKeyframeDelta(source, size) {
                 `decoded cover [${earliest}, ${covered})`,
         );
       }
-      // No cutoff argument: `@4dgs/core` reads `sequence.header.cutoff` itself, which
-      // is the same number `cutoffOf` was passing and one fewer place for the two to
-      // disagree.
+      // `@4dgs/core` reads `sequence.header.cutoff` itself.
       return frameFromKeyframeDelta(reconstructKeyframeDelta(sequence, chunk, t));
     },
     intervalsAt: (t) => {

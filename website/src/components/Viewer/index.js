@@ -566,11 +566,8 @@ async function frameCamera(playable, renderer, camera, isCurrent) {
   const warnings = [];
   let bounds = boundsOf(first.centers, first.count);
   for (const fraction of FRAMING_PROBES) {
-    // The probes exist to find SOMETHING to point the camera at, so once something has
-    // been found there is nothing left to look for. Continuing cost a URL-backed indexed
-    // scene a range fetch at 25%, 50%, 75% and 99.9% of the timeline on open — chunks
-    // from across the whole scene, to answer a question already answered by the first
-    // frame.
+    // One set of bounds is enough to place the camera. Probing on would range-fetch
+    // chunks from across the timeline on open.
     if (bounds !== null) break;
     if (fraction === 0 || !(playable.duration > 0)) continue;
     const t = Math.min(playable.duration * fraction, lastInstant(playable.duration));
