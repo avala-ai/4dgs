@@ -369,6 +369,14 @@ jobs:
             echo "\`dart pub add fourdgs:$version\` | [pub.dev](https://pub.dev/packages/fourdgs/versions/$version) | [full changelog](https://github.com/avala-ai/4dgs/blob/main/dart/fourdgs/CHANGELOG.md)"
           } > "$RUNNER_TEMP/notes.md"
 
+      # The suite decodes real corpus files, and the corpus is generated rather than
+      # committed. Without this, `dart test` here is not the suite CI ran on the same
+      # commit — it is that suite with its corpus-backed tests failing to load.
+      - name: Corpus
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+
       - name: Build what is about to be published
         run: |
           cd dart/fourdgs
