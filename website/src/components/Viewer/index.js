@@ -548,9 +548,15 @@ const READ_MODES = {
  * frame would leave the camera at the origin looking at nothing.
  */
 async function frameCamera(playable, renderer, camera, isCurrent) {
-  // The instant the visitor lands on. A refusal here is the file's answer to "can you open
-  // this", and is allowed to propagate.
-  const first = await playable.frameAt(0);
+  // The instant the visitor lands on, which is not always zero. A keyframe-delta file
+  // whose chunks cover `[earliest, covered)` with `earliest > 0` decodes perfectly well
+  // and has nothing at `t = 0` — the page even prints that interval — so asking for zero
+  // refused the open of a file it had just finished describing.
+  //
+  // A refusal at the file's OWN first instant is still the file's answer to "can you open
+  // this", and is still allowed to propagate.
+  const start = playable.firstInstant ?? 0;
+  const first = await playable.frameAt(start);
   // A file the visitor has already moved on from does not get to put a frame on the canvas
   // or move the camera; its caller will discard the rest of this open too.
   if (!isCurrent()) return [];
@@ -560,6 +566,12 @@ async function frameCamera(playable, renderer, camera, isCurrent) {
   const warnings = [];
   let bounds = boundsOf(first.centers, first.count);
   for (const fraction of FRAMING_PROBES) {
+    // The probes exist to find SOMETHING to point the camera at, so once something has
+    // been found there is nothing left to look for. Continuing cost a URL-backed indexed
+    // scene a range fetch at 25%, 50%, 75% and 99.9% of the timeline on open — chunks
+    // from across the whole scene, to answer a question already answered by the first
+    // frame.
+    if (bounds !== null) break;
     if (fraction === 0 || !(playable.duration > 0)) continue;
     const t = Math.min(playable.duration * fraction, lastInstant(playable.duration));
     try {

@@ -20,6 +20,7 @@ import {
   IndexedDecoder,
   MAGIC,
   MAX_SH_DEGREE,
+  MAX_SUMMARY_BYTES,
   Opcode,
   RECORD_HEADER_BYTES,
   audioSourceStateAt,
@@ -758,4 +759,53 @@ test("a second once-only record is refused on both read paths", async () => {
       `indexed: ${name}`,
     );
   }
+});
+
+test("a Footer claiming a summary larger than the ceiling is refused before it is read", async () => {
+  // The summary's length is not declared anywhere: it is `summary_start` to the Footer, so
+  // an untrusted file states it by subtraction and can state almost the whole resource.
+  // Reading it was one allocation of that size, before a single record inside it had been
+  // looked at — §1's "every allocation sized from a value the reader has already
+  // validated", inverted.
+  //
+  // Built as a sparse source rather than a fixture, because tripping the ceiling needs a
+  // resource larger than it and nothing here should write 64 MiB to disk. Real front
+  // matter and chunks at the front, a 100 MiB gap, then a real Footer with `summary_start`
+  // patched to 1000.
+  const path = corpus("TenWindows-UseChunkIndex-UseCrc");
+  if (path === null) return;
+  const real = new Uint8Array(readFileSync(path));
+  const TAIL = 37; // the Footer record (9 + 20) and the closing magic (8)
+  const tail = real.slice(real.length - TAIL);
+  new DataView(tail.buffer, tail.byteOffset).setBigUint64(9, 1000n, true);
+  const head = real.length - TAIL;
+  const size = head + 100 * 1024 * 1024 + TAIL;
+
+  let largest = 0;
+  const sparse = {
+    size: async () => BigInt(size),
+    read: async (offset: bigint, length: bigint) => {
+      const at = Number(offset);
+      const n = Number(length);
+      largest = Math.max(largest, n);
+      // The assertion this test is really making: nothing asks for the summary at all.
+      assert.ok(n <= 16 * 1024 * 1024, `a single read of ${n} bytes is the allocation this bounds`);
+      const out = new Uint8Array(n);
+      for (let i = 0; i < n; i++) {
+        const a = at + i;
+        if (a < head) out[i] = real[a];
+        else if (a >= size - TAIL) out[i] = tail[a - (size - TAIL)];
+      }
+      return out;
+    },
+  };
+
+  await assert.rejects(
+    () => IndexedDecoder.open(sparse),
+    /past the \d+ byte ceiling this reader will read in one piece/,
+  );
+  assert.ok(
+    largest <= MAX_SUMMARY_BYTES,
+    `largest single read was ${largest}, which the ceiling ${MAX_SUMMARY_BYTES} should have prevented`,
+  );
 });

@@ -64,6 +64,9 @@ import {
  * @property {(t: number) => Promise<Frame>} frameAt
  * @property {(t: number) => {t0: number, t1: number}[]} intervalsAt chunks covering `t`
  * @property {() => {bytes: number, reads: number, size: number}} transfer
+ * @property {number} [firstInstant] the earliest instant this file can be reconstructed
+ *   at, when that is not zero — a keyframe-delta file's chunks may begin later. Absent
+ *   means zero.
  * @property {string[]} notes things worth saying about this particular file
  */
 
@@ -666,6 +669,9 @@ async function openKeyframeDeltaIndexed(source) {
     readMode: "keyframe-delta",
     header: decoder.header,
     duration,
+    // Where this file's timeline actually starts. Chunks need not begin at zero, and the
+    // camera framing asks for this instant rather than assuming one exists at 0.
+    firstInstant: earliest,
     frameAt: async (t) => frameFromKeyframeDelta(await decoder.reconstructAt(t)),
     intervalsAt: (t) => {
       for (const entry of index) {
@@ -759,6 +765,9 @@ async function openKeyframeDelta(source, size) {
     readMode: "keyframe-delta",
     header: sequence.header,
     duration,
+    // As on the indexed path: a file whose chunks begin after zero has nothing at zero,
+    // and the camera framing asks here rather than assuming.
+    firstInstant: earliest,
     frameAt: async (t) => {
       const chunk = covering(t);
       if (chunk === null) {
