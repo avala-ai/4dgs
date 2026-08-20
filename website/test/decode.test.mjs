@@ -131,19 +131,11 @@ describe("the corpus decodes to the same scene on both read paths", () => {
 
         const a = digest(await indexed.frameAt(t));
         const b = digest(await streamed.frameAt(t));
-        // The sanity assertions below say "a conforming file decodes to drawable
-        // numbers". The corpus has since grown variants for which that is deliberately
-        // false — `ObjectTiedNonFiniteRows` carries non-finite rows on purpose, to pin
-        // what a reader does with them — so asserting finiteness across every variant
-        // would be asserting that the corpus does not contain the cases it was extended
-        // to contain.
-        //
-        // Scoped by name rather than by catching the failure, so a variant that starts
-        // decoding to infinities WITHOUT saying so in its name still fails here.
-        //
-        // The both-paths-agree check below is NOT scoped, and that is the one that
-        // matters most for this page: whatever a hostile file decodes to, the indexed
-        // and streamed paths must decode it the same way, non-finite rows included.
+        // `ObjectTiedNonFiniteRows` carries non-finite rows on purpose, so the drawable
+        // -numbers assertions below do not apply to it. Scoped by name rather than by
+        // catching the failure, so a variant that decodes to infinities without saying so
+        // still fails. The both-paths-agree check is not scoped: whatever a file decodes
+        // to, both paths must decode it alike.
         if (!name.includes("NonFinite")) {
           assert.ok(a.finite, `t = ${t}: every centre is finite`);
           assert.ok(a.positiveScales, `t = ${t}: every scale is positive`);
@@ -192,16 +184,9 @@ describe("keyframe-delta reconstruction matches the canonical statement", () => 
           pz += frame.centers[i * 3 + 2];
           opacity += frame.colors[i * 4 + 3];
         }
-        // Compared with a tolerance rather than exactly, because the two sides are not
-        // the same precision and are not supposed to be. The canonical statement is
-        // computed in float64; this page's frame is float32, because that is what it
-        // hands a GPU. Summing `count` float32 values and demanding the total match a
-        // float64 sum to six decimals is asserting a property neither format nor
-        // renderer offers — it held only while the numbers happened to be small.
-        //
-        // The bound scales with the population: each term carries up to a float32 ulp of
-        // error, and they accumulate. Anything larger than that is a real disagreement
-        // about what is in the frame, which is what this test is for.
+        // The canonical statement is float64; this page's frame is float32, so the sums
+        // differ by accumulated rounding. The bound scales with the population — each
+        // term carries up to a float32 ulp. Anything larger is a real disagreement.
         const tolerance = Math.max(1e-6, frame.count * 1e-6);
         for (const [axis, got, want] of [
           ["x", px, row.aggregate.positionSum[0]],
@@ -346,25 +331,10 @@ describe("§5.5: a chunk's gaussians are invisible outside its interval", () => 
   });
 });
 
-// §3's keyframe-delta window and cutoff gating used to be checked here, by composing a
-// chunk and reading its raw bin columns through `state.column()` to compute the expected
-// marginals independently.
-//
-// `@4dgs/core` has since made composed bins private — deliberately, and it says why at
-// `binsOf`: "Composed bins are not public API. A consumer reads reconstructed values
-// through reconstructKeyframeDelta, and this file is the only holder of this reader. The
-// class used to publish a `column()` method marked `@internal`, which is a comment where
-// a language feature will do."
-//
-// Both properties are now core's own, and core tests them on its own terms:
-// `typescript/conformance/src/keyframeDeltaHardening.test.ts` has "a gaussian whose
-// validity window has closed is absent, not transparent" and "a gaussian below the
-// temporal marginal cutoff is absent inside its window".
-//
-// Reaching around a privacy boundary to re-test someone else's invariant is how a suite
-// ends up pinned to another module's internals, so these are dropped rather than ported.
-// What belongs here is what the VIEWER does with a reconstructed frame, which the
-// surrounding blocks cover.
+// §3's window and cutoff gating for keyframe-delta was checked here by reading raw bin
+// columns through `state.column()`. `@4dgs/core` has since made composed bins private, and
+// covers both properties itself in `typescript/conformance/src/keyframeDeltaHardening.ts`.
+// What belongs here is what the viewer does with a reconstructed frame.
 
 describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
   const source = "keyframe/KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics.4dgs";

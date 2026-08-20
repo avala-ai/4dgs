@@ -23,6 +23,7 @@ export { BytesReadable, type IReadable } from "./readable.js";
 
 export {
   FourdgsError,
+  ExceedsReaderLimit,
   MalformedFile,
   Refusal,
   TruncatedFile,
@@ -237,6 +238,7 @@ export {
   HEAD_PROBE_BYTES,
   MAX_DEFERRED_RECORDS,
   MAX_FRONT_MATTER_BYTES,
+  MAX_SUMMARY_BYTES,
   IndexedDecoder,
   type IndexedChunk,
   type OpenIndexedOptions,

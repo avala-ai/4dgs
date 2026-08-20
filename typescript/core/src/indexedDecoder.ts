@@ -23,7 +23,7 @@ import {
   stepsFrom,
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
-import { duplicateStructuralRecord, MalformedFile } from "./errors.js";
+import { duplicateStructuralRecord, ExceedsReaderLimit, MalformedFile } from "./errors.js";
 import { FrontMatterScanner } from "./frontMatter.js";
 import { isProvenanceOpcode, Opcode } from "./opcodes.js";
 import { ObjectLayer } from "./objects.js";
@@ -115,6 +115,22 @@ export const MAX_FRONT_MATTER_BYTES = 64 * 1024 * 1024;
  * can make one deferred accessor grow the heap in proportion to the whole file.
  */
 export const MAX_DEFERRED_RECORDS = 65_536;
+
+/**
+ * Ceiling on the summary block an opening reader will read in one go.
+ *
+ * The summary's length is not declared anywhere: it is `footer.summary_start` to the
+ * Footer, so a file states it by subtraction and an untrusted file states whatever it
+ * likes. A Footer claiming `summary_start = 0` describes a summary the size of the whole
+ * resource, and reading it is one allocation of that size — before a single record inside
+ * it has been looked at, and before any fallback path could run. §1 forbids exactly that
+ * shape: an allocation sized from a value the reader has not validated.
+ *
+ * 64 MiB is the ceiling the front matter already uses, and it is far above any real
+ * summary: {@link MAX_CHUNK_INDEX_ENTRIES} entries at the widest keyframe-delta entry
+ * shape is roughly 15 MB, so a conforming file has four times the room it can use.
+ */
+export const MAX_SUMMARY_BYTES = 64 * 1024 * 1024;
 
 /** A provenance-family record framed during the front-matter walk (opcode + range). */
 interface ProvenanceRange {
@@ -427,6 +443,18 @@ export class IndexedDecoder {
         throw new MalformedFile(
           `footer says the summary starts at ${footer.summaryStart}, past the footer at ` +
             `${size - FOOTER_TAIL_BYTES}`,
+        );
+      }
+      // Checked before the read, not after: the point is the allocation, and a summary
+      // this large is a Footer describing most of the resource as its own index.
+      if (summaryLength > MAX_SUMMARY_BYTES) {
+        // Not `MalformedFile`: the format sets no maximum here, so a file this size is
+        // legal and simply larger than this reader will take in one piece. Telling its
+        // holder it is broken would be wrong, and the fix is a larger limit.
+        throw new ExceedsReaderLimit(
+          `footer says the summary spans ${summaryLength} bytes, from ${footer.summaryStart} ` +
+            `to the footer at ${size - FOOTER_TAIL_BYTES}, past the ${MAX_SUMMARY_BYTES} ` +
+            `byte ceiling this reader will read in one piece`,
         );
       }
       const summary = await source.read(BigInt(footer.summaryStart), BigInt(summaryLength));

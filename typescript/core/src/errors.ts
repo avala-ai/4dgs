@@ -119,3 +119,16 @@ export function duplicateStructuralRecord(name: string, offset: number): Malform
 }
 
 export class UnsupportedCodec extends FourdgsError {}
+
+/**
+ * A legal file whose scale is past a ceiling this reader states in advance.
+ *
+ * Not a fault in the file: it is what a bounded operation costs. A reader that will not
+ * allocate without a limit (AGENTS.md §1) has to declare one, and past it the honest
+ * reply is this rather than an allocation the file's own contents chose. The fix is a
+ * larger limit, not a new file — which is what separates it from {@link MalformedFile},
+ * and why a caller should not tell the user their file is broken.
+ *
+ * Mirrors `ExceedsReaderLimit` in `python/fourdgs/fourdgs/exceptions.py`.
+ */
+export class ExceedsReaderLimit extends FourdgsError {}
