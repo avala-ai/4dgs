@@ -112,7 +112,9 @@ export default function Viewer() {
           playback.time += dt;
           if (playback.time >= playable.duration) {
             // The timeline is the half-open [0, duration): the end is never a valid instant.
-            playback.time = playback.loop ? 0 : lastInstant(playable.duration);
+            playback.time = playback.loop
+              ? firstInstantOf(playable)
+              : lastInstant(playable.duration);
             if (!playback.loop) {
               playback.playing = false;
               setPlaying(false);
@@ -215,8 +217,8 @@ export default function Viewer() {
       );
       if (!current()) return;
       playback.playable = playable;
-      playback.time = 0;
-      playback.rendered = 0;
+      playback.time = firstInstantOf(playable);
+      playback.rendered = playback.time;
       setScene(playable);
     } catch (failure) {
       if (current()) setError(failure);
@@ -278,7 +280,10 @@ export default function Viewer() {
   const seek = useCallback((value) => {
     const playback = playbackRef.current;
     if (playback.playable === null) return;
-    playback.time = Math.max(0, Math.min(value, lastInstant(playback.playable.duration)));
+    playback.time = Math.max(
+      firstInstantOf(playback.playable),
+      Math.min(value, lastInstant(playback.playable.duration)),
+    );
   }, []);
 
   const togglePlay = useCallback(() => {
@@ -288,7 +293,7 @@ export default function Viewer() {
     // contains. Starting from there would reach the duration on the first tick and stop
     // again, so Play from the end means play it again rather than nothing at all.
     if (!playback.playing && playback.time >= lastInstant(playback.playable.duration)) {
-      playback.time = 0;
+      playback.time = firstInstantOf(playback.playable);
     }
     playback.playing = !playback.playing;
     setPlaying(playback.playing);
@@ -583,6 +588,17 @@ async function frameCamera(playable, renderer, camera, isCurrent) {
   if (!isCurrent()) return [];
   camera.frame(bounds === null ? [0, 0, 0] : bounds.center, bounds === null ? 1 : bounds.radius);
   return warnings;
+}
+
+/**
+ * The earliest instant a file can be reconstructed at.
+ *
+ * Usually zero, but a keyframe-delta file's chunks may begin later, and asking before
+ * them is a decode error rather than an empty frame. Every clock reset uses this as its
+ * floor so that Play, Loop and replay-from-the-end land somewhere the file covers.
+ */
+function firstInstantOf(playable) {
+  return playable === null ? 0 : (playable.firstInstant ?? 0);
 }
 
 /** The largest instant the half-open timeline `[0, duration)` actually contains. */

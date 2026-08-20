@@ -23,7 +23,7 @@ import {
   stepsFrom,
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
-import { duplicateStructuralRecord, MalformedFile } from "./errors.js";
+import { duplicateStructuralRecord, ExceedsReaderLimit, MalformedFile } from "./errors.js";
 import { FrontMatterScanner } from "./frontMatter.js";
 import { isProvenanceOpcode, Opcode } from "./opcodes.js";
 import { ObjectLayer } from "./objects.js";
@@ -448,7 +448,10 @@ export class IndexedDecoder {
       // Checked before the read, not after: the point is the allocation, and a summary
       // this large is a Footer describing most of the resource as its own index.
       if (summaryLength > MAX_SUMMARY_BYTES) {
-        throw new MalformedFile(
+        // Not `MalformedFile`: the format sets no maximum here, so a file this size is
+        // legal and simply larger than this reader will take in one piece. Telling its
+        // holder it is broken would be wrong, and the fix is a larger limit.
+        throw new ExceedsReaderLimit(
           `footer says the summary spans ${summaryLength} bytes, from ${footer.summaryStart} ` +
             `to the footer at ${size - FOOTER_TAIL_BYTES}, past the ${MAX_SUMMARY_BYTES} ` +
             `byte ceiling this reader will read in one piece`,

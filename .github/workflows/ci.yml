@@ -1042,14 +1042,24 @@ jobs:
           cd dart/fourdgs && dart test
           cd ../conformance && dart test
 
-      # `dart test` runs on the VM, where an `int` is a real 64-bit integer. A JavaScript
-      # number is not, so a 64-bit literal anywhere in the compile graph is a dart2js error
-      # no VM test can produce — 0.1.0 shipped with three, in the writer's Morton masks,
-      # and could not be built for the web at all.
+      # The gate whose absence shipped 0.1.0 unable to build for the web. `dart test` runs on
+      # the VM, where an `int` is a real 64-bit integer; a JavaScript number is not, so a
+      # 64-bit literal anywhere in the compile graph is a dart2js error that no VM test can
+      # produce. 0.1.0 carried three, in the writer's Morton masks, and the umbrella library
+      # exported the writer — so a browser app that only ever READ `.4dgs` could not be
+      # built at all, and nothing here noticed until a consumer did.
       #
-      # The probe imports the umbrella and nothing else. Any exported file that gains such
-      # a literal fails here, which is why this outlives the export change that prompted it.
-      # To confirm the step can fail: re-add `export 'src/writer.dart';` to lib/fourdgs.dart.
+      # The probe imports the umbrella and nothing else. What it proves is not what the
+      # decoder computes but that the read path compiles for the web at all.
+      #
+      # This gate outlives the bug that prompted it. Moving the encoder to its own library
+      # fixed one instance; a 64-bit literal landing in any file the umbrella exports — a
+      # reader optimisation reaching for Morton codes would do it — is the same failure
+      # again, and only this step would catch it.
+      #
+      # Confirm it can fail before trusting it: re-add `export 'src/writer.dart';` to
+      # lib/fourdgs.dart and this step reports the three literals. A gate nobody has
+      # watched fail is a gate nobody should believe.
       - name: The read path compiles for the web
         if: matrix.os == 'ubuntu-latest'
         run: cd dart/conformance && dart compile js -o "$RUNNER_TEMP/web_read_probe.js" bin/web_read_probe.dart

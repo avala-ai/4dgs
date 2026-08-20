@@ -19,6 +19,7 @@ import {
   Cursor,
   IndexedDecoder,
   MAGIC,
+  ExceedsReaderLimit,
   MAX_SH_DEGREE,
   MAX_SUMMARY_BYTES,
   Opcode,
@@ -800,10 +801,10 @@ test("a Footer claiming a summary larger than the ceiling is refused before it i
     },
   };
 
-  await assert.rejects(
-    () => IndexedDecoder.open(sparse),
-    /past the \d+ byte ceiling this reader will read in one piece/,
-  );
+  // `ExceedsReaderLimit`, not `MalformedFile`: the format sets no maximum here, so such a
+  // file is legal and merely larger than this reader takes in one piece. A caller that
+  // told its user the file was broken would be wrong.
+  await assert.rejects(() => IndexedDecoder.open(sparse), ExceedsReaderLimit);
   assert.ok(
     largest <= MAX_SUMMARY_BYTES,
     `largest single read was ${largest}, which the ceiling ${MAX_SUMMARY_BYTES} should have prevented`,
