@@ -1513,10 +1513,17 @@ void main() {
     // have kept the first. A file with two Quantization records declaring
     // different steps therefore decoded to two different scenes depending on
     // which reader opened it, with nothing raised on either path.
-    final Uint8List real =
-        File(
-          '../../tests/conformance/data/TenWindows-UseChunkIndex-UseCrc.4dgs',
-        ).readAsBytesSync();
+    // Read in `setUpAll` rather than in the group body. A group body runs at LOAD
+    // time, so reading there makes a missing corpus fail the whole FILE — every
+    // test in it, including the ones that need no corpus at all — instead of
+    // these four.
+    late final Uint8List real;
+    setUpAll(() {
+      real =
+          File(
+            '../../tests/conformance/data/TenWindows-UseChunkIndex-UseCrc.4dgs',
+          ).readAsBytesSync();
+    });
 
     for (final (int opcode, String name) in <(int, String)>[
       (opHeader, 'Header'),
