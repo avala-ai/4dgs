@@ -12,6 +12,10 @@ This guide ends where decoding ends: typed arrays of gaussian state at a time `t
 whatever draws them. Rendering is out of scope for this project — see
 [AGENTS.md](https://github.com/avala-ai/4dgs/blob/main/AGENTS.md).
 
+For a worked example of what comes after that line, the [viewer](/viewer) opens a `.4dgs` you supply
+and draws it with these two packages and about six hundred lines of WebGL2. It is a reference
+renderer, not a fast one, and it decodes in the page: nothing is uploaded.
+
 ## A whole scene
 
 ```ts

@@ -99,6 +99,11 @@ const config = {
             label: "Reference",
           },
           {
+            to: "/viewer",
+            label: "Viewer",
+            position: "left",
+          },
+          {
             href: "https://avala.ai",
             label: "An Avala project",
             position: "right",
@@ -116,6 +121,7 @@ const config = {
           {
             title: "Documentation",
             items: [
+              { label: "Viewer", to: "/viewer" },
               { label: "Guides", to: "/guides/" },
               { label: "Specification", to: "/spec/" },
               { label: "Feature support matrix", to: "/reference/" },
