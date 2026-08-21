@@ -422,8 +422,8 @@ void main() {
                 ..addByte(modeRaw)
                 ..addByte(codecDeflate)
                 ..addByte(shBandChannels[1]!)
-                ..add(_u32le(1))
-                ..add(_u64le(payload.length))
+                ..add(_u32(1))
+                ..add(_u64(payload.length))
                 ..add(payload))
               .toBytes();
 
@@ -433,7 +433,12 @@ void main() {
           isA<FourdgsMalformedFile>().having(
             (FourdgsMalformedFile e) => e.toString(),
             'message',
-            allOf(contains('-1'), contains('0..255')),
+            allOf(
+              contains('-1'),
+              contains('0..255'),
+              contains('index 0'),
+              contains('byte'),
+            ),
           ),
         ),
       );
@@ -714,18 +719,4 @@ void main() {
       expect(fourdgsPackageVersion, matches(RegExp(r'^\d+\.\d+\.\d+$')));
     });
   });
-}
-
-/// Little-endian `u32`, as every count in the format is written.
-Uint8List _u32le(int value) {
-  final out = Uint8List(4);
-  ByteData.sublistView(out).setUint32(0, value, Endian.little);
-  return out;
-}
-
-/// Little-endian `u64`, as every length in the format is written.
-Uint8List _u64le(int value) {
-  final out = Uint8List(8);
-  ByteData.sublistView(out).setUint64(0, value, Endian.little);
-  return out;
 }

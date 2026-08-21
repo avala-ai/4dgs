@@ -617,9 +617,13 @@ Uint8List? decodeShBandRecord(
     // colours the file does not describe, with nothing raised. Python, Rust and
     // TypeScript all refuse it; this was the SDK that did not.
     if (value < 0 || value > 255) {
+      // §6: which byte, which record, which value, what was expected. The
+      // record's own offset is already in hand for the codec refusals below, and
+      // a file with a million coefficients needs the index to be actionable —
+      // the reference names the row and channel for the same reason.
       throw FourdgsMalformedFile(
-        'SH band $band coefficient $value is outside the 0..255 range this '
-        'version stores',
+        'the SH Band Stream at byte $fileOffset carries coefficient $value at '
+        'index $i of band $band; expected 0..255, the range this version stores',
       );
     }
     out[i] = value;
