@@ -5,14 +5,6 @@ on:
     branches: [main]
     paths:
       - "website/**"
-      # The viewer imports @4dgs/core and @4dgs/browser as workspace dependencies and is
-      # tested against real corpus files, so an SDK-only change can break the page — its
-      # imports, or what it decodes — without touching website/. Watched here so that
-      # break shows up on the PR that causes it rather than on the next unrelated one.
-      - "typescript/**"
-      # The viewer's tests decode the generated corpus, so a generator change moves what
-      # they are checked against.
-      - "tests/conformance/**"
       - "package.json"
       - "yarn.lock"
       - ".github/workflows/website.yml"
@@ -21,14 +13,6 @@ on:
   pull_request:
     paths:
       - "website/**"
-      # The viewer imports @4dgs/core and @4dgs/browser as workspace dependencies and is
-      # tested against real corpus files, so an SDK-only change can break the page — its
-      # imports, or what it decodes — without touching website/. Watched here so that
-      # break shows up on the PR that causes it rather than on the next unrelated one.
-      - "typescript/**"
-      # The viewer's tests decode the generated corpus, so a generator change moves what
-      # they are checked against.
-      - "tests/conformance/**"
       - "package.json"
       - "yarn.lock"
       - ".github/workflows/website.yml"
@@ -62,24 +46,6 @@ jobs:
       # that no longer resolves fails here rather than shipping as a 404.
       - name: Build
         run: yarn workspace website build
-
-      # The viewer decodes real `.4dgs` files, so its tests need the corpus the six SDKs are
-      # diffed against. It is generated rather than committed; the tests fail rather than
-      # skip when it is absent, so this step is not optional.
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - name: Generate the conformance corpus
-        run: |
-          pip install -e ./python/fourdgs
-          python tests/conformance/generate.py
-
-      # Both halves run against what was just built: the decode tests drive the viewer's
-      # own decode layer over every corpus variant, and the browser tests drive the built
-      # site in the Chrome this runner image already carries.
-      - name: Test the viewer
-        run: yarn workspace website test
-        env:
-          CHROME_PATH: /usr/bin/google-chrome
 
       - uses: actions/upload-pages-artifact@v5
         with:

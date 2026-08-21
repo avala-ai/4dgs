@@ -2,17 +2,12 @@
   "name": "website",
   "private": true,
   "scripts": {
-    "start": "tsc -b ../typescript/browser && docusaurus start",
-    "build": "tsc -b ../typescript/browser && docusaurus build",
+    "start": "docusaurus start",
+    "build": "docusaurus build",
     "serve": "docusaurus serve",
-    "clear": "docusaurus clear",
-    "test": "yarn test:decode && yarn test:browser",
-    "test:decode": "tsc -b ../typescript/browser && node --test --test-concurrency=1 --test-timeout=120000 test/decode.test.mjs",
-    "test:browser": "node --test --test-concurrency=1 --test-timeout=120000 test/browser.test.mjs"
+    "clear": "docusaurus clear"
   },
   "dependencies": {
-    "@4dgs/browser": "workspace:^",
-    "@4dgs/core": "workspace:^",
     "@docusaurus/core": "3.10.2",
     "@docusaurus/plugin-client-redirects": "3.10.2",
     "@docusaurus/preset-classic": "3.10.2",
