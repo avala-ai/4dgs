@@ -122,7 +122,7 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 2048 ] || { echo "::error::rust is ${size_kb} KiB, over the 2048 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 1216 KB
+      - name: TypeScript sources under 1280 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -170,10 +170,17 @@ jobs:
         # not enough, because the two layers are additive rather than alternative: merged,
         # they measure 1096 KiB. 1152 is the next 64 KiB step and leaves 56 KiB, which is the
         # same deliberate headroom the raises above took rather than an exact-size assertion.
+        # Raised to 1280 KiB by the four packages carrying their own LICENSE and README.
+        # npm publishes a package directory, not a repository: a manifest that says
+        # `"license": "Apache-2.0"` while the tarball carries no licence text is a claim
+        # with nothing behind it, and three of the four had no README, so their registry
+        # pages would have been blank. The licence is 11 KiB and there are four packages,
+        # which is 44 of the 60 KiB this adds. Dart and Python already ship a package-local
+        # copy for the same reason. The tree measures 1244, so 1280 leaves 36.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 1216 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1216 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1280 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1280 KiB budget"; exit 1; }
       - name: Dart sources under 1536 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
