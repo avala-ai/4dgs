@@ -609,7 +609,20 @@ Uint8List? decodeShBandRecord(
   );
   final out = Uint8List(stream.count * stream.channels);
   for (int i = 0; i < out.length; i++) {
-    out[i] = stream.values[i] & 0xFF;
+    final value = stream.values[i];
+    // Version 1 stores an SH coefficient as one unsigned byte (§6.5), and the
+    // stream is signed zigzag, so a file can carry a value that is not one.
+    // Masking it with `& 0xFF` made every such value a different, legal-looking
+    // coefficient — -1 became 255 and 300 became 44 — so the scene rendered in
+    // colours the file does not describe, with nothing raised. Python, Rust and
+    // TypeScript all refuse it; this was the SDK that did not.
+    if (value < 0 || value > 255) {
+      throw FourdgsMalformedFile(
+        'SH band $band coefficient $value is outside the 0..255 range this '
+        'version stores',
+      );
+    }
+    out[i] = value;
   }
   return out;
 }

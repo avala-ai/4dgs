@@ -10,6 +10,7 @@
 /// how far it inflates. Those are the tests here.
 library;
 
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
@@ -401,6 +402,43 @@ void main() {
       );
     });
 
+    test('a coefficient outside 0..255 is refused, not masked into range', () {
+      // §6.5 stores an SH coefficient as one unsigned byte, and the stream is
+      // signed zigzag, so a file can carry a value that is not one. This used to
+      // mask with `& 0xFF`, which turns every such value into a different, legal
+      // -looking coefficient: -1 became 255 and 300 became 44, and the scene
+      // rendered in colours the file does not describe with nothing raised.
+      //
+      // A raw stream storing 1 decodes to -1, which is the smallest fixture that
+      // reaches it. Python, Rust and TypeScript all refuse this; Dart did not.
+      final Uint8List payload = Uint8List.fromList(
+        zlib.encode(List<int>.filled(shBandChannels[1]!, 1)),
+      );
+      final Uint8List content =
+          (BytesBuilder()
+                ..addByte(1) // band
+                ..addByte(0) // attribute id
+                ..addByte(1) // symbol width
+                ..addByte(modeRaw)
+                ..addByte(codecDeflate)
+                ..addByte(shBandChannels[1]!)
+                ..add(_u32le(1))
+                ..add(_u64le(payload.length))
+                ..add(payload))
+              .toBytes();
+
+      expect(
+        () => decodeShBandRecord(content, expectedBand: 1, expectedCount: 1),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile e) => e.toString(),
+            'message',
+            allOf(contains('-1'), contains('0..255')),
+          ),
+        ),
+      );
+    });
+
     test('no bands at all is an absence, not an error', () {
       expect(
         mergeChunkBands(<int>[2], <Map<int, Uint8List>>[<int, Uint8List>{}]),
@@ -676,4 +714,18 @@ void main() {
       expect(fourdgsPackageVersion, matches(RegExp(r'^\d+\.\d+\.\d+$')));
     });
   });
+}
+
+/// Little-endian `u32`, as every count in the format is written.
+Uint8List _u32le(int value) {
+  final out = Uint8List(4);
+  ByteData.sublistView(out).setUint32(0, value, Endian.little);
+  return out;
+}
+
+/// Little-endian `u64`, as every length in the format is written.
+Uint8List _u64le(int value) {
+  final out = Uint8List(8);
+  ByteData.sublistView(out).setUint64(0, value, Endian.little);
+  return out;
 }
