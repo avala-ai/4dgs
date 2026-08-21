@@ -2251,7 +2251,11 @@ Uint8List _keyframesWithSwappedBands() {
   final Uint8List first = chunk(0.0, 1.0, 0);
   final Uint8List firstBand = _shBandRecord(1, 0);
   final Uint8List second = chunk(1.0, 2.0, 32);
-  final Uint8List secondBand = _shBandRecord(1, 1);
+  // 2 rather than 1: a raw stream is zigzag-decoded, so a stored 1 becomes the
+  // coefficient -1, which §6.5 does not allow and the decoder now refuses. 2
+  // decodes to 1, which keeps the two bands distinguishable without making the
+  // fixture invalid in a second way this test is not about.
+  final Uint8List secondBand = _shBandRecord(1, 2);
   final int firstOffset = head.length;
   final int firstBandOffset = firstOffset + first.length;
   final int secondOffset = firstBandOffset + firstBand.length;
