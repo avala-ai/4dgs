@@ -1,7 +1,7 @@
 {
   "name": "@4dgs/browser",
   "version": "0.6.0",
-  "description": "4dgs browser",
+  "description": "Browser transports for the 4dgs decoder: a local File, or a URL read by HTTP range.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

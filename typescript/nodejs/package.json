@@ -1,7 +1,7 @@
 {
   "name": "@4dgs/nodejs",
   "version": "0.6.0",
-  "description": "4dgs nodejs",
+  "description": "The 4dgs command-line tool, and Node transports for the 4dgs decoder.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
