@@ -239,7 +239,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dart-lang/setup-dart@v1
-        with: { sdk: "3.7" }
+        with: { sdk: "3.13.1" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       # Compiled rather than run from source. `run.py` finds a runner by testing its
