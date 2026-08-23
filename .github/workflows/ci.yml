@@ -1013,7 +1013,7 @@ jobs:
       # The floor the package declares, not the newest SDK. A package whose CI only ever
       # ran on the latest Dart is a package whose lower bound is a guess.
       - uses: dart-lang/setup-dart@v1
-        with: { sdk: "3.7" }
+        with: { sdk: "3.13.1" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: dart --version
