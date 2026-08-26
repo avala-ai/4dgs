@@ -24,6 +24,7 @@ import {
   MAX_SUMMARY_BYTES,
   Opcode,
   RECORD_HEADER_BYTES,
+  TruncatedFile,
   audioSourceStateAt,
   assembleGaussians,
   decodeScene,
@@ -44,6 +45,31 @@ function corpus(variant: string): string | null {
   const path = `${DATA}${variant}.4dgs`;
   return existsSync(path) ? path : null;
 }
+
+test("a record length past 2^53 recovers like any other overrun", async (t) => {
+  // One byte changed: the top byte of the first Chunk's length. Python, Rust and Dart
+  // salvage the records before it and report the scene truncated; this reader refused
+  // the file as malformed — the same bytes, two meanings. From the framing alone a
+  // corrupt length and a cut cannot be told apart, so this one recovers the way a length
+  // a few bytes past the end already does.
+  const path = corpus("TenWindows-UseChunkIndex-UseCrc");
+  if (path === null) return t.skip("corpus not generated");
+
+  const bytes = Uint8Array.from(readFileSync(path));
+  const chunk = [...iterateRecords(bytes, MAGIC.length)].find(
+    (found) => found.opcode === Opcode.Chunk,
+  );
+  assert.ok(chunk, "the fixture must contain a Chunk record");
+  bytes[chunk.offset + 1 + 7] = 0xff;
+
+  const scene = await decodeScene(bytes, { recoverTruncated: true });
+  assert.equal(scene.truncated, true);
+  assert.ok(
+    scene.gaussians.count < scene.header.gaussianCount,
+    "the cut lands at the first Chunk, so the prefix must be short",
+  );
+  await assert.rejects(() => decodeScene(bytes, { recoverTruncated: false }), TruncatedFile);
+});
 
 /** The canonical JSON of a file, decoded front to back. */
 async function streamed(path: string): Promise<string> {

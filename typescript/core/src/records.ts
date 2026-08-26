@@ -95,7 +95,7 @@ export function readRecord(cursor: Cursor, base = 0): RawRecord {
   const start = cursor.pos;
   const offset = base + start;
   const opcode = cursor.u8();
-  const length = cursor.u64();
+  const length = cursor.recordLength(offset);
   const content = cursor.take(length);
   return {
     opcode,

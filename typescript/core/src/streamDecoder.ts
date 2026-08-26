@@ -15,7 +15,7 @@
  */
 
 import { MAGIC, RECORD_HEADER_BYTES, type RawRecord, bytesEqual, checkMagic } from "./records.js";
-import { Cursor } from "./cursor.js";
+import { Cursor, MAX_ADDRESSABLE_LENGTH } from "./cursor.js";
 
 /**
  * One bounded piece of a record selected for incremental consumption.
@@ -165,7 +165,12 @@ export class StreamDecoder {
       const head = new Cursor(this.pending, this.cursor, this.base);
       const offset = this.consumed;
       const opcode = head.u8();
-      const length = head.u64();
+      const declared = head.u64Raw();
+      // Past 2^53 no resource this reader can address holds the record, so more bytes
+      // never complete it. The header stays unconsumed, and `end()` reports the cut the
+      // way it does for any other record the resource ended inside.
+      if (declared > MAX_ADDRESSABLE_LENGTH) return;
+      const length = Number(declared);
       if (streamedOpcodes.has(opcode)) {
         this.cursor += RECORD_HEADER_BYTES;
         this.activeStreamedRecord = {

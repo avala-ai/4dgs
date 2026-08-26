@@ -22,6 +22,9 @@ import { MalformedFile, TruncatedFile } from "./errors.js";
  */
 const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
+/** The largest byte count a JavaScript number addresses exactly: 2^53 - 1. */
+export const MAX_ADDRESSABLE_LENGTH = BigInt(Number.MAX_SAFE_INTEGER);
+
 export class Cursor {
   readonly bytes: Uint8Array;
   private readonly view: DataView;
@@ -83,19 +86,49 @@ export class Cursor {
     return this.view.getUint32(at, true);
   }
 
+  /** A `u64` as it sits on the wire, for a caller that classifies the range itself. */
+  u64Raw(): bigint {
+    const at = this.pos;
+    this.take(8);
+    return this.view.getBigUint64(at, true);
+  }
+
   /**
    * A `u64`, as a number.
    *
    * Lengths and offsets in this format are byte counts; past 2^53 a JavaScript number
    * cannot represent one exactly, and silently rounding an offset is how a decoder reads
-   * the wrong bytes. Refusing is the only safe answer.
+   * the wrong bytes. Refusing is the only safe answer — malformed, for a field inside a
+   * record whose framing held. A record's own length is `recordLength()`.
    */
   u64(): number {
-    const at = this.pos;
-    this.take(8);
-    const value = this.view.getBigUint64(at, true);
-    if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new MalformedFile(`64-bit value ${value} at offset ${this.base + at} exceeds 2^53`);
+    const at = this.base + this.pos;
+    const value = this.u64Raw();
+    if (value > MAX_ADDRESSABLE_LENGTH) {
+      throw new MalformedFile(`64-bit value ${value} at offset ${at} exceeds 2^53`);
+    }
+    return Number(value);
+  }
+
+  /**
+   * A record's content length, as the framing walk reads it.
+   *
+   * On the walk the length *is* the framing: it says how far the file must extend for
+   * the record to be all here. A value past 2^53 is a claim no resource this reader can
+   * address satisfies — the same finding as a length that runs a few bytes past the end,
+   * and classified the same way, so that streamed recovery salvages the prefix in both
+   * cases. Python, Rust and Dart read such a file that way; refusing it as malformed let
+   * one corrupt byte in a length field refuse a file the other SDKs decode.
+   *
+   * `recordAt` is the resource offset of the record's opcode byte, so the message names
+   * the record and not only the field.
+   */
+  recordLength(recordAt: number): number {
+    const value = this.u64Raw();
+    if (value > MAX_ADDRESSABLE_LENGTH) {
+      throw new TruncatedFile(
+        `the record at byte ${recordAt} declares 0x${value.toString(16)} content bytes, past any resource this reader can address; ${this.remaining} remain`,
+      );
     }
     return Number(value);
   }

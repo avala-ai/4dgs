@@ -8,6 +8,19 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A record length past 2^53 is a cut, not a malformed file.** `Cursor.u64()` refuses a value above
+  2^53 as malformed, and `readRecord` and the `StreamDecoder` framed every record's length through
+  it. So `TenWindows-UseChunkIndex-UseCrc.4dgs` with the top byte of its first Chunk's length set
+  was refused outright, while Python, Rust and Dart read it as a cut and, with recovery on, return
+  the records before that chunk. A length a few bytes past the end was already a cut here too: which
+  class a corrupt length landed in depended on which byte of the field was corrupted. The framing
+  walks now read the length through `Cursor.recordLength()`, which names the record and classifies
+  the value as `TruncatedFile`; the stream decoder holds the header the way it holds any record the
+  bytes do not complete, and `end()` reports the cut. `u64()` is unchanged for a field inside a
+  complete record.
+
 ### Changed
 
 - **A file carrying two Header, Quantization or Window Table records is refused rather than guessed

@@ -36,6 +36,7 @@ import {
   poseAt,
   UnsupportedVersion,
   StreamDecoder,
+  iterateRecords,
   assembleGaussians,
   audioSourceStateAt,
   bandCoefficientRange,
@@ -352,6 +353,32 @@ test("a stream that stops mid-record keeps what completed and says it was cut", 
   decoder.append(MAGIC);
   decoder.append(record(0x02, new Uint8Array(20)));
   decoder.append(record(0x05, new Uint8Array(400)).subarray(0, 100));
+  assert.equal([...decoder.records()].length, 1);
+  decoder.end();
+  assert.equal(decoder.truncated, true);
+});
+
+test("a record length past 2^53 is a cut, not a malformed file", () => {
+  // Malformed as a field inside a record whose framing held; as a record's own length it
+  // is a claim the buffer cannot satisfy, like a length a few bytes past the end — which
+  // the streamed reader recovers from. Python, Rust and Dart class the two together;
+  // refusing this one read the same bytes to a different meaning.
+  const bytes = concat([
+    record(0x0b, new Uint8Array(0)),
+    Uint8Array.from([0x05, 0, 0, 0, 0, 0, 0, 0, 0xff]),
+  ]);
+  assert.throws(
+    () => [...iterateRecords(bytes)],
+    (error: unknown) =>
+      error instanceof TruncatedFile &&
+      error.message.includes("byte 9 ") &&
+      error.message.includes("0xff00000000000000"),
+  );
+  // The streaming framer holds the header the way it holds any record the bytes do not
+  // complete, and `end()` reports the cut.
+  const decoder = new StreamDecoder();
+  decoder.append(MAGIC);
+  decoder.append(bytes);
   assert.equal([...decoder.records()].length, 1);
   decoder.end();
   assert.equal(decoder.truncated, true);
