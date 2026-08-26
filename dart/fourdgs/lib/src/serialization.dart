@@ -52,6 +52,10 @@ const int streamHeaderBytes = 17;
 /// been checked against the resource. Streams above this are refused outright.
 const int maxStreamBytes = 512 * 1024 * 1024;
 
+/// The largest high `u32` of a `u64` that still leaves the value below 2^53,
+/// the ceiling every Dart backend represents exactly.
+const int _u64HighWordCeiling = 0x1FFFFF;
+
 /// A bounds-checked read head over a byte buffer.
 class FourdgsCursor {
   FourdgsCursor(this.bytes, [this.pos = 0]) : _bd = ByteData.sublistView(bytes);
@@ -118,20 +122,51 @@ class FourdgsCursor {
   ///
   /// Values above 2^53 cannot be represented exactly by every Dart backend, and
   /// no honest length in this format approaches that, so one is a corrupt or
-  /// hostile file rather than a large one.
+  /// hostile file rather than a large one — malformed, for a field inside a
+  /// record whose framing held. A record's own length is [recordLength].
   int u64() {
+    final (int lo, int hi) = _u64Halves();
+    if (hi > _u64HighWordCeiling) {
+      throw FourdgsMalformedFile(
+        '64-bit length at offset ${pos - 8} exceeds 2^53 and cannot be a real length',
+      );
+    }
+    return hi * 0x100000000 + lo;
+  }
+
+  /// A record's content length, as the framing walk reads it.
+  ///
+  /// On the walk the length *is* the framing: it says how far the file must
+  /// extend for the record to be all here. A value past 2^53 is a claim no
+  /// resource this reader can address satisfies — the same finding as a length
+  /// that runs a few bytes past the end, and classified the same way, so that
+  /// the streamed reader's recovery salvages the prefix in both cases. Python
+  /// and Rust read such a file that way; refusing it as malformed let one
+  /// corrupt byte in a length field refuse a file the other SDKs decode.
+  ///
+  /// [recordAt] is the offset of the record's opcode byte, so the message names
+  /// the record and not only the field.
+  int recordLength({required int recordAt}) {
+    final (int lo, int hi) = _u64Halves();
+    if (hi > _u64HighWordCeiling) {
+      throw FourdgsTruncatedFile(
+        'the record at byte $recordAt declares '
+        '0x${hi.toRadixString(16)}${lo.toRadixString(16).padLeft(8, '0')} '
+        'content bytes, past any resource this reader can address; '
+        '$remaining remain',
+      );
+    }
+    return hi * 0x100000000 + lo;
+  }
+
+  (int, int) _u64Halves() {
     if (pos + 8 > bytes.length) {
       throw FourdgsTruncatedFile('need 8 bytes at offset $pos');
     }
     final lo = _bd.getUint32(pos, Endian.little);
     final hi = _bd.getUint32(pos + 4, Endian.little);
     pos += 8;
-    if (hi > 0x1FFFFF) {
-      throw FourdgsMalformedFile(
-        '64-bit length at offset ${pos - 8} exceeds 2^53 and cannot be a real length',
-      );
-    }
-    return hi * 0x100000000 + lo;
+    return (lo, hi);
   }
 
   double f64() {
@@ -241,7 +276,7 @@ class FourdgsRecord {
 FourdgsRecord readRecord(FourdgsCursor cursor) {
   final offset = cursor.pos;
   final opcode = cursor.u8();
-  final length = cursor.u64();
+  final length = cursor.recordLength(recordAt: offset);
   return FourdgsRecord(
     opcode: opcode,
     content: cursor.take(length),
@@ -321,7 +356,7 @@ Iterable<FourdgsRecordSpan> scanRecordSpans(
   while (cursor.remaining >= recordHeaderBytes) {
     final offset = cursor.pos;
     final opcode = cursor.u8();
-    final length = cursor.u64();
+    final length = cursor.recordLength(recordAt: offset);
     final span = FourdgsRecordSpan(
       opcode: opcode,
       offset: offset,

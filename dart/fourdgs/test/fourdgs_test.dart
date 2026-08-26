@@ -297,6 +297,34 @@ void main() {
       expect(() => cursor.u64(), throwsA(isA<FourdgsMalformedFile>()));
     });
 
+    test('a record length past 2^53 is a cut, not a malformed file', () {
+      // Malformed as a field inside a record whose framing held; as a record's
+      // own length it is a claim the buffer cannot satisfy, like a length a few
+      // bytes past the end — which the streamed reader recovers from. Python
+      // and Rust class the two together; refusing this one read the same bytes
+      // to a different meaning.
+      final buf = Uint8List.fromList(<int>[
+        ...record(opMetadata, <int>[]),
+        opChunk,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0xFF,
+      ]);
+      final Matcher namesTheRecord = isA<FourdgsTruncatedFile>().having(
+        (e) => e.message,
+        'message',
+        allOf(contains('byte 9'), contains('0xff00000000000000')),
+      );
+      expect(() => iterRecords(buf).toList(), throwsA(namesTheRecord));
+      // The span walk the indexed opener reads front matter with agrees.
+      expect(() => scanRecordSpans(buf).toList(), throwsA(namesTheRecord));
+    });
+
     test('spans are walked without their content being present', () {
       // What lets an indexed reader step over a chunk it has not fetched.
       final buf = Uint8List.fromList(<int>[opChunk, ..._u64(1 << 20), 1, 2, 3]);

@@ -1225,6 +1225,47 @@ void main() {
         );
       },
     );
+
+    test('a record length past 2^53 recovers like any other overrun', () {
+      // One byte changed: the top byte of the first Chunk's length. Python and
+      // Rust salvage the records before it and report the scene truncated;
+      // this reader refused the file as malformed — the same bytes, two
+      // meanings. From the framing alone a corrupt length and a cut cannot be
+      // told apart (the recovery note in `readFourdgsBytes` says why), so this
+      // one recovers the way a length a few bytes past the end already does.
+      final Uint8List bytes = Uint8List.fromList(
+        File(
+          '../../tests/conformance/data/TenWindows-UseChunkIndex-UseCrc.4dgs',
+        ).readAsBytesSync(),
+      );
+      final int chunkAt =
+          scanRecordSpans(bytes, fourdgsMagic.length)
+              .firstWhere((FourdgsRecordSpan span) => span.opcode == opChunk)
+              .offset;
+      bytes[chunkAt + 1 + 7] = 0xFF;
+
+      final FourdgsScene scene = readFourdgsBytes(
+        bytes,
+        recoverTruncated: true,
+      );
+      expect(scene.truncated, isTrue);
+      expect(
+        scene.gaussians.count,
+        lessThan(scene.header.gaussianCount),
+        reason: 'the cut lands at the first Chunk, so the prefix must be short',
+      );
+
+      expect(
+        () => readFourdgsBytes(bytes, recoverTruncated: false),
+        throwsA(
+          isA<FourdgsTruncatedFile>().having(
+            (FourdgsTruncatedFile e) => e.message,
+            'message',
+            contains('byte $chunkAt'),
+          ),
+        ),
+      );
+    });
   });
 
   group('what a file declares is priced before it is allocated', () {
