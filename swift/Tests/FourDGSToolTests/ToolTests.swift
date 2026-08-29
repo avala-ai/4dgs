@@ -51,6 +51,13 @@ private func variants(_ directory: URL) -> [URL] {
         .map { directory.appendingPathComponent($0) }
 }
 
+private func invalidExpectationCount() -> Int {
+    let directory = corpusDirectory().appendingPathComponent("invalid")
+    return
+        ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
+        .filter { $0.hasSuffix(".json") }.count
+}
+
 private func readFixture(_ url: URL) throws -> [UInt8] {
     [UInt8](try Data(contentsOf: url))
 }
@@ -139,7 +146,7 @@ final class ValidateTests: XCTestCase {
     func testEveryInvalidVariantIsRefusedByItsOwnIdentifier() throws {
         try requireCorpus()
         let files = variants(corpusDirectory().appendingPathComponent("invalid"))
-        XCTAssertEqual(files.count, 7)
+        XCTAssertEqual(files.count, invalidExpectationCount())
         for file in files {
             let code = try XCTUnwrap(expectedRefusal(file), "\(file.lastPathComponent)")
             let result = runTool(["validate", file.path])
