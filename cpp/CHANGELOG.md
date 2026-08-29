@@ -8,6 +8,10 @@ All notable changes to the C++ package are documented here, following
 
 ### Changed
 
+- **A finite `Quantization.step_time` at or below zero crosses the binding as a named refusal.**
+  Both front-to-back and indexed opens return `kMalformed` with `non-positive-step-time`, including
+  for either sign of zero, while retaining the Rust core's field and record-byte diagnosis. The CLI
+  places the new refusal at the Quantization record.
 - **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
   at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
   already the intent, but no sentence made it a refusal and both read paths quietly guessed —

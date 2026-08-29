@@ -16,7 +16,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -96,6 +98,77 @@ std::vector<std::uint8_t> readWhole(const std::string& path, bool* found) {
   }
   std::fclose(handle);
   return bytes;
+}
+
+std::uint64_t littleU64(const std::uint8_t* at) {
+  std::uint64_t value = 0;
+  for (int i = 7; i >= 0; --i) value = (value << 8) | at[i];
+  return value;
+}
+
+std::uint32_t littleU32(const std::uint8_t* at) {
+  std::uint32_t value = 0;
+  for (int i = 3; i >= 0; --i) value = (value << 8) | at[i];
+  return value;
+}
+
+/// Replace only Quantization.step_time and return the enclosing record byte.
+std::optional<std::uint64_t> setStepTime(std::vector<std::uint8_t>* bytes, double value) {
+  constexpr std::size_t kRecordHeader = 9;
+  constexpr std::uint8_t kQuantization = 0x03;
+  std::size_t at = 8;
+  while (at + kRecordHeader <= bytes->size()) {
+    const std::uint64_t length = littleU64(bytes->data() + at + 1);
+    if (length > bytes->size() - at - kRecordHeader) return std::nullopt;
+    if ((*bytes)[at] == kQuantization) {
+      const std::size_t content = at + kRecordHeader;
+      if (length < 4) return std::nullopt;
+      const std::uint32_t schemeLength = littleU32(bytes->data() + content);
+      const std::size_t field = content + 4 + schemeLength + 3 * 8 + 6 * 8;
+      if (field + sizeof(value) > content + length) return std::nullopt;
+      std::uint64_t bits = 0;
+      static_assert(sizeof(bits) == sizeof(value), "f64 and uint64 must have equal width");
+      std::memcpy(&bits, &value, sizeof(bits));
+      for (std::size_t i = 0; i < sizeof(bits); ++i) {
+        (*bytes)[field + i] = static_cast<std::uint8_t>(bits >> (i * 8));
+      }
+      return static_cast<std::uint64_t>(at);
+    }
+    at += kRecordHeader + static_cast<std::size_t>(length);
+  }
+  return std::nullopt;
+}
+
+void aNonPositiveBirthTimeGridCrossesBothOpenModes(const std::string& directory) {
+  bool found = false;
+  const std::string path = directory + "/NoData-UseChunkIndex-UseCrc.4dgs";
+  const std::vector<std::uint8_t> valid = readWhole(path, &found);
+  CHECK(found);
+  if (!found) return;
+
+  for (const double value : {0.0, -0.0, -0.004}) {
+    std::vector<std::uint8_t> bytes = valid;
+    const std::optional<std::uint64_t> recordAt = setStepTime(&bytes, value);
+    CHECK(recordAt.has_value());
+    if (!recordAt.has_value()) continue;
+    for (const fourdgs::ReadMode mode :
+         {fourdgs::ReadMode::kSequential, fourdgs::ReadMode::kIndexed}) {
+      Result<std::unique_ptr<Scene>> opened =
+          Scene::openMemory(fourdgs::Span<const std::uint8_t>(bytes.data(), bytes.size()), mode);
+      CHECK(!opened.ok());
+      if (opened.ok()) continue;
+      CHECK_EQ(opened.error().code, fourdgs::ErrorCode::kMalformed);
+      CHECK(opened.error().refusal.has_value());
+      if (opened.error().refusal.has_value()) {
+        CHECK_EQ(*opened.error().refusal, std::string("non-positive-step-time"));
+      }
+      CHECK(opened.error().message.find("Quantization record at byte " +
+                                        std::to_string(*recordAt)) != std::string::npos);
+      CHECK(opened.error().message.find("step_time") != std::string::npos);
+      CHECK(opened.error().message.find("content byte") != std::string::npos);
+      CHECK(opened.error().message.find("greater than 0") != std::string::npos);
+    }
+  }
 }
 
 /// The codes this package documents. Anything else — or an empty message — means a caller
@@ -402,6 +475,7 @@ void runTests() {
   const std::string directory = corpusDirectory();
 
   refusalsAreNamed(directory);
+  aNonPositiveBirthTimeGridCrossesBothOpenModes(directory);
 
   for (const char* variant : kVariants) {
     const std::string path = directory + "/" + variant + ".4dgs";

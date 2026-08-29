@@ -9,7 +9,7 @@
 /// raised where the value was parsed, not where the bytes sit, and by then the record's
 /// position is several frames down the call stack, on the other side of an ABI.
 ///
-/// So the tool supplies it. The refusal vocabulary is six identifiers, each of which is about
+/// So the tool supplies it. The refusal vocabulary is seven identifiers, each of which is about
 /// exactly one kind of record, and a framing walk knows where every record is. That is the
 /// whole mechanism: walk the framing, ask which record this refusal is about, print the byte.
 ///
@@ -39,6 +39,7 @@ constexpr const char* kMagicMismatch = "magic-mismatch";
 constexpr const char* kUnsupportedMajorVersion = "unsupported-major-version";
 constexpr const char* kUnknownTemporalModel = "unknown-temporal-model";
 constexpr const char* kUnknownQuantizationScheme = "unknown-quantization-scheme";
+constexpr const char* kNonPositiveStepTime = "non-positive-step-time";
 
 std::uint64_t readU64(const std::uint8_t* at) {
   std::uint64_t value = 0;
@@ -442,7 +443,7 @@ std::optional<Site> frontMatterSite(const Walk* walk, const std::string& code) {
   if (code == kUnknownTemporalModel) {
     opcode = op::kHeader;
     what = "the Header record";
-  } else if (code == kUnknownQuantizationScheme) {
+  } else if (code == kUnknownQuantizationScheme || code == kNonPositiveStepTime) {
     opcode = op::kQuantization;
     what = "the Quantization record";
   } else {

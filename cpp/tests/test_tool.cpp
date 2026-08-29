@@ -2253,6 +2253,25 @@ void aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced() {
   }
 }
 
+void aNonPositiveStepTimeIsPlacedAtItsQuantizationRecord() {
+  Walk walk;
+  walk.representatives.push_back(fourdgs::tool::Frame{fourdgs::tool::op::kQuantization, 117, 100});
+  walk.opcodeCounts[fourdgs::tool::op::kQuantization] = 1;
+  walk.intactOpcodeCounts[fourdgs::tool::op::kQuantization] = 1;
+  const Error refusal(ErrorCode::kMalformed, "the Quantization step_time is not positive",
+                      std::string("non-positive-step-time"));
+
+  const std::optional<Named> named = fourdgs::tool::describe(refusal, &walk, std::nullopt);
+  CHECK(named.has_value());
+  if (!named.has_value()) return;
+  CHECK_EQ(named->code, std::string("non-positive-step-time"));
+  CHECK(named->site.has_value());
+  if (named->site.has_value()) {
+    CHECK_EQ(named->site->offset, static_cast<std::uint64_t>(117));
+    CHECK_EQ(named->site->what, std::string("the Quantization record"));
+  }
+}
+
 void aRecordAfterTheFooterIsReportedWithoutMovingTheVerdict() {
   // Spec section 4: the Footer MUST be the last record. Neither the Python reference validator
   // nor the Rust one checks it, so this is a note — the fact is reported and the verdict stays
@@ -2422,6 +2441,7 @@ void runTests() {
   aShortReadIsTruncationRatherThanAnInventedRecord();
   aFramingTransportFailureIsNotReportedAsAFileCut();
   aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced();
+  aNonPositiveStepTimeIsPlacedAtItsQuantizationRecord();
   aRecordAfterTheFooterIsReportedWithoutMovingTheVerdict();
   aBandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord();
   commasMatchThePythonToolsThousandsSeparator();

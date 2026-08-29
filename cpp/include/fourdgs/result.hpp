@@ -50,11 +50,12 @@ struct Error {
 
   /// Which rule refused the file, in the specification's own vocabulary:
   /// `"magic-mismatch"`, `"unsupported-major-version"`, `"unknown-temporal-model"`,
-  /// `"unknown-quantization-scheme"`, `"unknown-stream-codec"`,
-  /// `"window-index-out-of-range"` — the same six strings every other SDK prints.
+  /// `"unknown-quantization-scheme"`, `"non-positive-step-time"`,
+  /// `"unknown-stream-codec"`, `"window-index-out-of-range"` — the same seven strings
+  /// every other SDK prints.
   ///
   /// `code` says what *kind* of thing went wrong, and `kUnsupported` alone covers three of
-  /// those six; this says *which* one, so "refused the file" and "refused it for the right
+  /// those seven; this says *which* one, so "refused the file" and "refused it for the right
   /// reason" stop being the same observation.
   ///
   /// Absent for every failure the table does not name — a truncated file, a transport that
