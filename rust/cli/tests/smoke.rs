@@ -283,6 +283,18 @@ fn invalid_corpus() -> Vec<(String, PathBuf, String)> {
     out
 }
 
+/// The committed contract determines the corpus size; generated files must match it exactly.
+fn invalid_expectation_count() -> usize {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/invalid");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|x| x == "json"))
+        .count()
+}
+
 #[test]
 fn every_invalid_variant_is_refused_by_its_own_identifier() {
     // The strongest evidence there is that this tool is right, because the corpus already
@@ -312,7 +324,7 @@ fn every_invalid_variant_is_refused_by_its_own_identifier() {
             "{name} must be refused as `{code}`, and the tool said: {text}"
         );
         // And the byte, which is the question its holder actually has. Every one of these
-        // is placeable: four in the front matter, two inside a chunk the tool decodes.
+        // is placeable, whether the refusal lives in front matter or inside a decoded chunk.
         assert!(
             text.contains(&format!("refusal {code} at byte ")),
             "{name} named the refusal but not where it fired: {text}"
@@ -320,9 +332,8 @@ fn every_invalid_variant_is_refused_by_its_own_identifier() {
     }
     assert_eq!(
         corpus.len(),
-        7,
-        "the invalid corpus is seven variants; a run that saw a different number is \
-         checking a corpus this test has not been read against"
+        invalid_expectation_count(),
+        "the generated invalid corpus must match every committed expectation"
     );
 }
 
