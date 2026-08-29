@@ -367,6 +367,18 @@ malformed file is the one it already had, and this rule neither creates a new re
 existing one. Validators are where it is enforced — a tool that reports why a file is wrong SHOULD
 report a non-finite quantization parameter as an error, naming the field.
 
+**`step_time` MUST be strictly positive.** This is a reader obligation in addition to the writer
+rule above: a reader MUST refuse a Quantization record whose finite `step_time` is less than or
+equal to zero, with the refusal identifier `non-positive-step-time`. The diagnosis names the
+Quantization record, the `step_time` field and its byte, the value, and that a value greater than
+zero was expected. Both signs of zero are non-positive for this rule.
+
+Zero makes §6.3's `target / step_time` the undefined ratio `0 / 0`; implementations otherwise
+disagree between propagating NaN and throwing during the following `floor`. A negative value makes
+the reconstructed pitch negative and reverses every stored birth-time bin. Neither is a grid pitch,
+and refusing before dequantization gives the same bytes one meaning on both temporal models and both
+read paths.
+
 Each stored integer bin is multiplied by its step (and exponentiated, for the log-domain scale and
 sigma) to recover the value. Because every grid pitch is exactly twice its declared bound,
 `|decoded - original| <= bound` holds by construction. Producers SHOULD verify this exhaustively at
@@ -1640,6 +1652,7 @@ and the text was the bug.
 | §11/§5.18/§5.8 added: the `keyframe-delta` temporal model, Delta Chunk `0x10`, `gaussian_id` (id 13), and six appended Chunk Index fields | rule added                |
 | §5.3 added: the grammar a `bounds` value is spelled by, and that two bounds are compared as numbers rather than as bytes                  | clarification, rule added |
 | §4 added: Header, Quantization and Window Table appear exactly once, and a reader MUST refuse a file carrying two of any of them          | rule added                |
+| §5.3 added: `step_time` MUST be strictly positive and a reader refuses a non-positive value                                               | rule added                |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
 opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append

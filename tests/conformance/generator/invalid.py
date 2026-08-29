@@ -136,6 +136,26 @@ def _unknown_quantization_scheme(data: bytes) -> bytes:
     return _replace_once(data, b"uniform-v1", b"uniform-v9")
 
 
+def _step_time_offset(data: bytes) -> int:
+    """Locate Quantization.step_time without assuming the scheme's byte length."""
+    offset, _ = _find(data, 0x03)
+    (scheme_length,) = struct.unpack_from("<I", data, offset)
+    steps = offset + 4 + scheme_length + 3 * 8
+    return steps + 6 * 8
+
+
+def _step_time(data: bytes, value: float) -> bytes:
+    return _patch(data, _step_time_offset(data), struct.pack("<d", value))
+
+
+def _zero_step_time(data: bytes) -> bytes:
+    return _step_time(data, 0.0)
+
+
+def _negative_step_time(data: bytes) -> bytes:
+    return _step_time(data, -0.004)
+
+
 def _window_index_out_of_range(data: bytes) -> bytes:
     """Shrink the Window Table's `count` so the gaussians reference past its end.
 
@@ -175,6 +195,16 @@ REFUSALS: tuple[Refusal, ...] = (
     ),
     Refusal("WindowIndexOutOfRange", "window-index-out-of-range", "spec 5.4", _window_index_out_of_range),
     Refusal("UnknownStreamCodec", "unknown-stream-codec", "spec 5.5, registry stream codecs", _unknown_stream_codec),
+)
+
+#: The two witnesses for spec issue #306. They are declared on the normative bottom
+#: layer of the rollout and activated in `REFUSALS` only after every SDK layer can name
+#: them. The invalid runner contract is deliberately all-or-none; committing the files
+#: before that point would either make the bottom PR red or weaken that contract with a
+#: temporary per-refusal opt-out.
+STEP_TIME_REFUSALS: tuple[Refusal, ...] = (
+    Refusal("ZeroStepTime", "non-positive-step-time", "spec 5.3, 6.3", _zero_step_time),
+    Refusal("NegativeStepTime", "non-positive-step-time", "spec 5.3, 6.3", _negative_step_time),
 )
 
 #: Invalid variants the encoder writes directly rather than a mutation producing.

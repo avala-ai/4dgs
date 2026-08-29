@@ -39,10 +39,27 @@ import run as conformance_run
 from fourdgs import keyframe_delta_file as kdf
 from fourdgs.model import GaussianSet
 from fourdgs.records import Header
+from generator import invalid
 
 #: The expectation the signed zero was found in (#153): two composed values at the noise
 #: floor, which round to `-0.0` where the arithmetic lands a hair below zero.
 COMPOSED = "object/ObjectTrackComposed-UseChunkIndex-UseCrc"
+
+
+def test_non_positive_step_time_refusal_witnesses_change_only_the_field():
+    scenario = next(item for item in generate.scenarios.SCENARIOS if item.name == invalid.BASE_SCENARIO)
+    base, _ = generate.build(scenario, tuple(sorted(invalid.BASE_FLAGS)))
+    field = invalid._step_time_offset(base)
+
+    witnesses = {refusal.name: refusal.mutate(base) for refusal in invalid.STEP_TIME_REFUSALS}
+
+    assert {refusal.code for refusal in invalid.STEP_TIME_REFUSALS} == {"non-positive-step-time"}
+    assert struct.unpack_from("<d", witnesses["ZeroStepTime"], field) == (0.0,)
+    assert struct.unpack_from("<d", witnesses["NegativeStepTime"], field) == (-0.004,)
+    for mutated in witnesses.values():
+        changed = [index for index, pair in enumerate(zip(base, mutated, strict=True)) if pair[0] != pair[1]]
+        assert changed
+        assert set(changed) <= set(range(field, field + 8))
 
 
 class TestExactAggregateTransition:
