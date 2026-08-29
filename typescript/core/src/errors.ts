@@ -29,6 +29,8 @@ export const Refusal = {
   UnknownTemporalModel: "unknown-temporal-model",
   /** The Quantization record names a scheme this build does not implement. */
   UnknownQuantizationScheme: "unknown-quantization-scheme",
+  /** The Quantization record declares a finite birth-time grid pitch at or below zero. */
+  NonPositiveStepTime: "non-positive-step-time",
   /** A stream declares a codec this build does not implement. */
   UnknownStreamCodec: "unknown-stream-codec",
   /** A gaussian's window index names a row the Window Table does not have. */

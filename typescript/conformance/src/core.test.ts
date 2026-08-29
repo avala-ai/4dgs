@@ -54,12 +54,14 @@ import {
   mergeBands,
   motionStep,
   muStep,
+  parseQuantization,
   rctInverse,
   supportK,
   unshuffleAndUnzigzag,
   DEFAULT_CODECS,
   MAGIC,
   Opcode,
+  RECORD_HEADER_BYTES,
 } from "@4dgs/core";
 
 import { roundHalfEven } from "./canonical.js";
@@ -67,6 +69,23 @@ import { MODE_CONST, MODE_DELTA, MODE_RAW, concat, encodeTestStream, record } fr
 
 async function decodeOne(bytes: Uint8Array): Promise<Int32Array> {
   return decodeStream(frameOneStream(new Cursor(bytes)), DEFAULT_CODECS);
+}
+
+function withStepTime(
+  bytes: Uint8Array,
+  value: number,
+): { readonly bytes: Uint8Array; readonly recordAt: number; readonly fieldAt: number } {
+  const out = Uint8Array.from(bytes);
+  const quantization = [...iterateRecords(out, MAGIC.length)].find(
+    (candidate) => candidate.opcode === Opcode.Quantization,
+  );
+  assert.ok(quantization !== undefined, "the encoded file carries Quantization");
+  const contentAt = quantization.offset + RECORD_HEADER_BYTES;
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  const schemeLength = view.getUint32(contentAt, true);
+  const fieldAt = contentAt + 4 + schemeLength + 3 * 8 + 6 * 8;
+  view.setFloat64(fieldAt, value, true);
+  return { bytes: out, recordAt: quantization.offset, fieldAt };
 }
 
 test("raw streams decode to the values they were built from", async () => {
@@ -220,6 +239,30 @@ test("a named refusal carries the identifier every SDK is compared on", () => {
     refusalOf(() => checkMagic(new Uint8Array(3))),
     undefined,
   );
+});
+
+test("a non-positive birth-time grid is refused by name on both read paths", async () => {
+  const encoded = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1);
+  for (const value of [0, -0, -0.004]) {
+    const mutated = withStepTime(encoded, value);
+    const spelling = Object.is(value, -0) ? "-0.0" : value === 0 ? "0.0" : String(value);
+    const rejects = (error: unknown): boolean => {
+      assert.ok(error instanceof MalformedFile, String(error));
+      assert.equal(error.refusalCode, Refusal.NonPositiveStepTime);
+      assert.match(error.message, new RegExp(`Quantization record at byte ${mutated.recordAt}`));
+      assert.match(error.message, new RegExp(`step_time ${spelling.replace(".", "\\.")}`));
+      assert.match(error.message, new RegExp(`at byte ${mutated.fieldAt}`));
+      assert.match(error.message, /greater than 0/);
+      return true;
+    };
+
+    const quantization = [...iterateRecords(mutated.bytes, MAGIC.length)].find(
+      (candidate) => candidate.opcode === Opcode.Quantization,
+    )!;
+    assert.throws(() => parseQuantization(quantization.content, quantization.offset), rejects);
+    await assert.rejects(() => decodeScene(new BytesReadable(mutated.bytes)), rejects);
+    await assert.rejects(() => IndexedDecoder.open(new BytesReadable(mutated.bytes)), rejects);
+  }
 });
 
 test("CRC-32 matches the IEEE values the footer is written with", () => {

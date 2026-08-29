@@ -515,6 +515,37 @@ test("end to end: every deliberately broken file is refused by identifier and by
   }
 });
 
+test("unit: validation preserves the non-positive step-time refusal and record byte", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const quantization = recordsOf(original).find(
+    (candidate) => candidate.opcode === Opcode.Quantization,
+  )!;
+  const contentAt = quantization.offset + RECORD_HEADER_BYTES;
+  const schemeLength = new DataView(
+    original.buffer,
+    original.byteOffset,
+    original.byteLength,
+  ).getUint32(contentAt, true);
+  const stepTimeAt = contentAt + 4 + schemeLength + 3 * 8 + 6 * 8;
+
+  for (const value of [0, -0, -0.004]) {
+    const bytes = Uint8Array.from(original);
+    new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setFloat64(
+      stepTimeAt,
+      value,
+      true,
+    );
+    const report = await validateFile(bytes, { decode: true });
+    assert.equal(report.refused?.code, "non-positive-step-time");
+    assert.equal(report.refused?.at, quantization.offset);
+    assert.equal(report.refused?.where, "the Quantization record");
+    assert.match(report.refused?.message ?? "", /step_time/);
+    assert.match(report.refused?.message ?? "", /greater than 0/);
+  }
+});
+
 test("regression: inspect --json preflights magic before writing stdout", async () => {
   const badMagic = MAGIC.slice();
   badMagic[0] ^= 0xff;

@@ -204,11 +204,33 @@ export interface Quantization {
   readonly shBitDepthsMalformed: boolean;
 }
 
-export function parseQuantization(content: Uint8Array): Quantization {
+export function parseQuantization(content: Uint8Array, recordOffset?: number): Quantization {
   const c = new Cursor(content);
   const scheme = c.string();
   const posOrigin = c.f64s(3);
+  const stepsAt = c.pos;
   const steps = c.f64s(8);
+  const stepTime = steps[6]!;
+  if (Number.isFinite(stepTime) && stepTime <= 0) {
+    const fieldAt = stepsAt + 6 * 8;
+    const value = Object.is(stepTime, -0)
+      ? "-0.0"
+      : Number.isInteger(stepTime)
+        ? `${stepTime}.0`
+        : String(stepTime);
+    const record =
+      recordOffset === undefined
+        ? "the Quantization record"
+        : `the Quantization record at byte ${recordOffset}`;
+    const where =
+      recordOffset === undefined
+        ? `content byte ${fieldAt}`
+        : `byte ${recordOffset + RECORD_HEADER_BYTES + fieldAt}`;
+    throw new MalformedFile(
+      `${record} has step_time ${value} at ${where}; expected a finite value greater than 0`,
+      { refusalCode: Refusal.NonPositiveStepTime },
+    );
+  }
   const stepSh = c.u8();
   const bounds = c.stringMap();
   const parsedDepths = shBitDepths(c);
@@ -221,7 +243,7 @@ export function parseQuantization(content: Uint8Array): Quantization {
     stepRgb: steps[3]!,
     stepAlpha: steps[4]!,
     stepMotion: steps[5]!,
-    stepTime: steps[6]!,
+    stepTime,
     stepSigmaLog: steps[7]!,
     stepSh,
     bounds,

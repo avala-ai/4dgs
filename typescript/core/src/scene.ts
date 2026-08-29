@@ -294,7 +294,7 @@ export async function decodeScene(
           if (quantization !== null) {
             throw duplicateStructuralRecord("Quantization", record.offset);
           }
-          quantization = parseQuantization(content);
+          quantization = parseQuantization(content, record.offset);
           checkQuantizationScheme(quantization.scheme);
           break;
         case Opcode.WindowTable:

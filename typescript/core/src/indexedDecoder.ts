@@ -289,7 +289,7 @@ export class IndexedDecoder {
         if (quantization !== null) {
           throw duplicateStructuralRecord("Quantization", record.offset);
         }
-        quantization = parseQuantization(await scanner.content(record));
+        quantization = parseQuantization(await scanner.content(record), record.offset);
         checkQuantizationScheme(quantization.scheme);
       } else if (record.opcode === Opcode.WindowTable) {
         // A file may legitimately carry a table with no entries, so emptiness does not

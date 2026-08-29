@@ -342,9 +342,10 @@ export async function validateFile(
           break;
         case Opcode.Quantization:
           try {
-            quantization = parseQuantization(await content());
+            quantization = parseQuantization(await content(), offset);
           } catch (error) {
             found.error(`Quantization does not parse: ${message(error)}`);
+            found.refuse(error, offset, "the Quantization record");
             break;
           }
           // Checked here, as the record is met, rather than once at the end on whichever
