@@ -230,10 +230,9 @@ and mixing—belong to the renderer/player.
 
 ## Conformance
 
-Checked against the same generated corpus every other 4dgs SDK is, on both read paths: 119 checks,
-the seven invalid variants included now that a refusal here carries the identifier the suite
-compares. See the [feature matrix](https://4dgs.dev/reference/) for what this SDK implements and
-what it declines.
+Checked against the same generated corpus every other 4dgs SDK is, on both read paths, including
+every invalid variant now that a refusal here carries the identifier the suite compares. See the
+[feature matrix](https://4dgs.dev/reference/) for what this SDK implements and what it declines.
 
 ## License
 

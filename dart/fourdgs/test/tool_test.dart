@@ -1850,28 +1850,37 @@ void main() {
       expect(text, contains('the Footer frames cleanly but does not parse'));
     });
 
-    test('the seven invalid variants, end to end', () async {
-      // The strongest check available to this tool: six validators read the
-      // same seven files and must place the same seven refusals at the same
-      // seven bytes. The identifier is read out of the corpus's own expectation
-      // file rather than written here, so a test cannot drift away from what
-      // the suite compares — and the offsets are the ones every other SDK's
-      // tool prints for the same bytes.
+    test('every invalid variant, end to end', () async {
+      // The strongest check available to this tool: six validators read every
+      // committed expectation and must place the same refusal at the same byte.
+      // The identifier is read out of the corpus's own expectation file rather
+      // than written per variant, so a test cannot drift away from what the
+      // suite compares — and the offsets are the ones every other SDK's tool
+      // prints for the same bytes.
       const Map<String, int> bytes = <String, int>{
-        'BadMagic': 0,
-        'EmptyTemporalModel': 8,
-        'FutureMajorVersion': 0,
-        'UnknownQuantizationScheme': 154,
-        'UnknownStreamCodec': 659,
-        'UnknownTemporalModel': 8,
-        'WindowIndexOutOfRange': 2506,
+        'magic-mismatch': 0,
+        'unsupported-major-version': 0,
+        'unknown-temporal-model': 8,
+        'unknown-quantization-scheme': 154,
+        'non-positive-step-time': 154,
+        'unknown-stream-codec': 659,
+        'window-index-out-of-range': 2506,
       };
-      for (final MapEntry<String, int> variant in bytes.entries) {
-        final File file = File('$_corpus/invalid/${variant.key}.4dgs');
-        final File expectation = File('$_corpus/invalid/${variant.key}.json');
-        if (!file.existsSync() || !expectation.existsSync()) {
+      final List<File> expectations =
+          Directory('$_corpus/invalid')
+              .listSync()
+              .whereType<File>()
+              .where((File file) => file.path.endsWith('.json'))
+              .toList()
+            ..sort((File a, File b) => a.path.compareTo(b.path));
+      expect(expectations, isNotEmpty);
+      for (final File expectation in expectations) {
+        final String name = expectation.uri.pathSegments.last;
+        final String variant = name.substring(0, name.length - '.json'.length);
+        final File file = File('$_corpus/invalid/$variant.4dgs');
+        if (!file.existsSync()) {
           fail(
-            'the corpus is missing ${variant.key}: run '
+            'the corpus is missing $variant: run '
             '`python3 tests/conformance/generate.py` from the repository root',
           );
         }
@@ -1879,22 +1888,28 @@ void main() {
             (jsonDecode(await expectation.readAsString())
                     as Map<String, Object?>)['refused']!
                 as String;
+        final int? expectedByte = bytes[refusal];
+        expect(
+          expectedByte,
+          isNotNull,
+          reason: '$variant names an unknown refusal',
+        );
         final List<String> out = <String>[];
         final int code = await tool.run(
           <String>['validate', file.path],
           out.add,
           (_) {},
         );
-        expect(code, tool.exitRefused, reason: '${variant.key} must exit 1');
+        expect(code, tool.exitRefused, reason: '$variant must exit 1');
         expect(
           out,
           contains(
             allOf(
-              startsWith('  refusal $refusal at byte ${variant.value} ('),
+              startsWith('  refusal $refusal at byte $expectedByte ('),
               endsWith(')'),
             ),
           ),
-          reason: '${variant.key} must name $refusal at byte ${variant.value}',
+          reason: '$variant must name $refusal at byte $expectedByte',
         );
       }
     });
