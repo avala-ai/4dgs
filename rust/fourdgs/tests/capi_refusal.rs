@@ -137,10 +137,23 @@ fn indexed_state_status(bytes: &[u8]) -> c_int {
 /// test wants to break. Both refusals reach the C surface as the same status code, which
 /// is why the identifier has to tell them apart.
 fn file_naming(temporal_model: &str, scheme: &str) -> Vec<u8> {
-    file_naming_with_header_trailer(temporal_model, scheme, &[])
+    file_naming_with_step_time(temporal_model, scheme, 0.004)
+}
+
+fn file_naming_with_step_time(temporal_model: &str, scheme: &str, step_time: f64) -> Vec<u8> {
+    file_naming_with_header_trailer_and_step_time(temporal_model, scheme, &[], step_time)
 }
 
 fn file_naming_with_header_trailer(temporal_model: &str, scheme: &str, trailer: &[u8]) -> Vec<u8> {
+    file_naming_with_header_trailer_and_step_time(temporal_model, scheme, trailer, 0.004)
+}
+
+fn file_naming_with_header_trailer_and_step_time(
+    temporal_model: &str,
+    scheme: &str,
+    trailer: &[u8],
+    step_time: f64,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(
@@ -164,7 +177,7 @@ fn file_naming_with_header_trailer(temporal_model: &str, scheme: &str, trailer: 
             step_rgb: 2.0 / 255.0,
             step_alpha: 2.0 / 255.0,
             step_motion: 4e-4,
-            step_time: 0.004,
+            step_time,
             step_sigma_log: 0.04,
             step_sh: 1,
             bounds: BTreeMap::new(),
@@ -181,6 +194,30 @@ fn file_naming_with_header_trailer(temporal_model: &str, scheme: &str, trailer: 
     out.extend_from_slice(&Footer::default().encode());
     out.extend_from_slice(&MAGIC);
     out
+}
+
+#[test]
+fn a_non_positive_birth_time_grid_crosses_the_c_abi_by_name() {
+    for step_time in [0.0, -0.0, -0.004] {
+        let bytes = file_naming_with_step_time("gaussian-birth", "uniform-v1", step_time);
+        for open in [
+            open_memory_sequential as fn(&[u8]) -> c_int,
+            open_memory_indexed,
+        ] {
+            assert_eq!(open(&bytes), FOURDGS_STATUS_MALFORMED, "{step_time:?}");
+            assert_eq!(
+                last_refusal_code().as_deref(),
+                Some(refusal::NON_POSITIVE_STEP_TIME),
+                "{step_time:?}: {}",
+                last_error()
+            );
+            let message = last_error();
+            assert!(message.contains("Quantization record at byte"), "{message}");
+            assert!(message.contains("step_time"), "{message}");
+            assert!(message.contains(&format!("{step_time:?}")), "{message}");
+            assert!(message.contains("greater than 0"), "{message}");
+        }
+    }
 }
 
 fn file_with_state_ranges(

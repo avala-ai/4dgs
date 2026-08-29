@@ -8,6 +8,11 @@ All notable changes to the Rust crate are documented here, following
 
 ### Changed
 
+- **Readers refuse a finite `Quantization.step_time` at or below zero by name.** Both front-to-back
+  and indexed opens return `non-positive-step-time`, including for either sign of zero, and the C
+  ABI preserves the same identifier and record byte. A zero pitch makes birth-time grid selection
+  evaluate `0 / 0`; a negative pitch reverses the grid and gives different readers room to
+  reconstruct different state.
 - **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
   at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
   already the intent, but no sentence made it a refusal and both read paths quietly guessed —

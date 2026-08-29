@@ -141,6 +141,8 @@ pub mod refusal {
     pub const UNKNOWN_TEMPORAL_MODEL: &str = "unknown-temporal-model";
     /// The Quantization record names a scheme this build does not implement.
     pub const UNKNOWN_QUANTIZATION_SCHEME: &str = "unknown-quantization-scheme";
+    /// The Quantization record declares a finite birth-time grid pitch at or below zero.
+    pub const NON_POSITIVE_STEP_TIME: &str = "non-positive-step-time";
     /// A stream declares a codec this build does not implement.
     pub const UNKNOWN_STREAM_CODEC: &str = "unknown-stream-codec";
     /// A gaussian's `window_index` names a row the Window Table does not have.

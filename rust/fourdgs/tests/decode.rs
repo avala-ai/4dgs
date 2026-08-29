@@ -22,6 +22,10 @@ use fourdgs::stream::{unzigzag, zigzag};
 /// A file with a Header and a Quantization record and nothing else: the smallest thing a
 /// reader must accept, and the base every "now break one field" test starts from.
 fn minimal_file() -> Vec<u8> {
+    minimal_file_with_step_time(0.004)
+}
+
+fn minimal_file_with_step_time(step_time: f64) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(
@@ -45,7 +49,7 @@ fn minimal_file() -> Vec<u8> {
             step_rgb: 2.0 / 255.0,
             step_alpha: 2.0 / 255.0,
             step_motion: 4e-4,
-            step_time: 0.004,
+            step_time,
             step_sigma_log: 0.04,
             step_sh: 1,
             bounds: BTreeMap::new(),
@@ -62,6 +66,41 @@ fn minimal_file() -> Vec<u8> {
     out.extend_from_slice(&fourdgs::records::Footer::default().encode());
     out.extend_from_slice(&MAGIC);
     out
+}
+
+#[test]
+fn a_non_positive_birth_time_grid_is_refused_by_name_on_both_read_paths() {
+    for step_time in [0.0, -0.0, -0.004] {
+        let data = minimal_file_with_step_time(step_time);
+
+        let streamed = fourdgs::read_bytes(&data).expect_err("the time-grid pitch is invalid");
+        assert!(streamed.is_malformed(), "{step_time:?}: {streamed}");
+        assert_eq!(
+            streamed.refusal_code(),
+            Some(fourdgs::error::refusal::NON_POSITIVE_STEP_TIME),
+            "{step_time:?}: {streamed}"
+        );
+        let message = streamed.to_string();
+        assert!(message.contains("Quantization record at byte"), "{message}");
+        assert!(message.contains("step_time"), "{message}");
+        assert!(message.contains("content byte"), "{message}");
+        assert!(message.contains(&format!("{step_time:?}")), "{message}");
+        assert!(message.contains("greater than 0"), "{message}");
+
+        let mut source = fourdgs::BytesReadable::new(&data);
+        let indexed = fourdgs::indexed_reader::open_indexed(&mut source)
+            .expect_err("the indexed opener enforces the same field rule");
+        assert!(indexed.is_malformed(), "{step_time:?}: {indexed}");
+        assert_eq!(
+            indexed.refusal_code(),
+            Some(fourdgs::error::refusal::NON_POSITIVE_STEP_TIME),
+            "{step_time:?}: {indexed}"
+        );
+        assert!(
+            indexed.to_string().contains("Quantization record at byte"),
+            "{indexed}"
+        );
+    }
 }
 
 #[test]
