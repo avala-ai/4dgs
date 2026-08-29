@@ -306,7 +306,7 @@ func frontMatterSite(_ walk: Walk?, _ code: RefusalCode) -> Site? {
     case .unknownTemporalModel:
         opcode = Opcode.header
         what = "the Header record"
-    case .unknownQuantizationScheme:
+    case .unknownQuantizationScheme, .nonPositiveStepTime:
         opcode = Opcode.quantization
         what = "the Quantization record"
     case .unknownStreamCodec, .windowIndexOutOfRange:

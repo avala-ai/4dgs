@@ -896,7 +896,7 @@ enum Core {
         guard fourdgs_last_refusal_code(&pointer, &length) == ok else { return nil }
         guard pointer != nil, length > 0 else { return nil }
         // An identifier this build has no case for is `nil` rather than a fabricated one: a
-        // core that grows a seventh refusal should look unnamed here, not misnamed.
+        // core that grows an eighth refusal should look unnamed here, not misnamed.
         return RefusalCode(rawValue: string(pointer, length))
     }
 

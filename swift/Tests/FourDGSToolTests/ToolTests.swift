@@ -160,6 +160,38 @@ final class ValidateTests: XCTestCase {
         XCTAssertFalse(result.out.contains("error:"))
     }
 
+    func testANonPositiveBirthTimeGridCrossesBothReadPathsAndIsPlaced() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent("NoData-UseChunkIndex-UseCrc.4dgs")
+        let original = try readFixture(file)
+        let quantization = try XCTUnwrap(try walk(original).firstIntact(Opcode.quantization))
+        let content = quantization.offset + recordHeaderSize
+        let schemeLength = UInt64(try XCTUnwrap(readU32(original, at: content)))
+        let stepTime = content + 4 + schemeLength + 9 * 8
+
+        for value in [0.0, -0.0, -0.004] {
+            var bytes = original
+            writeU64(value.bitPattern, into: &bytes, at: stepTime)
+            for readPath in [SceneReader.ReadPath.streamed, .indexed] {
+                XCTAssertThrowsError(try SceneReader(InMemoryReader(bytes), path: readPath)) {
+                    error in
+                    let refusal = error as? FourDGSError
+                    XCTAssertEqual(refusal?.refusalCode, .nonPositiveStepTime)
+                    XCTAssertTrue("\(error)".contains("Quantization record at byte \(quantization.offset)"))
+                    XCTAssertTrue("\(error)".contains("step_time"))
+                    XCTAssertTrue("\(error)".contains("content byte"))
+                    XCTAssertTrue("\(error)".contains("greater than 0"))
+                }
+            }
+
+            let named = try XCTUnwrap(validate(bytes).findings.compactMap(\.refusal).first)
+            XCTAssertEqual(named.code, .nonPositiveStepTime)
+            XCTAssertEqual(named.site?.offset, quantization.offset)
+            XCTAssertEqual(
+                named.site?.what, "the physical Quantization record at byte \(quantization.offset)")
+        }
+    }
+
     func testAConformingKeyframeDeltaFileIsValid() throws {
         try requireCorpus()
         let files = variants(corpusDirectory().appendingPathComponent("keyframe"))
