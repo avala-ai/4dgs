@@ -229,5 +229,6 @@ ENCODED: tuple[tuple[str, str, str, dict], ...] = (
 )
 
 #: Every identifier the suite knows. A runner may produce no other, and a new refusal is
-#: added here rather than invented in one language.
-CODES = frozenset(r.code for r in REFUSALS) | {code for _, code, _, _ in ENCODED}
+#: added here rather than invented in one language. The staged step-time identifier is
+#: already vocabulary even though its two corpus files activate only after the SDK stack.
+CODES = frozenset(r.code for r in (*REFUSALS, *STEP_TIME_REFUSALS)) | {code for _, code, _, _ in ENCODED}
