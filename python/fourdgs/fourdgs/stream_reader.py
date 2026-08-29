@@ -387,7 +387,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
             elif record.opcode == op.QUANTIZATION:
                 if quant is not None:
                     raise duplicate_structural_record("Quantization", record.offset)
-                quant = rec.Quantization.parse(record.content)
+                quant = rec.Quantization.parse(record.content, record_offset=record.offset)
                 check_quantization_scheme(quant.scheme)
             elif record.opcode == op.WINDOW_TABLE:
                 # Tracked with a flag rather than by testing `windows` for emptiness: a

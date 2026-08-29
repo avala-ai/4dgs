@@ -186,11 +186,26 @@ class Quantization:
         return put_record(op.QUANTIZATION, body + trailer)
 
     @staticmethod
-    def parse(content) -> Quantization:
+    def parse(content, *, record_offset: int | None = None) -> Quantization:
         c = Cursor(content)
         scheme = c.string()
         origin = c.f64s(3)
+        steps_at = c.pos
         steps = c.f64s(8)
+        step_time = steps[6]
+        if math.isfinite(step_time) and step_time <= 0.0:
+            field_at = steps_at + 6 * 8
+            if record_offset is None:
+                where = f"content byte {field_at}"
+                record = "the Quantization record"
+            else:
+                # One opcode byte and the u64 content length precede the content.
+                where = f"byte {record_offset + 9 + field_at}"
+                record = f"the Quantization record at byte {record_offset}"
+            raise MalformedFile(
+                f"{record} has step_time {step_time!r} at {where}; expected a finite value greater than 0",
+                code="non-positive-step-time",
+            )
         step_sh = c.u8()
         bounds = c.str_map()
         if "object_id" in bounds:
@@ -208,7 +223,7 @@ class Quantization:
             step_rgb=steps[3],
             step_alpha=steps[4],
             step_motion=steps[5],
-            step_time=steps[6],
+            step_time=step_time,
             step_sigma_log=steps[7],
             step_sh=step_sh,
             bounds=bounds,
