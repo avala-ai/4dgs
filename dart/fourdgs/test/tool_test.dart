@@ -283,6 +283,21 @@ void main() {
       },
     );
 
+    test('a non-positive step_time names the Quantization record', () async {
+      for (final double stepTime in <double>[0.0, -0.0, -0.004]) {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(_minimal(stepTime: stepTime)),
+        );
+        final FourdgsNamedRefusal named = _refusals(report).single;
+        expect(named.code, refusalNonPositiveStepTime);
+        expect(named.site!.what, 'the Quantization record');
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(contains('step_time $stepTime')),
+        );
+      }
+    });
+
     test('a truncated file says what survived and where it was cut', () async {
       final Uint8List whole = _minimal();
       final FourdgsValidation report = await validateFourdgs(
@@ -2018,6 +2033,7 @@ Uint8List _minimal({
   String temporalModel = 'gaussian-birth',
   String profile = '',
   String scheme = 'uniform-v1',
+  double stepTime = 1.0,
   Uint8List? extra,
   Uint8List? secondHeader,
   int summaryStart = 0,
@@ -2052,6 +2068,7 @@ Uint8List _minimal({
       opQuantization,
       _quantizationContent(
         scheme: scheme,
+        stepTime: stepTime,
         shBitDepths: shBitDepths,
         shBand1Bound: shBand1Bound,
       ),
@@ -3158,6 +3175,7 @@ Uint8List _headerContent({
 
 Uint8List _quantizationContent({
   String scheme = 'uniform-v1',
+  double stepTime = 1.0,
   List<int> shBitDepths = const <int>[],
   String? shBand1Bound,
 }) {
@@ -3166,7 +3184,7 @@ Uint8List _quantizationContent({
     body.add(_f64(0.0)); // pos_origin
   }
   for (int i = 0; i < 8; i++) {
-    body.add(_f64(1.0)); // step_pos .. step_sigma_log
+    body.add(_f64(i == 6 ? stepTime : 1.0));
   }
   body.addByte(1); // step_sh
   final BytesBuilder bounds = BytesBuilder();

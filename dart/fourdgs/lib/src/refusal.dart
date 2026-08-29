@@ -266,6 +266,7 @@ class FourdgsNamedRefusal {
 const Map<String, (int, String)> _frontMatter = <String, (int, String)>{
   refusalUnknownTemporalModel: (opHeader, 'the Header record'),
   refusalUnknownQuantizationScheme: (opQuantization, 'the Quantization record'),
+  refusalNonPositiveStepTime: (opQuantization, 'the Quantization record'),
 };
 
 /// Refusals about the eight bytes of the magic itself, which is why neither

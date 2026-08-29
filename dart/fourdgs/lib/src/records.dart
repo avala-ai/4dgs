@@ -274,6 +274,22 @@ class FourdgsQuantization {
       );
     }
     _checkQuantizationMagnitudes(origin, originAt, steps, stepsAt);
+    final double stepTime = steps[6];
+    if (stepTime.isFinite && stepTime <= 0.0) {
+      final int fieldAt = stepsAt + 6 * 8;
+      final String record =
+          fileOffset == 0
+              ? 'the Quantization record'
+              : 'the Quantization record at byte '
+                  '${fileOffset - recordHeaderBytes}';
+      final String where =
+          fileOffset == 0 ? 'content byte $fieldAt' : 'byte $fieldAt';
+      throw FourdgsMalformedFile(
+        '$record has step_time $stepTime at $where; expected a finite value '
+        'greater than 0',
+        refusalCode: refusalNonPositiveStepTime,
+      );
+    }
     // Last, after every mandatory field has been read, for the reason the
     // Header checks its temporal model last: "a scheme this build does not
     // implement" is a statement about a whole record, and a record that ends
@@ -297,7 +313,7 @@ class FourdgsQuantization {
       stepRgb: steps[3],
       stepAlpha: steps[4],
       stepMotion: steps[5],
-      stepTime: steps[6],
+      stepTime: stepTime,
       stepSigmaLog: steps[7],
       stepSh: stepSh,
       bounds: bounds,

@@ -14,6 +14,9 @@ const String refusalUnknownTemporalModel = 'unknown-temporal-model';
 /// The Quantization record names a scheme this build does not implement.
 const String refusalUnknownQuantizationScheme = 'unknown-quantization-scheme';
 
+/// The Quantization record declares a finite birth-time grid pitch at or below zero.
+const String refusalNonPositiveStepTime = 'non-positive-step-time';
+
 /// A stream declares a codec this build does not implement.
 const String refusalUnknownStreamCodec = 'unknown-stream-codec';
 
@@ -25,12 +28,13 @@ const String refusalWindowIndexOutOfRange = 'window-index-out-of-range';
 /// Named constants rather than string literals at the raise sites, because these
 /// are compared across six implementations: a typo in one is a conformance
 /// failure that reads like a decoder bug. This set exists so a test can assert
-/// that a code it saw is one of the six rather than something invented locally.
+/// that a code it saw is one of the seven rather than something invented locally.
 const Set<String> fourdgsRefusalCodes = <String>{
   refusalMagicMismatch,
   refusalUnsupportedMajorVersion,
   refusalUnknownTemporalModel,
   refusalUnknownQuantizationScheme,
+  refusalNonPositiveStepTime,
   refusalUnknownStreamCodec,
   refusalWindowIndexOutOfRange,
 };
