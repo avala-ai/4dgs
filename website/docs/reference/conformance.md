@@ -24,7 +24,7 @@ the decode harness matches fragments to select runners, and the encode gate make
 per-band-depth pass only when the name contains `SHDegree`. Most variants sit at the top of `data/`;
 three families live in subdirectories — `data/keyframe/`, `data/object/` and `data/invalid/` — and a
 variant there is named with its directory as a prefix. Today that is 48 valid variants at the top
-level, 5 keyframe-delta, 10 object-layer and 7 invalid.
+level, 5 keyframe-delta, 10 object-layer and 9 invalid.
 
 ## The corpus is generated, not committed
 
@@ -184,7 +184,7 @@ argument. It must exit zero and print one JSON object:
 `protocol` is the integer `1`; a boolean is rejected even though Python normally compares `true`
 equal to `1`. `readPath` is `streamed` or `indexed`, and `name` must be exactly
 `<family>/decode_<readPath>`. `family` may be omitted when it is the part of `name` before the first
-slash. `refusals` defaults to false and says whether the runner answers all seven invalid variants.
+slash. `refusals` defaults to false and says whether the runner answers all nine invalid variants.
 `declines` defaults to an empty list and contains nonempty variant-name fragments for known valid
 features the runner does not implement. `exactAggregates` and `canonicalStateOrder` default to false
 and opt into strict comparison of exact root/state totals and composed-state samples. During the
@@ -322,16 +322,16 @@ runner whose name ends in `decode_indexed`. Exactly one valid variant, `TenWindo
 that position, and it is skipped for the indexed path in every language.
 
 The invalid corpus is the exception, deliberately. It is cut from a base file that carries an index
-precisely so that both paths can be asked to refuse all seven, and both are asked. A refusal check
+precisely so that both paths can be asked to refuse all nine, and both are asked. A refusal check
 written into only one read path refuses half the files it should, and there is no other way to
 notice.
 
-Two of the seven do not prove every indexed core. The Python and Rust runners route an unrecognized
+Two of the nine do not prove every indexed core. The Python and Rust runners route an unrecognized
 version prefix to their indexed opener, so their indexed magic/version checks own `BadMagic` and
 `FutureMajorVersion`. TypeScript instead calls `checkMagic` in its bounded temporal-model probe; C++
 and Swift call `peekTemporalModel` on a whole-file buffer. Those three therefore produce the right
 refusal before their indexed opener is called, and deleting the corresponding check from the indexed
-core can leave both prefix variants green. The other five invalid variants do reach those indexed
+core can leave both prefix variants green. The other seven invalid variants do reach those indexed
 paths. This is a property of how the runners are written rather than of the corpus, which is why it
 is recorded here instead of credited as two-path proof.
 
@@ -406,9 +406,9 @@ and the runner exits 0, because a refusal is a result rather than a crash.
 The identifier matters more than it looks. "Both decoders raised an error" is not agreement: one of
 them may have refused for the wrong reason, which is precisely the failure a negative test exists to
 catch. The identifier names the rule, and it is the same string in every language. The current
-invalid corpus uses six, declared as constants in `mod refusal` in
+invalid corpus uses seven, declared as constants in `mod refusal` in
 [`rust/fourdgs/src/error.rs`](https://github.com/avala-ai/4dgs/blob/main/rust/fourdgs/src/error.rs)
-and gathered as `CODES` in `invalid.py`. That registry is closed for these seven expectations: a
+and gathered as `CODES` in `invalid.py`. That registry is closed for these nine expectations: a
 runner may not substitute another identifier for them, and a new invalid-corpus refusal is added
 there rather than invented in one language. Other features have their own named refusals —
 keyframe-delta includes `depth-mismatch`, for example — and future corpus families may exercise
@@ -421,36 +421,38 @@ those without adding them to `invalid.CODES`.
 | `UnknownTemporalModel`      | `unknown-temporal-model`      | the Header names a temporal model this build does not implement        | registry |
 | `EmptyTemporalModel`        | `unknown-temporal-model`      | the Header's temporal model is the empty string                        | registry |
 | `UnknownQuantizationScheme` | `unknown-quantization-scheme` | the Quantization record names a scheme this build does not implement   | registry |
+| `ZeroStepTime`              | `non-positive-step-time`      | the birth-time quantization grid has zero spacing                      | §5.3     |
+| `NegativeStepTime`          | `non-positive-step-time`      | the birth-time quantization grid has negative spacing                  | §5.3     |
 | `UnknownStreamCodec`        | `unknown-stream-codec`        | an attribute stream declares a codec this build does not implement     | §5.5     |
 | `WindowIndexOutOfRange`     | `window-index-out-of-range`   | a gaussian's `window_index` names a row the Window Table does not have | §5.4     |
 
-Seven variants, six identifiers, and the pair that shares one is not redundant. An unknown name is
-what a _future_ writer produces; the empty string is what a struct left at its zero value produces,
-which is the shape a **bug** writes. Two SDKs in this repository disagreed about exactly that — one
-defaulted the field to `gaussian-birth`, the other left it blank — and nothing inside either
-language could see it. The two files break the same rule from opposite directions, and a reader must
-refuse both under the same name. A useful side effect: the identifier cannot be derived from the
-variant name, which is as it should be, since it names the rule and not the file.
+Nine variants use seven identifiers, and neither shared pair is redundant. An unknown temporal-model
+name is what a _future_ writer produces; the empty string is what a struct left at its zero value
+produces, which is the shape a **bug** writes. Zero and a negative `step_time` separately pin the
+strict boundary and the forbidden side of the same positive-spacing rule. Each pair breaks one rule
+from different directions and must be refused under one name. A useful side effect: the identifier
+cannot be derived from the variant name, which is as it should be, since it names the rule and not
+the file.
 
-For the current invalid corpus, only an error carrying the expected one of those six identifiers is
-a refusal answer. More generally, a named refusal is an answer only when the expectation names it.
-If decoding fails without one — a truncated transport, an I/O error, an ordinary parse failure — the
-runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In particular,
-`{"refused": ""}` is not the representation of an unnamed error: it exits zero and therefore claims
-the runner produced a valid answer, even though the empty string is not an identifier the format
-defines. All six built-in runners preserve this split: each answers only for an error its package
-names with a refusal identifier, and writes anything else to stderr with a non-zero exit. The
-handling that does not — catching the package's error type, substituting `""` for a missing code and
-exiting zero — misclassifies an unnamed decoder error as an answered refusal. An empty identifier
-matches none of today's invalid expectations, so it is red there, but the misclassification is a
-runner defect, not an alternative protocol. An outside implementation that cannot name a decoder
-error must fail the invocation rather than copy those empty refusals.
+For the current invalid corpus, only an error carrying the expected one of those seven identifiers
+is a refusal answer. More generally, a named refusal is an answer only when the expectation names
+it. If decoding fails without one — a truncated transport, an I/O error, an ordinary parse failure —
+the runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In
+particular, `{"refused": ""}` is not the representation of an unnamed error: it exits zero and
+therefore claims the runner produced a valid answer, even though the empty string is not an
+identifier the format defines. All six built-in runners preserve this split: each answers only for
+an error its package names with a refusal identifier, and writes anything else to stderr with a
+non-zero exit. The handling that does not — catching the package's error type, substituting `""` for
+a missing code and exiting zero — misclassifies an unnamed decoder error as an answered refusal. An
+empty identifier matches none of today's invalid expectations, so it is red there, but the
+misclassification is a runner defect, not an alternative protocol. An outside implementation that
+cannot name a decoder error must fail the invocation rather than copy those empty refusals.
 
 For built-ins, whether any of this runs is gated at family granularity by `REFUSAL_FAMILIES`, which
 today holds every built-in family: `python`, `rust`, `typescript`, `cpp`, `swift` and `dart`. None
-of them skips the invalid corpus. A family absent from the set skips all seven invalid variants, and
+of them skips the invalid corpus. A family absent from the set skips all nine invalid variants, and
 the feature matrix is where that shows up publicly. An out-of-tree runner makes the same claim with
-`"refusals": true` in its capabilities object, so it needs no harness edit and is held to all seven
+`"refusals": true` in its capabilities object, so it needs no harness edit and is held to all nine
 or none of them.
 
 The Python and Rust **indexed** runners inspect the version prefix before Header dispatch. If it is
@@ -463,15 +465,16 @@ without asking dispatch code to parse an unrecognized layout.
 For a recognized version-1 file, the Header pre-read is still dispatch rather than the validation
 this suite credits. Mutation pins that distinction: deleting `check_magic` from either indexed
 opener turns exactly the two prefix variants red; deleting its temporal-model or quantization-scheme
-check turns their variants red; and deleting the shared window-index or stream-codec check turns the
-corresponding variant red on both paths. The streamed runners still validate magic while selecting
-the streamed decoder; this claim is about the indexed path.
+check turns their variants red; deleting the positive `step_time` check turns both grid-spacing
+variants red; and deleting the shared window-index or stream-codec check turns the corresponding
+variant red on both paths. The streamed runners still validate magic while selecting the streamed
+decoder; this claim is about the indexed path.
 
-Every rule in this corpus already existed in version 1 — nothing here is new specification, so the
-contract is proved against rules that predate it. It found three real faults on its first run:
-neither an unknown `temporal_model` nor an unknown quantization `scheme` was refused at all, both
-decoding silently as the known value, and a corrupt first byte was reported as an unsupported
-version 1.
+Every rule in this corpus belongs to version 1. The harness itself was proved against rules that
+predated it; later witnesses may follow a normative clarification without inventing a new format
+revision in the generator. The first run found three real faults: neither an unknown
+`temporal_model` nor an unknown quantization `scheme` was refused at all, both decoding silently as
+the known value, and a corrupt first byte was reported as an unsupported version 1.
 
 Truncation is deliberately not here. A cut file is recoverable rather than refusable, so no
 expectation can express it. The **streamed** runners in this repository make their own truncated

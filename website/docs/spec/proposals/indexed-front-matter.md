@@ -310,7 +310,7 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   `Chunk Index`, with `summary_start` adjusted. Every other byte is a conforming file: the index is
   correct, the summary CRC is correct, and both read paths currently open it without complaint.
 - **What it asserts:** a streamed decode MUST refuse, naming opcode `0x25` and the record's byte
-  offset. It joins the seven files already in `data/invalid/`, which are all single-value refusals —
+  offset. It joins the nine files already in `data/invalid/`, which are all single-value refusals —
   a bad magic, an unknown scheme, a window index out of range — so a record-position refusal is a
   new shape for that directory rather than a variation on one already there.
 - **The rest of the positional family is independently pinned.** Add `LateCoordinateFrame`,

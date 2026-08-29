@@ -54,6 +54,9 @@ def test_non_positive_step_time_refusal_witnesses_change_only_the_field():
     witnesses = {refusal.name: refusal.mutate(base) for refusal in invalid.STEP_TIME_REFUSALS}
 
     assert {refusal.code for refusal in invalid.STEP_TIME_REFUSALS} == {"non-positive-step-time"}
+    assert {refusal.name for refusal in invalid.STEP_TIME_REFUSALS} <= {refusal.name for refusal in invalid.REFUSALS}, (
+        "the witnesses must remain active in the all-or-none invalid corpus"
+    )
     assert struct.unpack_from("<d", witnesses["ZeroStepTime"], field) == (0.0,)
     assert struct.unpack_from("<d", witnesses["NegativeStepTime"], field) == (-0.004,)
     for mutated in witnesses.values():
