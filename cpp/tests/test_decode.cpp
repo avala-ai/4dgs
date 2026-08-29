@@ -65,9 +65,9 @@ const char* kVariants[] = {
 /// from a stream this package failed to surface.
 const char* kMembershipVariant = "LongLived-UseChunkIndex-UseCrc-WithObjects";
 
-/// The invalid corpus, and the identifier the specification's refusal table gives each
-/// variant. Seven files, six identifiers: an empty temporal model and an unrecognized one are
-/// the same refusal, because a declaration of nothing is not a default.
+/// The original invalid corpus, and the identifier the specification's refusal table gives each
+/// variant. Its seven files use six identifiers: an empty temporal model and an
+/// unrecognized one are the same refusal, because a declaration of nothing is not a default.
 ///
 /// Named here rather than read from the expectation JSON, so this test states the mapping
 /// instead of agreeing with whatever the harness happens to hold.

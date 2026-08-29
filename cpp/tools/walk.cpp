@@ -16,8 +16,8 @@
 /// Front matter is located from framing alone. A refusal that lives inside a chunk's streams is
 /// located by decoding chunks one at a time until one of them refuses, which is also the only
 /// way to *find* those refusals at all — the framing walk steps over a chunk by its declared
-/// length and never looks inside it, which is why a framing-only validator calls two of the
-/// invalid corpus's seven files clean.
+/// length and never looks inside it, which is why a framing-only validator calls the invalid
+/// corpus's chunk-local files clean.
 
 #include <cstdio>
 #include <cstring>

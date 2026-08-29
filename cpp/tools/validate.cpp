@@ -31,8 +31,8 @@
 ///   Python's word for word; the identifier goes on a line of its own beneath the finding it
 ///   belongs to. Python's exceptions carry the same `code` — its CLI simply does not print it.
 /// * **It decodes the chunks.** A framing walk steps over a chunk by its declared length, so a
-///   fault inside a chunk's streams is invisible to it; two of the invalid corpus's seven files
-///   are exactly that, and Python calls them clean.
+///   fault inside a chunk's streams is invisible to it; two invalid corpus files are exactly
+///   that, and Python calls them clean.
 /// * **It knows `keyframe-delta`.** Python reports a conforming keyframe-delta file as invalid,
 ///   because its structural checks assume the gaussian-birth chunk shape. The core implements
 ///   the model — the conformance suite proves it — so refusing a file for declaring it was never
