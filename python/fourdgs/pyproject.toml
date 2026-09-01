@@ -22,7 +22,7 @@ zstd = ["zstandard>=0.22"]
 # a lower bound at OpenUSD 26.03, the release that shipped the ParticleField3DGaussianSplat
 # schema this bridge targets.
 usd = ["usd-core>=26.3"]
-dev = ["pytest>=8", "ruff==0.16.0"]
+dev = ["pytest>=8", "ruff==0.16.5"]
 
 [project.scripts]
 fourdgs = "fourdgs.cli:main"
