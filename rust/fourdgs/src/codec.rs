@@ -135,7 +135,7 @@ fn exact<R: Read>(mut source: R, expected: usize, name: &str) -> Result<Vec<u8>>
         let want = (expected - out.len()).min(BLOCK);
         let got = source
             .read(&mut block[..want])
-            .map_err(|e| decompression_read_error(name, e))?;
+            .map_err(|e| decompression_read_error(name, e, out.len(), expected))?;
         if got == 0 {
             return Err(Error::Truncated(format!(
                 "a {name} stream ended after {} bytes; the header declared {expected}",
@@ -165,11 +165,21 @@ fn exact<R: Read>(mut source: R, expected: usize, name: &str) -> Result<Vec<u8>>
         Ok(_) => Err(Error::Malformed(format!(
             "a {name} stream decompressed to more than the {expected} bytes its header declared"
         ))),
-        Err(e) => Err(decompression_read_error(name, e)),
+        Err(e) => Err(decompression_read_error(name, e, out.len(), expected)),
     }
 }
 
-fn decompression_read_error(name: &str, error: std::io::Error) -> Error {
+fn decompression_read_error(
+    name: &str,
+    error: std::io::Error,
+    decoded: usize,
+    expected: usize,
+) -> Error {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        return Error::Truncated(format!(
+            "a {name} stream ended after {decoded} bytes before its compressed framing completed; the header declared {expected}"
+        ));
+    }
     if name == "zstd"
         && error
             .to_string()
@@ -264,6 +274,15 @@ mod tests {
             error.to_string().contains("decoded-stream ceiling"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn incomplete_compressed_framing_is_truncated() {
+        let encoded = compress(&[0x5a], DEFLATE, 6).expect("one-byte deflate stream");
+        let error = decompress(&encoded[..encoded.len() - 1], DEFLATE, 1).unwrap_err();
+
+        assert!(matches!(error, Error::Truncated(_)), "{error}");
+        assert!(error.to_string().contains("header declared 1"), "{error}");
     }
 
     #[cfg(feature = "zstd")]
