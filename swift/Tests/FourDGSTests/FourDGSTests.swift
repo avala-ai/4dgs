@@ -306,7 +306,8 @@ final class RefusalTests: XCTestCase {
             RefusalCode.allCases.map(\.rawValue),
             [
                 "magic-mismatch", "unsupported-major-version", "unknown-temporal-model",
-                "unknown-quantization-scheme", "unknown-stream-codec", "window-index-out-of-range",
+                "unknown-quantization-scheme", "non-positive-step-time", "unknown-stream-codec",
+                "window-index-out-of-range",
             ])
     }
 

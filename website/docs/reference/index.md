@@ -9,10 +9,10 @@ harness skips the rest —
 — and this table is kept in lockstep with what runs. Nothing is marked `Yes` on the strength of code
 existing.
 
-Every row is filled in from a suite that runs: 48 valid variants and 7 invalid ones, plus 5
+Every row is filled in from a suite that runs: 48 valid variants and 9 invalid ones, plus 5
 keyframe-delta and 10 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records. Every language layer runs 139 checks; while the canonical-state stack is
+is what this table records. Every language layer runs 143 checks; while the canonical-state stack is
 landing, a capability-gated comparison omits only exact totals and composed-state samples from SDKs
 whose implementations have not landed yet. It never skips a variant or weakens unrelated fields. C++
 and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor computes
@@ -388,18 +388,18 @@ implemented: it checks both temporal models with bounded range reads, composes k
 identity history, and reports a structurally clean file as valid.
 
 **Rust**'s `Yes` on that row is marked from `rust/cli/tests/smoke.rs`, and the assertion that earns
-it is `every_invalid_variant_is_refused_by_its_own_identifier`: each of the seven invalid variants
-must be refused **by the identifier the corpus declares for it** and include a byte location, and
-the expectation is read out of the corpus rather than written into the test. "Both readers raised an
-error" is not the property — a reader that refuses all seven for the wrong reason passes a test that
-only checks the exit code, and that is the failure the invalid corpus exists to catch.
+it is `every_invalid_variant_is_refused_by_its_own_identifier`: each invalid variant must be refused
+**by the identifier the corpus declares for it** and include a byte location, and the expectation is
+read out of the corpus rather than written into the test. "Both readers raised an error" is not the
+property — a reader that refuses every file for the wrong reason passes a test that only checks the
+exit code, and that is the failure the invalid corpus exists to catch.
 
-**C++** is `Partial`. `cpp/tests/test_tool.cpp` reads the seven invalid expectations from the corpus
-and requires the tool to name each identifier and include a byte location. Separate mutation tests
-prove chunk and SH-band decoding, framing and truncation diagnostics, streamed keyframe-delta
-validation, and lifetime-identity accounting. Representative indexed keyframe-delta and indexed
-gaussian-birth files are accepted too, so a tool that refuses every input cannot pass; the current
-mutations do not yet pin an indexed-only malformed-payload rejection.
+**C++** is `Partial`. `cpp/tests/test_tool.cpp` reads every invalid expectation from the corpus and
+requires the tool to name each identifier and include a byte location. Separate mutation tests prove
+chunk and SH-band decoding, framing and truncation diagnostics, streamed keyframe-delta validation,
+and lifetime-identity accounting. Representative indexed keyframe-delta and indexed gaussian-birth
+files are accepted too, so a tool that refuses every input cannot pass; the current mutations do not
+yet pin an indexed-only malformed-payload rejection.
 
 Known partial boundaries include the following; this is not an exhaustive acceptance contract.
 Indexed gaussian-birth validation returns an incomplete verdict for a Footer extended beyond its

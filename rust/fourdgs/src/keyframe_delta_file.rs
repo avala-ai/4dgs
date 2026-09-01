@@ -1710,7 +1710,9 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 }
             }
             op::QUANTIZATION => {
-                let parsed = rec::Quantization::parse(record.content)?;
+                let parsed = rec::Quantization::parse(record.content).map_err(|error| {
+                    error.at_record("Quantization record", record.offset as u64)
+                })?;
                 crate::registry::check_quantization_scheme(&parsed.scheme)?;
                 if !state_seen {
                     quant = Some(parsed);
@@ -2185,7 +2187,8 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
                     content_length,
                     "Quantization",
                 )?;
-                let parsed = rec::Quantization::parse(&content)?;
+                let parsed = rec::Quantization::parse(&content)
+                    .map_err(|error| error.at_record("Quantization record", at))?;
                 crate::registry::check_quantization_scheme(&parsed.scheme)?;
                 quant = Some(parsed);
             }

@@ -283,6 +283,21 @@ void main() {
       },
     );
 
+    test('a non-positive step_time names the Quantization record', () async {
+      for (final double stepTime in <double>[0.0, -0.0, -0.004]) {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(_minimal(stepTime: stepTime)),
+        );
+        final FourdgsNamedRefusal named = _refusals(report).single;
+        expect(named.code, refusalNonPositiveStepTime);
+        expect(named.site!.what, 'the Quantization record');
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(contains('step_time $stepTime')),
+        );
+      }
+    });
+
     test('a truncated file says what survived and where it was cut', () async {
       final Uint8List whole = _minimal();
       final FourdgsValidation report = await validateFourdgs(
@@ -1835,28 +1850,37 @@ void main() {
       expect(text, contains('the Footer frames cleanly but does not parse'));
     });
 
-    test('the seven invalid variants, end to end', () async {
-      // The strongest check available to this tool: six validators read the
-      // same seven files and must place the same seven refusals at the same
-      // seven bytes. The identifier is read out of the corpus's own expectation
-      // file rather than written here, so a test cannot drift away from what
-      // the suite compares — and the offsets are the ones every other SDK's
-      // tool prints for the same bytes.
+    test('every invalid variant, end to end', () async {
+      // The strongest check available to this tool: six validators read every
+      // committed expectation and must place the same refusal at the same byte.
+      // The identifier is read out of the corpus's own expectation file rather
+      // than written per variant, so a test cannot drift away from what the
+      // suite compares — and the offsets are the ones every other SDK's tool
+      // prints for the same bytes.
       const Map<String, int> bytes = <String, int>{
-        'BadMagic': 0,
-        'EmptyTemporalModel': 8,
-        'FutureMajorVersion': 0,
-        'UnknownQuantizationScheme': 154,
-        'UnknownStreamCodec': 659,
-        'UnknownTemporalModel': 8,
-        'WindowIndexOutOfRange': 2506,
+        'magic-mismatch': 0,
+        'unsupported-major-version': 0,
+        'unknown-temporal-model': 8,
+        'unknown-quantization-scheme': 154,
+        'non-positive-step-time': 154,
+        'unknown-stream-codec': 659,
+        'window-index-out-of-range': 2506,
       };
-      for (final MapEntry<String, int> variant in bytes.entries) {
-        final File file = File('$_corpus/invalid/${variant.key}.4dgs');
-        final File expectation = File('$_corpus/invalid/${variant.key}.json');
-        if (!file.existsSync() || !expectation.existsSync()) {
+      final List<File> expectations =
+          Directory('$_corpus/invalid')
+              .listSync()
+              .whereType<File>()
+              .where((File file) => file.path.endsWith('.json'))
+              .toList()
+            ..sort((File a, File b) => a.path.compareTo(b.path));
+      expect(expectations, isNotEmpty);
+      for (final File expectation in expectations) {
+        final String name = expectation.uri.pathSegments.last;
+        final String variant = name.substring(0, name.length - '.json'.length);
+        final File file = File('$_corpus/invalid/$variant.4dgs');
+        if (!file.existsSync()) {
           fail(
-            'the corpus is missing ${variant.key}: run '
+            'the corpus is missing $variant: run '
             '`python3 tests/conformance/generate.py` from the repository root',
           );
         }
@@ -1864,22 +1888,28 @@ void main() {
             (jsonDecode(await expectation.readAsString())
                     as Map<String, Object?>)['refused']!
                 as String;
+        final int? expectedByte = bytes[refusal];
+        expect(
+          expectedByte,
+          isNotNull,
+          reason: '$variant names an unknown refusal',
+        );
         final List<String> out = <String>[];
         final int code = await tool.run(
           <String>['validate', file.path],
           out.add,
           (_) {},
         );
-        expect(code, tool.exitRefused, reason: '${variant.key} must exit 1');
+        expect(code, tool.exitRefused, reason: '$variant must exit 1');
         expect(
           out,
           contains(
             allOf(
-              startsWith('  refusal $refusal at byte ${variant.value} ('),
+              startsWith('  refusal $refusal at byte $expectedByte ('),
               endsWith(')'),
             ),
           ),
-          reason: '${variant.key} must name $refusal at byte ${variant.value}',
+          reason: '$variant must name $refusal at byte $expectedByte',
         );
       }
     });
@@ -2018,6 +2048,7 @@ Uint8List _minimal({
   String temporalModel = 'gaussian-birth',
   String profile = '',
   String scheme = 'uniform-v1',
+  double stepTime = 1.0,
   Uint8List? extra,
   Uint8List? secondHeader,
   int summaryStart = 0,
@@ -2052,6 +2083,7 @@ Uint8List _minimal({
       opQuantization,
       _quantizationContent(
         scheme: scheme,
+        stepTime: stepTime,
         shBitDepths: shBitDepths,
         shBand1Bound: shBand1Bound,
       ),
@@ -3158,6 +3190,7 @@ Uint8List _headerContent({
 
 Uint8List _quantizationContent({
   String scheme = 'uniform-v1',
+  double stepTime = 1.0,
   List<int> shBitDepths = const <int>[],
   String? shBand1Bound,
 }) {
@@ -3166,7 +3199,7 @@ Uint8List _quantizationContent({
     body.add(_f64(0.0)); // pos_origin
   }
   for (int i = 0; i < 8; i++) {
-    body.add(_f64(1.0)); // step_pos .. step_sigma_log
+    body.add(_f64(i == 6 ? stepTime : 1.0));
   }
   body.addByte(1); // step_sh
   final BytesBuilder bounds = BytesBuilder();

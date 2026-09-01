@@ -988,12 +988,28 @@ private func validatePhysicalRecords(
                         } catch {
                             let tableError = asFourDGS(error)
                             if firstFrontMatterError == nil {
-                                firstFrontMatterError = (
-                                    tableError,
-                                    Site(
+                                let site: Site
+                                if tableError.refusalCode == .unknownTemporalModel {
+                                    site = Site(
+                                        offset: header.offset,
+                                        what: "the physical Header record at byte \(header.offset)")
+                                } else if tableError.refusalCode == .unknownQuantizationScheme
+                                    || tableError.refusalCode == .nonPositiveStepTime
+                                {
+                                    site = Site(
+                                        offset: quantization.offset,
+                                        what:
+                                            "the physical Quantization record at byte "
+                                            + "\(quantization.offset)")
+                                } else {
+                                    site = Site(
                                         offset: frame.offset,
                                         what:
                                             "the physical WindowTable record at byte \(frame.offset)")
+                                }
+                                firstFrontMatterError = (
+                                    tableError,
+                                    site
                                 )
                             }
                         }

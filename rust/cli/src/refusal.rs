@@ -344,10 +344,11 @@ impl<'a> Streamed<'a> {
 /// Two shapes of refusal are placed, and they are placed differently because they are found
 /// differently:
 ///
-/// * **Front matter** — an unimplemented temporal model or quantization scheme — is placed
-///   by streaming the framing and asking each Header or Quantization record whether its own
-///   declared value is the refused one. The first that says yes is the record the reader
-///   refused at, in the order the reader met them.
+/// * **Front matter** — an unimplemented temporal model or quantization scheme, or a
+///   non-positive birth-time grid — is placed by streaming the framing and asking each
+///   Header or Quantization record whether its own declared value is the refused one. The
+///   first that says yes is the record the reader refused at, in the order the reader met
+///   them.
 /// * **A chunk's streams** — an unimplemented stream codec, a window index outside the
 ///   table — cannot be found from framing at all, because stepping over a chunk by its
 ///   declared length is exactly not looking inside it. So the file is decoded front to back,
@@ -365,6 +366,9 @@ pub fn locate_streaming(source: &mut dyn Readable, code: &str) -> Option<Site> {
         id::UNKNOWN_TEMPORAL_MODEL => first_declaring(source, op::HEADER, "the Header record"),
         id::UNKNOWN_QUANTIZATION_SCHEME => {
             first_declaring(source, op::QUANTIZATION, "the Quantization record")
+        }
+        id::NON_POSITIVE_STEP_TIME => {
+            first_non_positive_step_time(source, op::QUANTIZATION, "the Quantization record")
         }
         id::UNKNOWN_STREAM_CODEC | id::WINDOW_INDEX_OUT_OF_RANGE => match scan_streamed(source) {
             Err((error, site)) if error.refusal_code() == Some(code) => site,
@@ -433,6 +437,39 @@ fn quantization_declaration_refuses(records: &mut Streamed<'_>, frame: &Frame) -
         .is_some_and(|scheme| fourdgs::registry::check_quantization_scheme(&scheme).is_err())
 }
 
+/// Find the first Quantization record whose fixed-width `step_time` field carries the
+/// refusal, reading only the scheme prefix and those eight bytes rather than an extensible
+/// record's potentially large trailer.
+fn first_non_positive_step_time(source: &mut dyn Readable, opcode: u8, what: &str) -> Option<Site> {
+    let mut records = Streamed::open(source).ok()?;
+    while let Some(frame) = records.next_frame() {
+        if frame.opcode != opcode {
+            continue;
+        }
+        let Some(after_scheme) = skip_string(&mut records, &frame, 0) else {
+            continue;
+        };
+        // Three position-origin doubles, then the seventh of eight step doubles.
+        let Some(step_time_at) = after_scheme.checked_add(3 * 8 + 6 * 8) else {
+            continue;
+        };
+        let Some(raw) = records.range(&frame, step_time_at, 8) else {
+            continue;
+        };
+        let Ok(raw) = raw.try_into() else {
+            continue;
+        };
+        let value = f64::from_le_bytes(raw);
+        if value.is_finite() && value <= 0.0 {
+            return Some(Site {
+                offset: frame.offset,
+                what: what.into(),
+            });
+        }
+    }
+    None
+}
+
 /// The byte a refusal fired at, and what sits there.
 #[derive(Debug, Clone)]
 pub struct Site {
@@ -494,6 +531,11 @@ fn front_matter_site(framing: Option<Framing>, code: &str) -> Option<Site> {
             "the Quantization record",
             quantization_refuses,
         ),
+        id::NON_POSITIVE_STEP_TIME => (
+            op::QUANTIZATION,
+            "the Quantization record",
+            non_positive_step_time_refuses,
+        ),
         _ => return None,
     };
     let framing = framing?;
@@ -523,6 +565,11 @@ fn quantization_refuses(content: &[u8]) -> bool {
     rec::Quantization::parse(content).is_ok_and(|quantization| {
         fourdgs::registry::check_quantization_scheme(&quantization.scheme).is_err()
     })
+}
+
+fn non_positive_step_time_refuses(content: &[u8]) -> bool {
+    rec::Quantization::parse(content)
+        .is_err_and(|error| error.refusal_code() == Some(id::NON_POSITIVE_STEP_TIME))
 }
 
 /// The first chunk that refuses, decoded one chunk at a time.
@@ -993,6 +1040,69 @@ mod tests {
             "the locator read through byte {}, into an appended trailer that starts at {old_end}",
             source.furthest
         );
+    }
+
+    #[test]
+    fn placing_a_non_positive_step_time_reads_only_its_fixed_prefix() {
+        let mut data = valid();
+        let framing = walk(&mut BytesReadable::new(&data)).unwrap();
+        let quantization = framing.first_intact(op::QUANTIZATION).unwrap();
+        let content_at = quantization.offset as usize + RECORD_HEADER_SIZE;
+        let scheme_length = u32::from_le_bytes(
+            data[content_at..content_at + 4]
+                .try_into()
+                .expect("scheme length"),
+        ) as usize;
+        let step_time_at = content_at + 4 + scheme_length + 3 * 8 + 6 * 8;
+        data[step_time_at..step_time_at + 8].copy_from_slice(&(-0.0f64).to_le_bytes());
+
+        // The Quantization record is extensible. Make that concrete: locating a refusal
+        // in its fixed prefix must not fetch this deliberately large future field.
+        let old_end = content_at + quantization.length as usize;
+        let trailer = vec![0xA5; 1024 * 1024];
+        data.splice(old_end..old_end, trailer.iter().copied());
+        data[quantization.offset as usize + 1..content_at]
+            .copy_from_slice(&(quantization.length + trailer.len() as u64).to_le_bytes());
+
+        let mut source = Watched::new(&data);
+        let site = locate_streaming(&mut source, id::NON_POSITIVE_STEP_TIME)
+            .expect("the Quantization record carries the refusing pitch");
+        assert_eq!(site.offset, quantization.offset);
+        assert!(
+            source.furthest <= (step_time_at + 8) as u64,
+            "the locator read through byte {}, past step_time ending at {}",
+            source.furthest,
+            step_time_at + 8
+        );
+    }
+
+    #[test]
+    fn describing_a_non_positive_step_time_places_the_quantization_record() {
+        let mut data = valid();
+        let walk = walk(&mut BytesReadable::new(&data)).unwrap();
+        let quantization = walk.first_intact(op::QUANTIZATION).unwrap();
+        let content_at = quantization.offset as usize + RECORD_HEADER_SIZE;
+        let scheme_length = u32::from_le_bytes(
+            data[content_at..content_at + 4]
+                .try_into()
+                .expect("scheme length"),
+        ) as usize;
+        let step_time_at = content_at + 4 + scheme_length + 3 * 8 + 6 * 8;
+        data[step_time_at..step_time_at + 8].copy_from_slice(&0.0f64.to_le_bytes());
+
+        let error = fourdgs::read_bytes(&data).expect_err("zero step_time is refused");
+        let fetch = |frame: &Frame| frame.content(&data).map(<[u8]>::to_vec);
+        let named = describe(
+            &error,
+            Some(Framing {
+                walk: &walk,
+                fetch: &fetch,
+            }),
+            None,
+        )
+        .expect("the refusal is named");
+        assert_eq!(named.code, id::NON_POSITIVE_STEP_TIME);
+        assert_eq!(named.site.unwrap().offset, quantization.offset);
     }
 
     #[test]

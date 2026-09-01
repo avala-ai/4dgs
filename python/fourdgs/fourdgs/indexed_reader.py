@@ -225,7 +225,7 @@ def open_indexed(source: Readable) -> IndexedScene:
         elif record.opcode == op.QUANTIZATION:
             if quant is not None:
                 raise duplicate_structural_record("Quantization", record.offset)
-            quant = rec.Quantization.parse(front.content(record))
+            quant = rec.Quantization.parse(front.content(record), record_offset=record.offset)
             check_quantization_scheme(quant.scheme)
         elif record.opcode == op.WINDOW_TABLE:
             # A file may legitimately carry a table with no entries, so emptiness does

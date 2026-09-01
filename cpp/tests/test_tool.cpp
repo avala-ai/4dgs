@@ -3,10 +3,9 @@
 
 /// The `4dgs` tool, over the corpus that already knows the answers.
 ///
-/// The invalid corpus is seven files, each with a `.json` beside it naming the rule it breaks.
-/// That mapping is not restated here: it is read out of the corpus, so this suite cannot drift
-/// into agreeing with a stale copy of itself, and a corpus that grows an eighth variant fails
-/// this suite until the tool has an answer for it.
+/// Every invalid corpus file has a `.json` beside it naming the rule it breaks. That mapping is
+/// not restated here: it is read out of the corpus, so this suite cannot drift into agreeing with
+/// a stale copy of itself, and a corpus that grows fails this suite until the tool has an answer.
 ///
 /// The tool is driven through `fourdgs::tool::run` with argument strings and a pair of streams,
 /// which is the whole tool including its exit codes — no subprocess, so this behaves the same on
@@ -57,8 +56,8 @@ std::filesystem::path corpusDirectory() {
 /// there a missing corpus is a suite that silently did not run.
 bool corpusMissing() {
   // The generated files, not the directory that holds them. `tests/conformance/data/invalid/` is
-  // tracked — the seven `.json` expectations are committed and only the `.4dgs` beside each one
-  // is generated — so a check for the directory answers "present" in a checkout where the
+  // tracked — the `.json` expectations are committed and only the `.4dgs` beside each one is
+  // generated — so a check for the directory answers "present" in a checkout where the
   // generator has never run. This suite then ran against files that were not there and failed,
   // which is the opposite of the local skip the paragraph above promises; it also made the skip
   // untestable, because nothing could make it fire.
@@ -229,6 +228,17 @@ std::vector<std::filesystem::path> variants(const std::filesystem::path& directo
   return out;
 }
 
+std::size_t invalidExpectationCount() {
+  const std::filesystem::path directory = corpusDirectory() / "invalid";
+  if (!std::filesystem::is_directory(directory)) return 0;
+  std::size_t count = 0;
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(directory)) {
+    if (entry.path().extension() == ".json") ++count;
+  }
+  return count;
+}
+
 std::set<std::filesystem::path> identityScratchDirectories() {
   std::set<std::filesystem::path> out;
   std::error_code error;
@@ -256,7 +266,7 @@ void everyInvalidVariantIsRefusedByItsOwnIdentifier() {
   if (corpusMissing()) return;
   if (noDecoder()) return;
   const std::vector<std::filesystem::path> files = variants(corpusDirectory() / "invalid");
-  CHECK_EQ(files.size(), static_cast<std::size_t>(7));
+  CHECK_EQ(files.size(), invalidExpectationCount());
   for (const std::filesystem::path& file : files) {
     const std::string code =
         expectedRefusal(std::filesystem::path(file).replace_extension(".json"));
@@ -267,7 +277,7 @@ void everyInvalidVariantIsRefusedByItsOwnIdentifier() {
     CHECK_EQ(result.code, fourdgs::tool::kExitFailed);
     CHECK(result.outContains("refusal " + code));
     // And the byte, which is the question its holder actually has. Every one of these is
-    // placeable: four in the front matter, two inside a chunk the tool decodes.
+    // placeable, whether the refusal lives in front matter or inside a decoded chunk.
     CHECK(result.outContains("refusal " + code + " at byte "));
     if (!result.outContains("refusal " + code + " at byte ")) {
       std::fprintf(stderr, "  %s said: %s", file.filename().string().c_str(), result.out.c_str());
@@ -2253,6 +2263,25 @@ void aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced() {
   }
 }
 
+void aNonPositiveStepTimeIsPlacedAtItsQuantizationRecord() {
+  Walk walk;
+  walk.representatives.push_back(fourdgs::tool::Frame{fourdgs::tool::op::kQuantization, 117, 100});
+  walk.opcodeCounts[fourdgs::tool::op::kQuantization] = 1;
+  walk.intactOpcodeCounts[fourdgs::tool::op::kQuantization] = 1;
+  const Error refusal(ErrorCode::kMalformed, "the Quantization step_time is not positive",
+                      std::string("non-positive-step-time"));
+
+  const std::optional<Named> named = fourdgs::tool::describe(refusal, &walk, std::nullopt);
+  CHECK(named.has_value());
+  if (!named.has_value()) return;
+  CHECK_EQ(named->code, std::string("non-positive-step-time"));
+  CHECK(named->site.has_value());
+  if (named->site.has_value()) {
+    CHECK_EQ(named->site->offset, static_cast<std::uint64_t>(117));
+    CHECK_EQ(named->site->what, std::string("the Quantization record"));
+  }
+}
+
 void aRecordAfterTheFooterIsReportedWithoutMovingTheVerdict() {
   // Spec section 4: the Footer MUST be the last record. Neither the Python reference validator
   // nor the Rust one checks it, so this is a note — the fact is reported and the verdict stays
@@ -2345,7 +2374,7 @@ void aBandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord() {
   const Run result = run({"validate", patched.string()});
   CHECK_EQ(result.code, fourdgs::tool::kExitFailed);
   // Exact equality on the identifier, read from the corpus rather than restated here — this is
-  // the same string the seven invalid variants are compared by.
+  // the same string the invalid variants are compared by.
   const std::string expected =
       expectedRefusal(corpusDirectory() / "invalid" / "UnknownStreamCodec.json");
   CHECK_EQ(expected, std::string("unknown-stream-codec"));
@@ -2422,6 +2451,7 @@ void runTests() {
   aShortReadIsTruncationRatherThanAnInventedRecord();
   aFramingTransportFailureIsNotReportedAsAFileCut();
   aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced();
+  aNonPositiveStepTimeIsPlacedAtItsQuantizationRecord();
   aRecordAfterTheFooterIsReportedWithoutMovingTheVerdict();
   aBandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord();
   commasMatchThePythonToolsThousandsSeparator();

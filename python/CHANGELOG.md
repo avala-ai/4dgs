@@ -8,6 +8,12 @@ All notable changes to the Python package are documented here, following
 
 ### Changed
 
+- **A finite `step_time` of zero or less is refused as `non-positive-step-time` before
+  dequantization.** The birth-time grid formula divides by this field. Zero therefore made Python
+  propagate NaN into every reconstructed birth time while another SDK threw, and a negative value
+  made the grid pitch negative. Both read paths now name the Quantization record, field, value and
+  byte and require a value greater than zero. Positive and negative zero are both refused.
+
 - **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
   at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
   already the intent, but no sentence made it a refusal and both read paths quietly guessed —

@@ -331,7 +331,7 @@ def validate(data: bytes) -> Report:
                 if problem is not None:
                     report.error(problem)
             elif record.opcode == op.QUANTIZATION:
-                quant = rec.Quantization.parse(record.content)
+                quant = rec.Quantization.parse(record.content, record_offset=record.offset)
                 # Checked here, as the record is met, rather than once at the end on
                 # whichever copy survived the loop. See `_check_quantization_finite`.
                 _check_quantization_finite(quant, report, quant_count)
@@ -899,7 +899,7 @@ def _check_compatibility_records(
                         code="wrong-temporal-model",
                     )
             else:
-                check_quantization_scheme(rec.Quantization.parse(content).scheme)
+                check_quantization_scheme(rec.Quantization.parse(content, record_offset=frame.offset).scheme)
     except FourdgsError as exc:
         report.refused("a seeking reader cannot open this file: ", exc, walk, gate_site)
         return False

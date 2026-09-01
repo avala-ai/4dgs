@@ -10,7 +10,7 @@
 /// exception is thrown where the value was parsed, not where its bytes sit, and
 /// by then the record's position is several frames up the stack.
 ///
-/// So the tool supplies it. The refusal vocabulary is six identifiers, each of
+/// So the tool supplies it. The refusal vocabulary is seven identifiers, each of
 /// which is about exactly one kind of record, and a framing walk knows where
 /// every record is. That is the whole mechanism: walk the framing, ask which
 /// record this refusal is about, name the byte.
@@ -266,6 +266,7 @@ class FourdgsNamedRefusal {
 const Map<String, (int, String)> _frontMatter = <String, (int, String)>{
   refusalUnknownTemporalModel: (opHeader, 'the Header record'),
   refusalUnknownQuantizationScheme: (opQuantization, 'the Quantization record'),
+  refusalNonPositiveStepTime: (opQuantization, 'the Quantization record'),
 };
 
 /// Refusals about the eight bytes of the magic itself, which is why neither

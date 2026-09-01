@@ -18,7 +18,7 @@
 /// here would make the tool a second implementation of the format that could disagree with the
 /// decoder it ships beside. So the checks below are the ones that need no parser — framing, the
 /// records a file must carry, where the index points, the summary checksum — plus everything
-/// the reader itself decides, which is where the six named refusals live.
+/// the reader itself decides, which is where the seven named refusals live.
 ///
 /// The consequence is worth stating plainly: on a file this tool calls valid, Python may still
 /// have something to say. It reports a subset of Python's findings and never a finding Python
@@ -31,8 +31,8 @@
 ///   Python's word for word; the identifier goes on a line of its own beneath the finding it
 ///   belongs to. Python's exceptions carry the same `code` — its CLI simply does not print it.
 /// * **It decodes the chunks.** A framing walk steps over a chunk by its declared length, so a
-///   fault inside a chunk's streams is invisible to it; two of the invalid corpus's seven files
-///   are exactly that, and Python calls them clean.
+///   fault inside a chunk's streams is invisible to it; two invalid corpus files are exactly
+///   that, and Python calls them clean.
 /// * **It knows `keyframe-delta`.** Python reports a conforming keyframe-delta file as invalid,
 ///   because its structural checks assume the gaussian-birth chunk shape. The core implements
 ///   the model — the conformance suite proves it — so refusing a file for declaring it was never
@@ -148,7 +148,8 @@ std::string hex2(std::uint8_t value) {
 /// The two checks only a reader can perform: open the file, then decode it.
 ///
 /// Opening it the way a seeking client would is where the front-matter refusals fire — an
-/// unimplemented temporal model, an unimplemented quantization scheme. Decoding the chunks is
+/// unimplemented temporal model, an unimplemented quantization scheme, or a non-positive
+/// birth-time grid. Decoding the chunks is
 /// where the rest do, and there is no substitute for it: the framing walk steps over a chunk by
 /// its declared length, so an unimplemented stream codec and an out-of-range window index are
 /// both invisible to everything before this point. Both are in the invalid corpus.

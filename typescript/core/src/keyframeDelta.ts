@@ -999,7 +999,7 @@ export async function decodeKeyframeDeltaStreamed(
         );
       }
     } else if (record.opcode === Opcode.Quantization) {
-      quantization = parseQuantization(record.content);
+      quantization = parseQuantization(record.content, record.offset);
       checkQuantizationScheme(quantization.scheme);
     } else if (record.opcode === Opcode.WindowTable) {
       windows = parseWindowTable(record.content);
@@ -1523,7 +1523,7 @@ export class KeyframeDeltaIndexedDecoder {
         }
       } else if (record.opcode === Opcode.Quantization) {
         checkFetchedFrontMatterSize(record);
-        quantization = parseQuantization(await front.content(record));
+        quantization = parseQuantization(await front.content(record), record.offset);
         checkQuantizationScheme(quantization.scheme);
       } else if (record.opcode === Opcode.WindowTable) {
         checkFetchedFrontMatterSize(record);
@@ -1725,7 +1725,7 @@ export async function decodeKeyframeDeltaIndexed(
     if (record.opcode === Opcode.Header) {
       header = parseHeader(record.content);
     } else if (record.opcode === Opcode.Quantization) {
-      quantization = parseQuantization(record.content);
+      quantization = parseQuantization(record.content, record.offset);
       checkQuantizationScheme(quantization.scheme);
     } else if (record.opcode === Opcode.WindowTable) {
       windows = parseWindowTable(record.content);

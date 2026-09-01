@@ -349,6 +349,7 @@ class TestTheInvalidCorpus:
         expected_opcode = {
             "unknown-temporal-model": op.HEADER,
             "unknown-quantization-scheme": op.QUANTIZATION,
+            "non-positive-step-time": op.QUANTIZATION,
             "unknown-stream-codec": op.CHUNK,
             "window-index-out-of-range": op.CHUNK,
         }

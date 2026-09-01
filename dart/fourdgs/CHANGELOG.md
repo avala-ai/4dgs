@@ -4,6 +4,16 @@ All notable changes to the Dart package are documented here, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Readers refuse a finite `Quantization.step_time` at or below zero by name.** Both front-to-back
+  and indexed opens return `non-positive-step-time`, including for either sign of zero, and the
+  validator preserves the identifier and the Quantization record byte. A zero pitch makes birth-time
+  grid selection evaluate `0 / 0`; a negative pitch reverses the grid and gives different readers
+  room to reconstruct different state.
+
 ## [0.2.0] - 2026-08-17
 
 ### Fixed

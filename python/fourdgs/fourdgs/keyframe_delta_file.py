@@ -837,7 +837,7 @@ def decode_streamed(data: bytes) -> DecodedSequence:
                     code="wrong-temporal-model",
                 )
         elif record.opcode == op.QUANTIZATION:
-            quant = rec.Quantization.parse(record.content)
+            quant = rec.Quantization.parse(record.content, record_offset=record.offset)
         elif record.opcode == op.WINDOW_TABLE:
             windows = rec.WindowTable.parse(record.content).windows
         elif record.opcode == op.CHUNK:
@@ -929,7 +929,7 @@ def open_indexed(data: bytes) -> IndexedSequence:
         if record.opcode == op.HEADER:
             header = rec.Header.parse(record.content)
         elif record.opcode == op.QUANTIZATION:
-            quant = rec.Quantization.parse(record.content)
+            quant = rec.Quantization.parse(record.content, record_offset=record.offset)
         elif record.opcode == op.WINDOW_TABLE:
             windows = rec.WindowTable.parse(record.content).windows
         elif record.opcode == op.FOOTER:
@@ -1468,7 +1468,7 @@ def scan_indexed(
             if record.opcode == op.HEADER:
                 header = rec.Header.parse(record.content)
             elif record.opcode == op.QUANTIZATION:
-                quantization = rec.Quantization.parse(record.content)
+                quantization = rec.Quantization.parse(record.content, record_offset=record.offset)
             elif record.opcode in (op.CHUNK, op.DELTA_CHUNK):
                 break
         if header is None or quantization is None:
@@ -1668,7 +1668,7 @@ def scan_streamed(
                 declared_degree = parsed_header.sh_degree
             continue
         if record.opcode == op.QUANTIZATION:
-            quantization = rec.Quantization.parse(record.content)
+            quantization = rec.Quantization.parse(record.content, record_offset=record.offset)
             continue
         if record.opcode == op.WINDOW_TABLE:
             windows = rec.WindowTable.parse(record.content).windows

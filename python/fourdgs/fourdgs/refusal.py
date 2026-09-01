@@ -9,10 +9,9 @@ value was found and what was expected. What neither of them carries is the **off
 exception is raised where the value was parsed, not where its bytes sit, and by then the
 record's position is several frames up the stack.
 
-So the tool supplies it. The refusal vocabulary the corpus compares is six identifiers,
-each of which is about exactly one kind of record, and a framing walk knows where every
-record is. That is the whole mechanism: walk the framing, ask which record this refusal is
-about, print the byte.
+So the tool supplies it. Each identifier in the refusal vocabulary is about exactly one
+kind of record, and a framing walk knows where every record is. That is the whole
+mechanism: walk the framing, ask which record this refusal is about, print the byte.
 
 Front matter is located from the framing and the bytes it frames: which record, and then
 which record *of that kind*, since nothing forbids a second Header and a reader refuses at
@@ -20,7 +19,7 @@ the first one carrying a value it does not implement. A refusal that lives insid
 streams is located by decoding chunks one at a time until one of them refuses, which is
 also the only way to *find* those refusals at all — the framing walk steps over a chunk by
 its declared length and never looks inside it, which is why the framing-only validator
-called two of the invalid corpus's seven files clean.
+called two invalid corpus files clean.
 
 Nothing here holds more than one chunk. That is not an optimization: the files this tool
 exists for are the ones nobody can afford to hold, and a validator that answers "do the
@@ -265,6 +264,7 @@ def _quantization_refuses(content: bytes) -> bool:
 _FRONT_MATTER: dict[str, tuple[int, str, Callable[[bytes], bool]]] = {
     "unknown-temporal-model": (op.HEADER, "the Header record", _header_refuses),
     "unknown-quantization-scheme": (op.QUANTIZATION, "the Quantization record", _quantization_refuses),
+    "non-positive-step-time": (op.QUANTIZATION, "the Quantization record", _quantization_refuses),
 }
 
 #: Refusals about the eight bytes of the magic itself, which is why neither needs a walk
@@ -466,7 +466,7 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
                 cutoff = header.cutoff
                 declared_degree = int(header.sh_degree)
             elif frame.opcode == op.QUANTIZATION:
-                quant = rec.Quantization.parse(content)
+                quant = rec.Quantization.parse(content, record_offset=frame.offset)
             elif frame.opcode == op.WINDOW_TABLE:
                 windows = rec.WindowTable.parse(content).windows
         except FourdgsError:

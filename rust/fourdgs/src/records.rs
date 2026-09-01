@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::error::{Error, Result};
+use crate::error::{refusal, Error, RefusalKind, Result};
 use crate::opcode as op;
 use crate::serialization::{
     put_blob, put_f32s, put_f64, put_f64s, put_record, put_str_map, put_string, put_u16, put_u32,
@@ -331,7 +331,19 @@ impl Quantization {
         let mut c = Cursor::new(content);
         let scheme = c.string()?;
         let pos_origin = c.f64s(3)?;
+        let steps_at = c.position();
         let steps = c.f64s(8)?;
+        let step_time = steps[6];
+        if step_time.is_finite() && step_time <= 0.0 {
+            return Err(Error::refused(
+                refusal::NON_POSITIVE_STEP_TIME,
+                RefusalKind::Malformed,
+                format!(
+                    "Quantization has step_time {step_time:?} at content byte {}; expected a finite value greater than 0",
+                    steps_at + 6 * std::mem::size_of::<f64>()
+                ),
+            ));
+        }
         let step_sh = c.u8()?;
         let bounds = c.str_map()?;
         let tail = c.rest();
@@ -360,7 +372,7 @@ impl Quantization {
             step_rgb: steps[3],
             step_alpha: steps[4],
             step_motion: steps[5],
-            step_time: steps[6],
+            step_time,
             step_sigma_log: steps[7],
             step_sh,
             bounds,

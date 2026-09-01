@@ -63,7 +63,7 @@ void voidResultReportsBothWays() {
 /// The refusal identifier is optional, and absent is a real answer.
 ///
 /// `code` says what kind of thing went wrong and `refusal` says which rule fired, so the two
-/// are not the same field: `kUnsupported` alone covers three of the six named refusals, and
+/// are not the same field: `kUnsupported` alone covers three of the seven named refusals, and
 /// plenty of genuine failures — a truncated file, a transport that gave up — name no rule at
 /// all. Absent is therefore not "no error"; `Result::ok()` is what answers that.
 void refusalIsOptionalAndTravelsWithTheError() {

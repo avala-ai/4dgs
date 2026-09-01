@@ -345,9 +345,16 @@ fn validate_checked(data: &[u8]) -> Result<Report> {
             }
             op::QUANTIZATION
                 if refusing_quantization.is_none()
-                    && rec::Quantization::parse(content).is_ok_and(|quantization| {
-                        fourdgs::registry::check_quantization_scheme(&quantization.scheme).is_err()
-                    }) =>
+                    && rec::Quantization::parse(content).map_or_else(
+                        |error| {
+                            error.refusal_code()
+                                == Some(fourdgs::error::refusal::NON_POSITIVE_STEP_TIME)
+                        },
+                        |quantization| {
+                            fourdgs::registry::check_quantization_scheme(&quantization.scheme)
+                                .is_err()
+                        },
+                    ) =>
             {
                 refusing_quantization = Some(frame);
             }

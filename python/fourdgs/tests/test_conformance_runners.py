@@ -29,17 +29,22 @@ import fourdgs
 import numpy as np
 import pytest
 from fourdgs.exceptions import MalformedFile, TruncatedFile
+from fourdgs.indexed_reader import open_indexed
+from fourdgs.readable import BytesReadable
 
 CONFORMANCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "conformance")
+INVALID_GENERATOR = os.path.join(CONFORMANCE, "..", "..", "tests", "conformance", "generator")
 RUNNERS = ("decode_streamed.py", "decode_indexed.py")
 
 #: The runners are scripts beside the package rather than part of it, so the classifier
 #: they share is imported the way they import each other.
 sys.path.insert(0, CONFORMANCE)
+sys.path.insert(0, INVALID_GENERATOR)
+import invalid
 from refusal import CODES, refusal_answer
 
 #: Too short to hold the magic: a truncated transport, which is a real decode failure and
-#: one the six identifiers deliberately do not name. Both read paths reach it — the
+#: one the named identifiers deliberately do not cover. Both read paths reach it — the
 #: streamed runner through `check_magic`, the indexed one through its opener — so it is
 #: the same question asked of both.
 UNNAMED = b"4DG"
@@ -106,6 +111,25 @@ def test_a_named_refusal_is_still_an_answer(runner, tmp_path):
     done = _run(runner, NAMED, tmp_path)
     assert done.returncode == 0, f"{runner} failed the invocation for a refusal it named: {done.stderr!r}"
     assert json.loads(done.stdout) == {"refused": "magic-mismatch"}
+
+
+@pytest.mark.parametrize("value", [0.0, -0.0, -0.004], ids=["zero", "negative-zero", "negative"])
+def test_non_positive_step_time_is_one_named_refusal_on_both_read_paths(value, tmp_path):
+    data = invalid._step_time(_large_finite_window_file(), value)
+
+    for decode in (fourdgs.read, lambda raw: open_indexed(BytesReadable(raw))):
+        with pytest.raises(MalformedFile) as caught:
+            decode(data)
+        assert caught.value.code == "non-positive-step-time"
+        message = str(caught.value)
+        assert "Quantization record at byte" in message
+        assert f"step_time {value!r} at byte" in message
+        assert "greater than 0" in message
+
+    for runner in RUNNERS:
+        done = _run(runner, data, tmp_path)
+        assert done.returncode == 0, f"{runner} failed: {done.stderr}"
+        assert json.loads(done.stdout) == {"refused": "non-positive-step-time"}
 
 
 def test_large_finite_window_endpoint_agrees_on_both_read_paths(tmp_path):

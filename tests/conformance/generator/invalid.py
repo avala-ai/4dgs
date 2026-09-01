@@ -19,10 +19,9 @@ Two properties are deliberate:
   agreement — one of them may have refused for the wrong reason, and a negative test that
   cannot tell those apart is the kind that passes while proving nothing. The id says
   which rule.
-* **Every rule here already exists in version 1.** Nothing in this file is new
-  specification. That is what makes the harness change reviewable on its own: the
-  contract is exercised against rules that predate it, rather than arriving at the same
-  time as the rules it is meant to police.
+* **Every rule here belongs to version 1.** The harness began with rules that predated it.
+  Later witnesses may follow a normative clarification, but they isolate one cited rule;
+  the generator does not introduce a new format revision.
 
 The mutations are byte patches rather than a second encoder, and each is length-preserving
 wherever it can be, so nothing downstream of the patch shifts. A mutation that moved
@@ -136,6 +135,26 @@ def _unknown_quantization_scheme(data: bytes) -> bytes:
     return _replace_once(data, b"uniform-v1", b"uniform-v9")
 
 
+def _step_time_offset(data: bytes) -> int:
+    """Locate Quantization.step_time without assuming the scheme's byte length."""
+    offset, _ = _find(data, 0x03)
+    (scheme_length,) = struct.unpack_from("<I", data, offset)
+    steps = offset + 4 + scheme_length + 3 * 8
+    return steps + 6 * 8
+
+
+def _step_time(data: bytes, value: float) -> bytes:
+    return _patch(data, _step_time_offset(data), struct.pack("<d", value))
+
+
+def _zero_step_time(data: bytes) -> bytes:
+    return _step_time(data, 0.0)
+
+
+def _negative_step_time(data: bytes) -> bytes:
+    return _step_time(data, -0.004)
+
+
 def _window_index_out_of_range(data: bytes) -> bytes:
     """Shrink the Window Table's `count` so the gaussians reference past its end.
 
@@ -163,6 +182,14 @@ def _unknown_stream_codec(data: bytes) -> bytes:
     return _patch(data, cursor + 3, b"\x09")  # attribute_id, symbol_width, mode, [codec]
 
 
+#: The two witnesses for spec issue #306. Both are length-preserving patches of the
+#: Quantization record's birth-time grid, so no later offset or checksum-covered range moves.
+STEP_TIME_REFUSALS: tuple[Refusal, ...] = (
+    Refusal("ZeroStepTime", "non-positive-step-time", "spec 5.3, 6.3", _zero_step_time),
+    Refusal("NegativeStepTime", "non-positive-step-time", "spec 5.3, 6.3", _negative_step_time),
+)
+
+
 REFUSALS: tuple[Refusal, ...] = (
     Refusal("BadMagic", "magic-mismatch", "spec 4.1", _bad_magic),
     Refusal("FutureMajorVersion", "unsupported-major-version", "spec 4.1", _future_major_version),
@@ -175,6 +202,7 @@ REFUSALS: tuple[Refusal, ...] = (
     ),
     Refusal("WindowIndexOutOfRange", "window-index-out-of-range", "spec 5.4", _window_index_out_of_range),
     Refusal("UnknownStreamCodec", "unknown-stream-codec", "spec 5.5, registry stream codecs", _unknown_stream_codec),
+    *STEP_TIME_REFUSALS,
 )
 
 #: Invalid variants the encoder writes directly rather than a mutation producing.

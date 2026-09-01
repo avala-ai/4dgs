@@ -76,14 +76,17 @@ Uint8List _headerContent({String temporalModel = 'gaussian-birth'}) {
   return body.toBytes();
 }
 
-/// A Quantization record's content, complete but for the scheme under test.
-Uint8List _quantizationContent({String scheme = 'uniform-v1'}) {
+/// A complete Quantization body with an overridable scheme and birth-time pitch.
+Uint8List _quantizationContent({
+  String scheme = 'uniform-v1',
+  double stepTime = 1.0,
+}) {
   final body = BytesBuilder()..add(_string(scheme));
   for (int i = 0; i < 3; i++) {
     body.add(_f64(0.0)); // pos_origin
   }
   for (int i = 0; i < 8; i++) {
-    body.add(_f64(1.0)); // step_pos .. step_sigma_log
+    body.add(_f64(i == 6 ? stepTime : 1.0));
   }
   body
     ..addByte(1) // step_sh
@@ -175,6 +178,19 @@ FourdgsDecodedChunk _decodeOneGaussian({
 /// One record: `u8 opcode`, `u64 content_length`, content.
 Uint8List _record(int opcode, List<int> content) =>
     Uint8List.fromList(<int>[opcode, ..._u64(content.length), ...content]);
+
+/// A complete zero-gaussian file whose only variable is the birth-time pitch.
+Uint8List _fileWithStepTime(double stepTime) {
+  final out =
+      BytesBuilder()
+        ..add(fourdgsMagic)
+        ..add(_record(opHeader, _headerContent()))
+        ..add(_record(opQuantization, _quantizationContent(stepTime: stepTime)))
+        ..add(_record(opWindowTable, _u32(0)))
+        ..add(_record(opFooter, Uint8List(20)))
+        ..add(fourdgsMagic);
+  return out.toBytes();
+}
 
 /// A whole one-chunk `keyframe-delta` file whose single gaussian carries
 /// [gaussianId] and names [windowIndex] against a one-entry Window Table.
@@ -271,6 +287,50 @@ void main() {
         refusalUnknownQuantizationScheme,
       );
     });
+
+    test(
+      'a non-positive birth-time grid is named on both read paths',
+      () async {
+        for (final double stepTime in <double>[0.0, -0.0, -0.004]) {
+          final Uint8List bytes = _fileWithStepTime(stepTime);
+          final FourdgsRecord quantization = iterRecords(
+            bytes,
+            fourdgsMagic.length,
+          ).firstWhere(
+            (FourdgsRecord record) => record.opcode == opQuantization,
+          );
+          final int contentAt = quantization.offset + recordHeaderBytes;
+          final int schemeLength = ByteData.sublistView(
+            bytes,
+          ).getUint32(contentAt, Endian.little);
+          final int fieldAt = contentAt + 4 + schemeLength + 3 * 8 + 6 * 8;
+          final matcher = isA<FourdgsMalformedFile>()
+              .having(
+                (FourdgsMalformedFile error) => error.refusalCode,
+                'refusal code',
+                refusalNonPositiveStepTime,
+              )
+              .having(
+                (FourdgsMalformedFile error) => error.message,
+                'diagnosis',
+                allOf(
+                  contains(
+                    'Quantization record at byte ${quantization.offset}',
+                  ),
+                  contains('step_time $stepTime'),
+                  contains('at byte $fieldAt'),
+                  contains('greater than 0'),
+                ),
+              );
+
+          expect(() => readFourdgsBytes(bytes), throwsA(matcher));
+          await expectLater(
+            openFourdgsIndexed(FourdgsBytes(bytes)),
+            throwsA(matcher),
+          );
+        }
+      },
+    );
 
     test('both routes to an unknown stream codec answer the same name', () {
       // A chunk names its codec; a stream numbers it. The invalid corpus only
@@ -507,15 +567,16 @@ void main() {
       expect(_refusalOf(() => checkMagic(Uint8List(3))), isNull);
     });
 
-    test('every identifier a raise site uses is one of the six', () {
-      // The set is the vocabulary; a seventh string invented in one language is
+    test('every identifier a raise site uses is one of the seven', () {
+      // The set is the vocabulary; an eighth string invented in one language is
       // a conformance failure everywhere else.
-      expect(fourdgsRefusalCodes, hasLength(6));
+      expect(fourdgsRefusalCodes, hasLength(7));
       expect(<String>{
         refusalMagicMismatch,
         refusalUnsupportedMajorVersion,
         refusalUnknownTemporalModel,
         refusalUnknownQuantizationScheme,
+        refusalNonPositiveStepTime,
         refusalUnknownStreamCodec,
         refusalWindowIndexOutOfRange,
       }, fourdgsRefusalCodes);

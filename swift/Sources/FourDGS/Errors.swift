@@ -4,14 +4,12 @@
 /// The specification's name for **which** rule a file broke.
 ///
 /// ``FourDGSError`` says what *kind* of thing went wrong; this says which rule, in the same
-/// six words Python, Rust, TypeScript, C++ and Dart print for the same file. That is the
+/// seven words Python, Rust, TypeScript, C++ and Dart print for the same file. That is the
 /// difference between "both decoders refused it" and "both decoders refused it for the same
 /// reason" — a reader that rejects a bad-magic file because it mis-parsed the version passes
 /// a bare-refusal test and is still wrong.
 ///
-/// The vocabulary is closed and is defined once, in `rust/fourdgs/src/error.rs`. Seven
-/// invalid corpus variants map onto these six: an empty temporal model and an unrecognized
-/// one share ``unknownTemporalModel``, because a declaration of nothing is not a default.
+/// The vocabulary is closed and is defined once, in `rust/fourdgs/src/error.rs`.
 public enum RefusalCode: String, Sendable, Equatable, CaseIterable {
 
     /// The file does not begin with the 4dgs magic.
@@ -26,6 +24,9 @@ public enum RefusalCode: String, Sendable, Equatable, CaseIterable {
 
     /// The Quantization record names a scheme this build does not implement.
     case unknownQuantizationScheme = "unknown-quantization-scheme"
+
+    /// The Quantization record's birth-time grid has no positive spacing.
+    case nonPositiveStepTime = "non-positive-step-time"
 
     /// A stream declares a codec this build does not implement.
     case unknownStreamCodec = "unknown-stream-codec"
