@@ -11,6 +11,9 @@
     "@types/node": "26.4.0",
     "typescript": "5.6.3"
   },
+  "resolutions": {
+    "qs@npm:~6.15.1": "npm:6.16.0"
+  },
   "scripts": {
     "lint": "prettier --check .",
     "format": "prettier --write .",
