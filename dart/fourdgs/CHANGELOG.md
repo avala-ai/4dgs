@@ -16,6 +16,12 @@ All notable changes to the Dart package are documented here, following
 
 ### Changed
 
+- **Collecting readers now have a configurable aggregate decoded-state budget.** `readFourdgsBytes`,
+  `assembleGaussians`, `decodeKeyframeDeltaStreamed` and `decodeKeyframeDeltaIndexed` accept
+  `maxDecodedStateBytes`, defaulting to 512 MiB. The limit covers retained results plus simultaneous
+  decode, composition, SH merge and final assembly storage; exhaustion is the distinct
+  `FourdgsReaderLimit` resource result and never a malformed-file refusal. Incremental chunk and
+  chain reads continue to release prior state rather than accumulating history.
 - **Readers refuse decoded binary32 attribute overflow by name.** Gaussian-birth and keyframe-delta
   decoding now completes each floating reconstruction in `double`, then returns
   `decoded-f32-overflow` before narrowing any NaN, infinity, or out-of-range result into state.

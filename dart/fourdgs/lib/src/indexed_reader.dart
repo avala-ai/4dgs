@@ -17,6 +17,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'chunk_decoder.dart';
+import 'decoded_state_budget.dart';
 import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
@@ -512,11 +513,16 @@ Future<({int offset, int length})> _locateFooter(
 }
 
 /// Fetches and decodes one chunk, plus only the SH bands asked for.
+///
+/// [decodedStateBudget] is for a collecting adapter that retains several calls'
+/// results. An ordinary incremental caller omits it, and a returned chunk then
+/// belongs to that caller rather than accruing as library-owned history.
 Future<FourdgsDecodedChunk> readFourdgsChunk(
   FourdgsReadable source,
   FourdgsIndexedScene scene,
   FourdgsChunkIndexEntry entry, {
   int maxShBand = 0,
+  FourdgsDecodedStateBudget? decodedStateBudget,
 }) async {
   _checkRange(scene, entry.chunkOffset, entry.chunkLength, 'chunk');
   final blob = await source.read(entry.chunkOffset, entry.chunkLength);
@@ -542,6 +548,16 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
     );
     bandContentOffsets[band.band] = band.offset + recordHeaderBytes;
   }
+
+  final highestBand =
+      bandRecords.isEmpty
+          ? 0
+          : bandRecords.keys.reduce((a, b) => a > b ? a : b);
+  decodedStateBudget?.checkRows(
+    body.header.count,
+    chunkDecodedBytesPerGaussian(highestBand),
+    'indexed Chunk decode at byte ${entry.chunkOffset}',
+  );
 
   final decoded = decodeChunkStreams(
     body.streams,

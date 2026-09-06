@@ -12,6 +12,7 @@ library;
 import 'dart:typed_data';
 
 import 'chunk_decoder.dart';
+import 'decoded_state_budget.dart';
 import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
@@ -128,11 +129,17 @@ const int maxStreamedSceneChunks = 262144;
 /// reader cannot range-skip the bands it does not want — it has already been
 /// sent them — so this saves the decode and not the transfer, which is the
 /// opposite of what the same cap buys an indexed reader.
+///
+/// [maxDecodedStateBytes] bounds the peak decoded gaussian state retained by
+/// this collecting call together with the next decode or final assembly
+/// working set. It is a caller resource policy, not a file-validity rule.
 FourdgsScene readFourdgsBytes(
   Uint8List data, {
   bool recoverTruncated = true,
   int maxShBand = 3,
+  int maxDecodedStateBytes = defaultMaxDecodedStateBytes,
 }) {
+  final decodedStateBudget = FourdgsDecodedStateBudget(maxDecodedStateBytes);
   checkMagic(data);
 
   FourdgsHeader? header;
@@ -220,6 +227,11 @@ FourdgsScene readFourdgsBytes(
             );
           }
           final body = parseChunk(record.content);
+          decodedStateBudget.checkRows(
+            body.header.count,
+            chunkDecodedBytesPerGaussian(0),
+            'streamed Chunk decode at byte ${record.offset}',
+          );
           final decoded = decodeChunkStreams(
             body.streams,
             body.header.count,
@@ -231,6 +243,10 @@ FourdgsScene readFourdgsBytes(
             chunkOffset: record.offset,
             streamsOffset:
                 record.offset + recordHeaderBytes + body.streamsOffset,
+          );
+          decodedStateBudget.retain(
+            decodedChunkStateBytes(decoded),
+            'streamed Chunk collection after byte ${record.offset}',
           );
           chunks.add(decoded);
           chunkCounts.add(body.header.count);
@@ -246,13 +262,32 @@ FourdgsScene readFourdgsBytes(
               record.content.isNotEmpty) {
             final band = record.content[0];
             if (band <= maxShBand) {
+              final channels = shBandChannels[band];
+              if (channels != null) {
+                decodedStateBudget.checkRows(
+                  chunkCounts.last,
+                  channels * 5,
+                  'streamed SH band $band decode at byte ${record.offset}',
+                );
+              }
               final decoded = decodeShBandRecord(
                 record.content,
                 expectedBand: band,
                 expectedCount: chunkCounts.last,
                 fileOffset: record.offset + recordHeaderBytes,
               );
-              if (decoded != null) chunkBands.last[band] = decoded;
+              if (decoded != null) {
+                final previous = chunkBands.last[band];
+                decodedStateBudget.retain(
+                  decoded.lengthInBytes,
+                  'streamed SH band $band collection after byte '
+                  '${record.offset}',
+                );
+                chunkBands.last[band] = decoded;
+                if (previous != null) {
+                  decodedStateBudget.release(previous.lengthInBytes);
+                }
+              }
             }
           }
         case opAudio:
@@ -536,18 +571,22 @@ FourdgsScene readFourdgsBytes(
   provenance.check(truncated: truncated && !sawFooter);
   objects.check();
 
+  final mergedShBytes = mergedShStateBytes(chunkCounts, chunkBands);
+  decodedStateBudget.retain(mergedShBytes, 'gaussian-birth SH band assembly');
+  final mergedSh =
+      header.shDegree == 0 ? null : mergeChunkBands(chunkCounts, chunkBands);
+  final gaussians = assembleGaussians(
+    chunks,
+    header.shDegree,
+    sh: mergedSh,
+    decodedStateBudget: decodedStateBudget,
+  );
+
   return FourdgsScene(
     header: header,
     quantization: quantization,
     windows: windows,
-    gaussians: assembleGaussians(
-      chunks,
-      header.shDegree,
-      sh:
-          header.shDegree == 0
-              ? null
-              : mergeChunkBands(chunkCounts, chunkBands),
-    ),
+    gaussians: gaussians,
     chunkIndex: chunkIndex,
     metadata: metadata,
     attachments: attachments,
@@ -716,11 +755,34 @@ bool _endsWithMagic(Uint8List data) {
 /// Chunks are independently decodable and carry no cross-references, so this is
 /// genuinely just concatenation — and gaussian order is an encoder choice that
 /// no reader may depend on.
+///
+/// A standalone call selects [maxDecodedStateBytes]. A collecting adapter that
+/// already charged its chunks passes [decodedStateBudget] instead; supplying a
+/// non-default limit as well is rejected rather than silently choosing one.
 FourdgsGaussianSet assembleGaussians(
   List<FourdgsDecodedChunk> chunks,
   int shDegree, {
   ({Uint8List values, int coefficients})? sh,
+  int maxDecodedStateBytes = defaultMaxDecodedStateBytes,
+  FourdgsDecodedStateBudget? decodedStateBudget,
 }) {
+  // Validate the public option even when an existing tracker carries the
+  // collection's configured limit. Supplying a bad caller argument must never
+  // become dependent on which internal assembly path reached this function.
+  validateMaxDecodedStateBytes(maxDecodedStateBytes);
+  if (decodedStateBudget != null &&
+      maxDecodedStateBytes != defaultMaxDecodedStateBytes) {
+    throw ArgumentError(
+      'maxDecodedStateBytes and decodedStateBudget are alternative budget '
+      'sources; pass only one',
+    );
+  }
+  final budget =
+      decodedStateBudget ?? FourdgsDecodedStateBudget(maxDecodedStateBytes);
+  budget.check(
+    gaussianSetAssemblyBytes(chunks),
+    'gaussian-birth final scene assembly',
+  );
   int total = 0;
   for (final chunk in chunks) {
     total += chunk.count;

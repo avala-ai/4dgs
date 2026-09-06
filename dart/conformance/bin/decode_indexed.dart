@@ -36,7 +36,10 @@ String? temporalModel(Uint8List data) {
   return null;
 }
 
-Future<String> run(String path) async {
+Future<String> run(
+  String path, {
+  int maxDecodedStateBytes = defaultMaxDecodedStateBytes,
+}) async {
   final data = File(path).readAsBytesSync();
   bool keyframeDelta = false;
   try {
@@ -52,19 +55,44 @@ Future<String> run(String path) async {
     // streamed runner does. Agreeing across the two paths is most of what makes
     // an indexed keyframe-delta reader trustworthy.
     return canonical(
-      keyframeDeltaStatesJson(decodeKeyframeDeltaIndexed(data).sequence),
+      keyframeDeltaStatesJson(
+        decodeKeyframeDeltaIndexed(
+          data,
+          maxDecodedStateBytes: maxDecodedStateBytes,
+        ).sequence,
+      ),
     );
   }
 
+  final decodedStateBudget = FourdgsDecodedStateBudget(maxDecodedStateBytes);
   final file = await FourdgsFileReadable.open(path);
   final source = CountingReadable(file);
   try {
     final scene = await openFourdgsIndexed(source);
 
+    // This proof performs incremental reads and retains none of them. Run it
+    // before the collector starts accruing results, but share the injected
+    // budget so even its first decoded allocation observes the caller limit.
+    await checkBandRangeSkipping(
+      source,
+      scene,
+      decodedStateBudget: decodedStateBudget,
+    );
+
     final chunks = <FourdgsDecodedChunk>[];
     for (final entry in scene.index) {
       chunks.add(
-        await readFourdgsChunk(source, scene, entry, maxShBand: allBands),
+        await readFourdgsChunk(
+          source,
+          scene,
+          entry,
+          maxShBand: allBands,
+          decodedStateBudget: decodedStateBudget,
+        ),
+      );
+      decodedStateBudget.retain(
+        decodedChunkStateBytes(chunks.last),
+        'indexed Chunk collection after byte ${entry.chunkOffset}',
       );
     }
     final audioSources = await readFourdgsAudioSources(source, scene);
@@ -74,17 +102,21 @@ Future<String> run(String path) async {
     final provenance = await readFourdgsProvenance(source, scene);
     final objects = await readFourdgsObjects(source, scene);
 
-    await checkBandRangeSkipping(source, scene);
-
+    final counts = <int>[for (final c in chunks) c.count];
+    final bands = <Map<int, Uint8List>>[for (final c in chunks) c.shBands];
+    decodedStateBudget.retain(
+      mergedShStateBytes(counts, bands),
+      'gaussian-birth SH band assembly',
+    );
     final sh =
-        scene.header.shDegree == 0
-            ? null
-            : mergeChunkBands(
-              <int>[for (final c in chunks) c.count],
-              <Map<int, Uint8List>>[for (final c in chunks) c.shBands],
-            );
+        scene.header.shDegree == 0 ? null : mergeChunkBands(counts, bands);
 
-    final whole = assembleGaussians(chunks, scene.header.shDegree, sh: sh);
+    final whole = assembleGaussians(
+      chunks,
+      scene.header.shDegree,
+      sh: sh,
+      decodedStateBudget: decodedStateBudget,
+    );
 
     // Everything above this line assembles the whole scene, which is exactly why
     // it cannot see a gaussian filed in the wrong chunk: the summary carries it
@@ -128,12 +160,19 @@ Future<String> run(String path) async {
 }
 
 Future<void> main(List<String> args) async {
-  if (args.length != 1) {
-    stderr.writeln('usage: decode_indexed <file.4dgs>');
+  final parsed = _parseArguments(args);
+  if (parsed == null) {
+    stderr.writeln(
+      'usage: decode_indexed [--max-decoded-state-bytes N] <file.4dgs>',
+    );
     exit(2);
   }
   try {
-    stdout.writeln(await run(args.single));
+    stdout.writeln(
+      await run(parsed.path, maxDecodedStateBytes: parsed.maxDecodedStateBytes),
+    );
+  } on FourdgsReaderLimit {
+    stdout.writeln('{"unsupported":"resource-limit"}');
   } on FourdgsException catch (error) {
     // Both read paths answer the invalid corpus, and they reach the Header by
     // different routes — one front to back, one through the Footer. A check
@@ -143,7 +182,7 @@ Future<void> main(List<String> args) async {
     // anything else goes to stderr with a non-zero exit. See [refusalAnswer].
     final String? answer = refusalAnswer(error);
     if (answer == null) {
-      stderr.writeln('${args.single}: $error');
+      stderr.writeln('${parsed.path}: $error');
       exit(1);
     }
     stdout.writeln(answer);
@@ -151,4 +190,20 @@ Future<void> main(List<String> args) async {
     stderr.writeln(error);
     exit(1);
   }
+}
+
+({String path, int maxDecodedStateBytes})? _parseArguments(List<String> args) {
+  if (args.length == 1) {
+    return (
+      path: args.single,
+      maxDecodedStateBytes: defaultMaxDecodedStateBytes,
+    );
+  }
+  if (args.length != 3 || args.first != '--max-decoded-state-bytes') {
+    return null;
+  }
+  if (!RegExp(r'^[0-9]+$').hasMatch(args[1])) return null;
+  final value = int.tryParse(args[1]);
+  if (value == null || value <= 0) return null;
+  return (path: args[2], maxDecodedStateBytes: value);
 }
