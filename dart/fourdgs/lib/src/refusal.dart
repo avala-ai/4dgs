@@ -10,10 +10,12 @@
 /// exception is thrown where the value was parsed, not where its bytes sit, and
 /// by then the record's position is several frames up the stack.
 ///
-/// So the tool supplies it. The refusal vocabulary is eight identifiers, each of
-/// which is about exactly one kind of record, and a framing walk knows where
-/// every record is. That is the whole mechanism: walk the framing, ask which
-/// record this refusal is about, name the byte.
+/// So the tool supplies it. Most refusal identifiers are about exactly one kind
+/// of record, and a framing walk knows where every record is. The decoded-f32
+/// refusal can belong to a Chunk or Delta Chunk, so the decoder supplies that
+/// physical state-record site when it catches the failure. That is the whole
+/// mechanism: walk the framing, ask which record this refusal is about, name the
+/// byte.
 ///
 /// Front matter is located from framing alone. A refusal that lives inside a
 /// chunk's attribute streams is located by decoding chunks one at a time until

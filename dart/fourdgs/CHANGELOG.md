@@ -16,6 +16,14 @@ All notable changes to the Dart package are documented here, following
 
 ### Changed
 
+- **Readers refuse decoded binary32 attribute overflow by name.** Gaussian-birth and keyframe-delta
+  decoding now completes each floating reconstruction in `double`, then returns
+  `decoded-f32-overflow` before narrowing any NaN, infinity, or out-of-range result into state.
+  Diagnostics identify the physical Chunk or Delta Chunk, row, identity where present, attribute
+  component, contributing bin, effective step, and origin where applicable. Zero bins remain legal
+  beside the largest finite `double` steps, ordinary underflow remains legal, and the `never_fades`
+  sigma infinity remains the format's sole sentinel exception.
+
 - **Readers refuse a finite `Quantization.step_time` at or below zero by name.** Both front-to-back
   and indexed opens return `non-positive-step-time`, including for either sign of zero, and the
   validator preserves the identifier and the Quantization record byte. A zero pitch makes birth-time

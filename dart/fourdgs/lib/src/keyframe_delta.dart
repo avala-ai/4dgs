@@ -33,6 +33,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'chunk_decoder.dart' show maxChunkDecodedBytes;
+import 'decoded_f32.dart';
 import 'exceptions.dart';
 import 'opcode.dart';
 import 'quantization.dart';
@@ -619,6 +620,277 @@ Int32List _idsOf(_Column gaussianId) {
   return out;
 }
 
+/// Floating attributes whose fully reconstructed destination is binary32.
+const Set<int> _decodedF32Attributes = <int>{
+  attrPosition,
+  attrScale,
+  attrRotation,
+  attrColor,
+  attrOpacity,
+  attrMotion,
+  attrMuT,
+  attrSigmaT,
+};
+
+/// Check record-local rows while their stored and composed bins are both known.
+///
+/// Carrying provenance beside every live gaussian would make valid sequences
+/// pay forever for diagnostics they never use. Keyframes and births are absolute;
+/// updates carry deltas for most lanes. This boundary receives both views only
+/// long enough to diagnose the first value outside finite binary32.
+void _checkDecodedF32Rows(
+  Int32List ids,
+  Map<int, _Column> absolute,
+  Map<int, _Column> stored,
+  _Grids grids, {
+  required int recordOffset,
+  required String rowKind,
+  required bool storedIsDelta,
+  required Set<int> attributes,
+  List<int>? absoluteRows,
+}) {
+  if (ids.isEmpty) return;
+  final wanted = attributes.intersection(_decodedF32Attributes);
+  if (wanted.isEmpty) return;
+
+  int composedBin(int attribute, int row, int component) {
+    final column = absolute[attribute]!;
+    final absoluteRow = absoluteRows == null ? row : absoluteRows[row];
+    return column.values[absoluteRow * column.channels + component];
+  }
+
+  String scalarBins(int attribute, int row, int component) {
+    final saved =
+        stored[attribute]!.values[row * stored[attribute]!.channels +
+            component];
+    final composed = composedBin(attribute, row, component);
+    return storedIsDelta
+        ? 'stored delta bin $saved and composed bin $composed'
+        : 'stored/composed absolute bin $composed';
+  }
+
+  const components = <String>['x', 'y', 'z'];
+  final steps = grids.steps;
+  final temporal =
+      wanted.contains(attrSigmaT) ||
+      wanted.contains(attrMotion) ||
+      wanted.contains(attrMuT);
+  final support = wanted.contains(attrMotion) ? supportK(grids.cutoff) : 0.0;
+  final rotationOut = wanted.contains(attrRotation) ? Float64List(4) : null;
+  final rgb = wanted.contains(attrColor) ? List<int>.filled(3, 0) : null;
+
+  for (int row = 0; row < ids.length; row++) {
+    final gaussianId = ids[row];
+    final storedI3 = row * 3;
+
+    if (wanted.contains(attrPosition)) {
+      for (int c = 0; c < 3; c++) {
+        final bin = composedBin(attrPosition, row, c);
+        requireDecodedF32(
+          reconstructLinear(bin, steps.pos, origin: grids.origin[c]),
+          record: rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk',
+          recordOffset: recordOffset,
+          rowKind: rowKind,
+          row: row,
+          gaussianId: gaussianId,
+          attribute: 'position',
+          component: components[c],
+          inputs:
+              () =>
+                  '${scalarBins(attrPosition, row, c)} with step_pos ${steps.pos}, '
+                  'pos_origin.${components[c]} ${grids.origin[c]}',
+        );
+      }
+    }
+
+    if (wanted.contains(attrScale)) {
+      for (int c = 0; c < 3; c++) {
+        final bin = composedBin(attrScale, row, c);
+        requireDecodedF32(
+          math.exp(reconstructLinear(bin, steps.scaleLog)),
+          record: rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk',
+          recordOffset: recordOffset,
+          rowKind: rowKind,
+          row: row,
+          gaussianId: gaussianId,
+          attribute: 'scale',
+          component: components[c],
+          inputs:
+              () =>
+                  '${scalarBins(attrScale, row, c)} with step_scale_log '
+                  '${steps.scaleLog}',
+        );
+      }
+    }
+
+    if (wanted.contains(attrRotation)) {
+      final index = composedBin(attrRotationIndex, row, 0);
+      if (index < 0 || index > 3) {
+        throw FourdgsMalformedFile(
+          'the ${rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk'} record '
+          'opcode at byte $recordOffset, $rowKind row $row '
+          '(gaussian_id ${gaussianId.toUnsigned(32)}), has rotation_index '
+          '$index; expected an omitted quaternion component in 0..3',
+        );
+      }
+      final bin0 = composedBin(attrRotation, row, 0);
+      final bin1 = composedBin(attrRotation, row, 1);
+      final bin2 = composedBin(attrRotation, row, 2);
+      dequantizeRotation(index, bin0, bin1, bin2, steps.rot, rotationOut!, 0);
+      final storedIndex = stored[attrRotationIndex]!.values[row];
+      final storedBins = stored[attrRotation]!.values;
+      String rotationInputs() =>
+          '${storedIsDelta ? 'stored absolute update rotation_index '
+                  '$storedIndex and bins (${storedBins[storedI3]}, '
+                  '${storedBins[storedI3 + 1]}, '
+                  '${storedBins[storedI3 + 2]}), composed rotation_index '
+                  '$index and bins ($bin0, $bin1, $bin2)' : 'stored/composed '
+                  'rotation_index $index and bins ($bin0, $bin1, $bin2)'} '
+          'with step_rot ${steps.rot}';
+      for (int c = 0; c < 4; c++) {
+        requireDecodedF32(
+          rotationOut[c],
+          record: rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk',
+          recordOffset: recordOffset,
+          rowKind: rowKind,
+          row: row,
+          gaussianId: gaussianId,
+          attribute: 'rotation',
+          component: 'xyzw'[c],
+          inputs: rotationInputs,
+        );
+      }
+    }
+
+    if (wanted.contains(attrColor)) {
+      final bin0 = composedBin(attrColor, row, 0);
+      final bin1 = composedBin(attrColor, row, 1);
+      final bin2 = composedBin(attrColor, row, 2);
+      rctInverse(bin0, bin1, bin2, rgb!);
+      final storedBins = stored[attrColor]!.values;
+      for (int c = 0; c < 3; c++) {
+        requireDecodedF32(
+          reconstructLinear(rgb[c], steps.rgb).clamp(0.0, 1.0).toDouble(),
+          record: rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk',
+          recordOffset: recordOffset,
+          rowKind: rowKind,
+          row: row,
+          gaussianId: gaussianId,
+          attribute: 'color',
+          component: 'rgb'[c],
+          inputs:
+              () =>
+                  '${storedIsDelta ? 'stored RCT delta bins '
+                          '(${storedBins[storedI3]}, '
+                          '${storedBins[storedI3 + 1]}, '
+                          '${storedBins[storedI3 + 2]}), composed RCT bins '
+                          '($bin0, $bin1, $bin2)' : 'stored/composed RCT bins '
+                          '($bin0, $bin1, $bin2)'} and reconstructed RGB bin '
+                  '${rgb[c]} with step_rgb ${steps.rgb}',
+        );
+      }
+    }
+
+    if (wanted.contains(attrOpacity)) {
+      final bin = composedBin(attrOpacity, row, 0);
+      requireDecodedF32(
+        reconstructLinear(bin, steps.alpha).clamp(0.0, 1.0).toDouble(),
+        record: rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk',
+        recordOffset: recordOffset,
+        rowKind: rowKind,
+        row: row,
+        gaussianId: gaussianId,
+        attribute: 'color',
+        component: 'opacity',
+        inputs:
+            () =>
+                '${scalarBins(attrOpacity, row, 0)} with step_alpha ${steps.alpha}',
+      );
+    }
+
+    final neverFades =
+        temporal && composedBin(attrFlags, row, 0) & flagNeverFades != 0;
+    final sigmaBin = temporal ? composedBin(attrSigmaT, row, 0) : 0;
+    if (wanted.contains(attrSigmaT) && !neverFades) {
+      requireDecodedF32(
+        math.exp(reconstructLinear(sigmaBin, steps.sigmaLog)),
+        record: rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk',
+        recordOffset: recordOffset,
+        rowKind: rowKind,
+        row: row,
+        gaussianId: gaussianId,
+        attribute: 'sigma_t',
+        component: 'value',
+        inputs:
+            () =>
+                '${scalarBins(attrSigmaT, row, 0)} with step_sigma_log '
+                '${steps.sigmaLog}',
+      );
+    }
+
+    if (wanted.contains(attrMotion)) {
+      final windowIndex = composedBin(attrWindowIndex, row, 0);
+      final effectiveStep = motionStep(
+        lifeClass(
+          sigmaBin,
+          steps.sigmaLog,
+          neverFades,
+          grids.windowLengthAt(windowIndex, gaussian: gaussianId),
+          k: support,
+        ),
+        steps.motion,
+      );
+      for (int c = 0; c < 3; c++) {
+        final bin = composedBin(attrMotion, row, c);
+        requireDecodedF32(
+          reconstructLinear(bin, effectiveStep),
+          record: rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk',
+          recordOffset: recordOffset,
+          rowKind: rowKind,
+          row: row,
+          gaussianId: gaussianId,
+          attribute: 'motion',
+          component: components[c],
+          inputs:
+              () =>
+                  '${scalarBins(attrMotion, row, c)} with effective step '
+                  '$effectiveStep (step_motion ${steps.motion})',
+        );
+      }
+    }
+
+    if (wanted.contains(attrMuT)) {
+      final effectiveStep = muStep(
+        sigmaBin,
+        steps.sigmaLog,
+        neverFades,
+        steps.time,
+      );
+      requireDecodedF32(
+        reconstructLinear(composedBin(attrMuT, row, 0), effectiveStep),
+        record: rowKind == 'keyframe' ? 'Chunk' : 'Delta Chunk',
+        recordOffset: recordOffset,
+        rowKind: rowKind,
+        row: row,
+        gaussianId: gaussianId,
+        attribute: 'mu_t',
+        component: 'value',
+        inputs:
+            () =>
+                '${scalarBins(attrMuT, row, 0)} with effective step $effectiveStep '
+                '(step_time ${steps.time})',
+      );
+    }
+  }
+}
+
+List<int> _rowsForIds(KeyframeDeltaState state, Int32List ids) {
+  final rows = <int, int>{
+    for (int row = 0; row < state.ids.length; row++) state.ids[row]: row,
+  };
+  return <int>[for (final id in ids) rows[id]!];
+}
+
 // --------------------------------------------------------------------------
 // The decoded sequence
 // --------------------------------------------------------------------------
@@ -739,9 +1011,19 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
       case opWindowTable:
         windows = FourdgsWindowTable.parse(record.content).windows;
       case opChunk:
+        if (header == null || quantization == null) {
+          throw const FourdgsMalformedFile(
+            'a keyframe Chunk arrived before the Header or Quantization record',
+          );
+        }
         final chunk = parseChunk(record.content);
-        final decoded = _keyframeFromChunk(record.content, at: record.offset);
-        final state = _keyframeState(decoded.ids, decoded.bins);
+        final state = keyframeDeltaStateFromChunk(
+          record.content,
+          chunkOffset: record.offset,
+          quantization: quantization,
+          windows: windows,
+          cutoff: header.cutoff,
+        );
         final decodedChunk = KeyframeDeltaChunk(
           t0: chunk.header.t0,
           t1: chunk.header.t1,
@@ -758,6 +1040,11 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
         byOffset[record.offset] = decodedChunk;
         chunks.add(decodedChunk);
       case opDeltaChunk:
+        if (header == null || quantization == null) {
+          throw const FourdgsMalformedFile(
+            'a Delta Chunk arrived before the Header or Quantization record',
+          );
+        }
         final body = parseDeltaChunk(record.content);
         final reference = byOffset[body.header.referenceOffset];
         if (reference == null) {
@@ -773,7 +1060,17 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
             '${body.header.referenceOffset}, which is not behind it',
           );
         }
-        final state = _composeDelta(reference.state, body, at: record.offset);
+        final state = _composeDelta(
+          reference.state,
+          body,
+          at: record.offset,
+          grids: _Grids(
+            FourdgsSteps.of(quantization),
+            quantization.posOrigin,
+            windows,
+            header.cutoff,
+          ),
+        );
         final decodedChunk = KeyframeDeltaChunk(
           t0: body.header.t0,
           t1: body.header.t1,
@@ -818,6 +1115,7 @@ KeyframeDeltaState _composeDelta(
   KeyframeDeltaState reference,
   FourdgsDeltaChunkBody body, {
   required int at,
+  _Grids? grids,
 }) {
   final content = at + recordHeaderBytes;
   final what = 'the delta chunk at byte $at';
@@ -877,7 +1175,7 @@ KeyframeDeltaState _composeDelta(
       'group contains exactly one gaussian_id stream',
     );
   }
-  return _applyDelta(
+  final state = _applyDelta(
     reference,
     updateIds: updates.ids,
     updateBins: updates.bins,
@@ -885,6 +1183,45 @@ KeyframeDeltaState _composeDelta(
     birthBins: births.bins,
     deathIds: deaths.ids,
   );
+  if (grids != null) {
+    final updateAttributes = updates.bins.keys.toSet();
+    if (updateAttributes.intersection(_decodedF32Attributes).isNotEmpty) {
+      final rows = _rowsForIds(state, updates.ids);
+      _checkDecodedF32Rows(
+        updates.ids,
+        state._bins,
+        updates.bins,
+        grids,
+        recordOffset: at,
+        rowKind: 'update',
+        storedIsDelta: true,
+        attributes: updateAttributes,
+        absoluteRows: rows,
+      );
+    }
+    if (births.ids.isNotEmpty) {
+      final rows = <int>[
+        for (
+          int row = state.count - births.ids.length;
+          row < state.count;
+          row++
+        )
+          row,
+      ];
+      _checkDecodedF32Rows(
+        births.ids,
+        state._bins,
+        births.bins,
+        grids,
+        recordOffset: at,
+        rowKind: 'birth',
+        storedIsDelta: false,
+        attributes: _decodedF32Attributes,
+        absoluteRows: rows,
+      );
+    }
+  }
+  return state;
 }
 
 /// Decode one keyframe Chunk into composed keyframe-delta state.
@@ -894,9 +1231,30 @@ KeyframeDeltaState _composeDelta(
 KeyframeDeltaState keyframeDeltaStateFromChunk(
   Uint8List content, {
   required int chunkOffset,
+  FourdgsQuantization? quantization,
+  List<FourdgsWindow> windows = const <FourdgsWindow>[],
+  double cutoff = fourdgsDefaultCutoff,
 }) {
   final decoded = _keyframeFromChunk(content, at: chunkOffset);
-  return _keyframeState(decoded.ids, decoded.bins);
+  final state = _keyframeState(decoded.ids, decoded.bins);
+  if (quantization != null) {
+    _checkDecodedF32Rows(
+      state.ids,
+      state._bins,
+      decoded.bins,
+      _Grids(
+        FourdgsSteps.of(quantization),
+        quantization.posOrigin,
+        windows,
+        cutoff,
+      ),
+      recordOffset: chunkOffset,
+      rowKind: 'keyframe',
+      storedIsDelta: false,
+      attributes: _decodedF32Attributes,
+    );
+  }
+  return state;
 }
 
 /// Require every keyframe gaussian's encoded birth-time bin to name its t0.
@@ -941,7 +1299,23 @@ KeyframeDeltaState applyKeyframeDeltaBody(
   KeyframeDeltaState reference,
   FourdgsDeltaChunkBody body, {
   required int chunkOffset,
-}) => _composeDelta(reference, body, at: chunkOffset);
+  FourdgsQuantization? quantization,
+  List<FourdgsWindow> windows = const <FourdgsWindow>[],
+  double cutoff = fourdgsDefaultCutoff,
+}) => _composeDelta(
+  reference,
+  body,
+  at: chunkOffset,
+  grids:
+      quantization == null
+          ? null
+          : _Grids(
+            FourdgsSteps.of(quantization),
+            quantization.posOrigin,
+            windows,
+            cutoff,
+          ),
+);
 
 /// Read the Footer, then the index, then compose each chunk by byte range.
 ///
@@ -1026,12 +1400,19 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   // Built once for the whole loop: every chain walk needs it, and rebuilding it
   // per entry is what makes composing an index quadratic.
   final byOffset = keyframeDeltaChainIndex(index);
+  final grids = _Grids(
+    FourdgsSteps.of(quantization),
+    quantization.posOrigin,
+    windows,
+    header.cutoff,
+  );
   for (int i = 0; i < index.length; i++) {
     final entry = index[i];
-    final state = composeKeyframeDeltaChain(
+    final state = _composeKeyframeDeltaChain(
       data,
       index,
       entry,
+      grids,
       byOffset: byOffset,
     );
     int? updateCount;
@@ -1157,10 +1538,58 @@ int _stateOpcode(FourdgsChunkIndexEntry entry) {
 /// provides (AGENTS.md §1).
 /// [byOffset] is [keyframeDeltaChainIndex] of the same index, for a caller in a
 /// loop. See that function for why it is worth passing.
+_Grids _decodedGridsFromFile(Uint8List data) {
+  FourdgsHeader? header;
+  FourdgsQuantization? quantization;
+  List<FourdgsWindow> windows = const <FourdgsWindow>[];
+  for (final record in iterRecords(data, fourdgsMagic.length)) {
+    if (record.opcode == opHeader) {
+      header = FourdgsHeader.parse(
+        record.content,
+        fileOffset: record.offset + recordHeaderBytes,
+      );
+    } else if (record.opcode == opQuantization) {
+      quantization = FourdgsQuantization.parse(
+        record.content,
+        fileOffset: record.offset + recordHeaderBytes,
+      );
+    } else if (record.opcode == opWindowTable) {
+      windows = FourdgsWindowTable.parse(record.content).windows;
+    } else if (record.opcode == opChunk || record.opcode == opDeltaChunk) {
+      break;
+    }
+  }
+  if (header == null || quantization == null) {
+    throw const FourdgsMalformedFile(
+      'keyframe-delta file has no Header or Quantization record before its state chunks',
+    );
+  }
+  return _Grids(
+    FourdgsSteps.of(quantization),
+    quantization.posOrigin,
+    windows,
+    header.cutoff,
+  );
+}
+
 KeyframeDeltaState composeKeyframeDeltaChain(
   Uint8List data,
   List<FourdgsChunkIndexEntry> index,
   FourdgsChunkIndexEntry entry, {
+  Map<int, FourdgsChunkIndexEntry>? byOffset,
+}) => _composeKeyframeDeltaChain(
+  data,
+  index,
+  entry,
+  _decodedGridsFromFile(data),
+  byOffset: byOffset,
+);
+
+KeyframeDeltaState _composeKeyframeDeltaChain(
+  Uint8List data,
+  List<FourdgsChunkIndexEntry> index,
+  FourdgsChunkIndexEntry entry,
+  _Grids grids, {
   Map<int, FourdgsChunkIndexEntry>? byOffset,
 }) {
   final chain = chainFrom(index, entry, byOffset: byOffset);
@@ -1178,6 +1607,7 @@ KeyframeDeltaState composeKeyframeDeltaChain(
       ),
       link,
       referenceLevel: referenceLevel,
+      grids: grids,
     );
     state = composed.state;
     referenceLevel = composed.level;
@@ -1198,9 +1628,21 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
   List<FourdgsChunkIndexEntry> index,
   FourdgsChunkIndexEntry entry, {
   Map<int, FourdgsChunkIndexEntry>? byOffset,
+  FourdgsQuantization? quantization,
+  List<FourdgsWindow> windows = const <FourdgsWindow>[],
+  double cutoff = fourdgsDefaultCutoff,
 }) async {
   final chain = chainFrom(index, entry, byOffset: byOffset);
   final int size = await source.size();
+  final grids =
+      quantization == null
+          ? null
+          : _Grids(
+            FourdgsSteps.of(quantization),
+            quantization.posOrigin,
+            windows,
+            cutoff,
+          );
   KeyframeDeltaState? state;
   int? referenceLevel;
   for (final link in chain) {
@@ -1252,6 +1694,7 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
       ),
       link,
       referenceLevel: referenceLevel,
+      grids: grids,
     );
     state = composed.state;
     referenceLevel = composed.level;
@@ -1266,12 +1709,25 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
   Uint8List content,
   FourdgsChunkIndexEntry link, {
   required int? referenceLevel,
+  required _Grids? grids,
 }) {
   if (link.kind == 0) {
     final FourdgsChunkBody body = parseChunk(content);
     _checkKeyframeIndexAgreement(link, body.header);
     final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
     final composed = _keyframeState(decoded.ids, decoded.bins);
+    if (grids != null) {
+      _checkDecodedF32Rows(
+        composed.ids,
+        composed._bins,
+        decoded.bins,
+        grids,
+        recordOffset: link.chunkOffset,
+        rowKind: 'keyframe',
+        storedIsDelta: false,
+        attributes: _decodedF32Attributes,
+      );
+    }
     _checkDecodedIndexCounts(
       link,
       composed.count,
@@ -1294,7 +1750,12 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
       '$referenceLevel; a delta preserves its reference level',
     );
   }
-  final composed = _composeDelta(state, body, at: link.chunkOffset);
+  final composed = _composeDelta(
+    state,
+    body,
+    at: link.chunkOffset,
+    grids: grids,
+  );
   _checkDecodedIndexCounts(
     link,
     body.header.updateCount + body.header.birthCount + body.header.deathCount,
@@ -1681,7 +2142,9 @@ _Reconstruction _reconstructAt(
     final sigmaBin = sigmaBinsCol[i];
     final neverFades = flags[i] & flagNeverFades != 0;
     final sigma =
-        neverFades ? double.infinity : math.exp(sigmaBin * steps.sigmaLog);
+        neverFades
+            ? double.infinity
+            : math.exp(reconstructLinear(sigmaBin, steps.sigmaLog));
     final mStep = motionStep(
       lifeClass(
         sigmaBin,
@@ -1693,18 +2156,27 @@ _Reconstruction _reconstructAt(
       steps.motion,
     );
     final tStep = muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
-    final mu = muBins[i] * tStep;
+    final mu = reconstructLinear(muBins[i], tStep);
     final dt = t - mu;
 
     final o3 = outRow * 3;
     final i3 = i * 3;
     for (int c = 0; c < 3; c++) {
-      final pos = position[i3 + c] * steps.pos + grids.origin[c];
-      centers[o3 + c] = pos + motion[i3 + c] * mStep * dt;
-      scales[o3 + c] = math.exp(scaleBins[i3 + c] * steps.scaleLog);
+      final pos = reconstructLinear(
+        position[i3 + c],
+        steps.pos,
+        origin: grids.origin[c],
+      );
+      centers[o3 + c] = pos + reconstructLinear(motion[i3 + c], mStep) * dt;
+      scales[o3 + c] = math.exp(
+        reconstructLinear(scaleBins[i3 + c], steps.scaleLog),
+      );
     }
 
-    final alpha = (opacityBins[i] * steps.alpha).clamp(0.0, 1.0);
+    final alpha = reconstructLinear(
+      opacityBins[i],
+      steps.alpha,
+    ).clamp(0.0, 1.0);
     final marginal =
         sigma.isInfinite ? 1.0 : math.exp(-0.5 * (dt / sigma) * (dt / sigma));
     // A gaussian is absent outside its own validity window, exactly as the
@@ -1881,7 +2353,9 @@ KeyframeDeltaPopulation _population(KeyframeDeltaState state, _Grids grids) {
     final sigmaBin = sigmaBins[i];
     final neverFades = flags[i] & flagNeverFades != 0;
     sigmaT[i] =
-        neverFades ? double.infinity : math.exp(sigmaBin * steps.sigmaLog);
+        neverFades
+            ? double.infinity
+            : math.exp(reconstructLinear(sigmaBin, steps.sigmaLog));
     final mStep = motionStep(
       lifeClass(
         sigmaBin,
@@ -1892,15 +2366,23 @@ KeyframeDeltaPopulation _population(KeyframeDeltaState state, _Grids grids) {
       ),
       steps.motion,
     );
-    muT[i] =
-        muBins[i] * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
+    muT[i] = reconstructLinear(
+      muBins[i],
+      muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time),
+    );
     windowIndexOut[i] = windowIndex[i];
 
     final i3 = i * 3;
     for (int c = 0; c < 3; c++) {
-      positions[i3 + c] = position[i3 + c] * steps.pos + grids.origin[c];
-      scales[i3 + c] = math.exp(scaleBins[i3 + c] * steps.scaleLog);
-      motions[i3 + c] = motionBins[i3 + c] * mStep;
+      positions[i3 + c] = reconstructLinear(
+        position[i3 + c],
+        steps.pos,
+        origin: grids.origin[c],
+      );
+      scales[i3 + c] = math.exp(
+        reconstructLinear(scaleBins[i3 + c], steps.scaleLog),
+      );
+      motions[i3 + c] = reconstructLinear(motionBins[i3 + c], mStep);
     }
     final omitted = rotationIndex[i];
     if (omitted < 0 || omitted > 3) {
@@ -1920,9 +2402,12 @@ KeyframeDeltaPopulation _population(KeyframeDeltaState state, _Grids grids) {
     );
     rctInverse(colorBins[i3], colorBins[i3 + 1], colorBins[i3 + 2], rgb);
     for (int c = 0; c < 3; c++) {
-      colors[i * 4 + c] = (rgb[c] * steps.rgb).clamp(0.0, 1.0);
+      colors[i * 4 + c] = reconstructLinear(rgb[c], steps.rgb).clamp(0.0, 1.0);
     }
-    colors[i * 4 + 3] = (opacityBins[i] * steps.alpha).clamp(0.0, 1.0);
+    colors[i * 4 + 3] = reconstructLinear(
+      opacityBins[i],
+      steps.alpha,
+    ).clamp(0.0, 1.0);
   }
   return KeyframeDeltaPopulation._(
     ids: ids,

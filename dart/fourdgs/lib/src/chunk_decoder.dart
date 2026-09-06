@@ -11,6 +11,7 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'decoded_f32.dart';
 import 'exceptions.dart';
 import 'opcode.dart';
 import 'quantization.dart';
@@ -259,7 +260,10 @@ FourdgsDecodedChunk decodeChunkStreams(
   final ox = posOrigin[0];
   final oy = posOrigin[1];
   final oz = posOrigin[2];
+  final origins = <double>[ox, oy, oz];
+  const components = <String>['x', 'y', 'z'];
   final rgbOut = List<int>.filled(3, 0);
+  final rotationOut = Float64List(4);
   // An absent or empty Window Table is one default `(0, 0)` window (spec
   // section 5.4) — degenerate, well defined, and not an error. It is a real row
   // for the purpose of the bound below, so that index 0 resolves against it and
@@ -276,13 +280,36 @@ FourdgsDecodedChunk decodeChunkStreams(
     final i3 = i * 3;
     final i4 = i * 4;
 
-    positions[i3] = pos.values[i3] * steps.pos + ox;
-    positions[i3 + 1] = pos.values[i3 + 1] * steps.pos + oy;
-    positions[i3 + 2] = pos.values[i3 + 2] * steps.pos + oz;
+    for (int c = 0; c < 3; c++) {
+      final positionBin = pos.values[i3 + c];
+      positions[i3 + c] = requireDecodedF32(
+        reconstructLinear(positionBin, steps.pos, origin: origins[c]),
+        record: 'Chunk',
+        recordOffset: chunkOffset,
+        rowKind: 'gaussian-birth',
+        row: i,
+        attribute: 'position',
+        component: components[c],
+        inputs:
+            () =>
+                'stored bin $positionBin with step_pos ${steps.pos}, '
+                'pos_origin.${components[c]} ${origins[c]}',
+      );
 
-    scales[i3] = math.exp(scale.values[i3] * steps.scaleLog);
-    scales[i3 + 1] = math.exp(scale.values[i3 + 1] * steps.scaleLog);
-    scales[i3 + 2] = math.exp(scale.values[i3 + 2] * steps.scaleLog);
+      final scaleBin = scale.values[i3 + c];
+      scales[i3 + c] = requireDecodedF32(
+        math.exp(reconstructLinear(scaleBin, steps.scaleLog)),
+        record: 'Chunk',
+        recordOffset: chunkOffset,
+        rowKind: 'gaussian-birth',
+        row: i,
+        attribute: 'scale',
+        component: components[c],
+        inputs:
+            () =>
+                'stored log bin $scaleBin with step_scale_log ${steps.scaleLog}',
+      );
+    }
 
     // Which quaternion component was dropped, and therefore which three the
     // stream carries. Structural, like the window index below: it says how to
@@ -303,9 +330,25 @@ FourdgsDecodedChunk decodeChunkStreams(
       rot.values[i3 + 1],
       rot.values[i3 + 2],
       steps.rot,
-      rotations,
-      i4,
+      rotationOut,
+      0,
     );
+    for (int c = 0; c < 4; c++) {
+      rotations[i4 + c] = requireDecodedF32(
+        rotationOut[c],
+        record: 'Chunk',
+        recordOffset: chunkOffset,
+        rowKind: 'gaussian-birth',
+        row: i,
+        attribute: 'rotation',
+        component: 'xyzw'[c],
+        inputs:
+            () =>
+                'stored rotation_index $largest and bins '
+                '(${rot.values[i3]}, ${rot.values[i3 + 1]}, '
+                '${rot.values[i3 + 2]}) with step_rot ${steps.rot}',
+      );
+    }
 
     rctInverse(
       color.values[i3],
@@ -313,15 +356,52 @@ FourdgsDecodedChunk decodeChunkStreams(
       color.values[i3 + 2],
       rgbOut,
     );
-    colors[i4] = (rgbOut[0] * steps.rgb).clamp(0.0, 1.0);
-    colors[i4 + 1] = (rgbOut[1] * steps.rgb).clamp(0.0, 1.0);
-    colors[i4 + 2] = (rgbOut[2] * steps.rgb).clamp(0.0, 1.0);
-    colors[i4 + 3] = (opacity.values[i] * steps.alpha).clamp(0.0, 1.0);
+    for (int c = 0; c < 3; c++) {
+      colors[i4 + c] = requireDecodedF32(
+        reconstructLinear(rgbOut[c], steps.rgb).clamp(0.0, 1.0).toDouble(),
+        record: 'Chunk',
+        recordOffset: chunkOffset,
+        rowKind: 'gaussian-birth',
+        row: i,
+        attribute: 'color',
+        component: 'rgb'[c],
+        inputs:
+            () =>
+                'stored RCT bins (${color.values[i3]}, '
+                '${color.values[i3 + 1]}, ${color.values[i3 + 2]}) and '
+                'reconstructed RGB bin ${rgbOut[c]} with step_rgb ${steps.rgb}',
+      );
+    }
+    final opacityBin = opacity.values[i];
+    colors[i4 + 3] = requireDecodedF32(
+      reconstructLinear(opacityBin, steps.alpha).clamp(0.0, 1.0).toDouble(),
+      record: 'Chunk',
+      recordOffset: chunkOffset,
+      rowKind: 'gaussian-birth',
+      row: i,
+      attribute: 'color',
+      component: 'opacity',
+      inputs: () => 'stored bin $opacityBin with step_alpha ${steps.alpha}',
+    );
 
     final neverFades = flags.values[i] & flagNeverFades != 0;
     final sigmaBin = sigma.values[i];
-    sigmaT[i] =
-        neverFades ? double.infinity : math.exp(sigmaBin * steps.sigmaLog);
+    if (neverFades) {
+      // The flag is the one specified non-finite decoded attribute value.
+      sigmaT[i] = double.infinity;
+    } else {
+      sigmaT[i] = requireDecodedF32(
+        math.exp(reconstructLinear(sigmaBin, steps.sigmaLog)),
+        record: 'Chunk',
+        recordOffset: chunkOffset,
+        rowKind: 'gaussian-birth',
+        row: i,
+        attribute: 'sigma_t',
+        component: 'value',
+        inputs:
+            () => 'stored bin $sigmaBin with step_sigma_log ${steps.sigmaLog}',
+      );
+    }
 
     // Refused rather than clamped, which is what this used to do and what the
     // keyframe-delta path has always refused to do. Clamping substitutes one
@@ -350,12 +430,43 @@ FourdgsDecodedChunk decodeChunkStreams(
       lifeClass(sigmaBin, steps.sigmaLog, neverFades, hi - lo, k: k),
       steps.motion,
     );
-    motions[i3] = motion.values[i3] * mStep;
-    motions[i3 + 1] = motion.values[i3 + 1] * mStep;
-    motions[i3 + 2] = motion.values[i3 + 2] * mStep;
+    for (int c = 0; c < 3; c++) {
+      final motionBin = motion.values[i3 + c];
+      motions[i3 + c] = requireDecodedF32(
+        reconstructLinear(motionBin, mStep),
+        record: 'Chunk',
+        recordOffset: chunkOffset,
+        rowKind: 'gaussian-birth',
+        row: i,
+        attribute: 'motion',
+        component: components[c],
+        inputs:
+            () =>
+                'stored bin $motionBin with effective step $mStep '
+                '(step_motion ${steps.motion})',
+      );
+    }
 
-    muT[i] =
-        mu.values[i] * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
+    final muBin = mu.values[i];
+    final effectiveMuStep = muStep(
+      sigmaBin,
+      steps.sigmaLog,
+      neverFades,
+      steps.time,
+    );
+    muT[i] = requireDecodedF32(
+      reconstructLinear(muBin, effectiveMuStep),
+      record: 'Chunk',
+      recordOffset: chunkOffset,
+      rowKind: 'gaussian-birth',
+      row: i,
+      attribute: 'mu_t',
+      component: 'value',
+      inputs:
+          () =>
+              'stored bin $muBin with effective step $effectiveMuStep '
+              '(step_time ${steps.time})',
+    );
   }
 
   final sourceGroup = got[attrSourceGroup];
