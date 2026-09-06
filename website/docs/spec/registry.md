@@ -26,6 +26,22 @@ Unknown and private opcodes have no placement class and retain §4.2's skip rule
 
 ---
 
+## Reader result categories
+
+These values are API and conformance-runner vocabulary, not bytes stored in a `.4dgs` file.
+
+| value            | meaning                                                                                                                                                                   |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `resource-limit` | The file may be conforming, but this operation would cross a configured reader resource ceiling. Retry with a larger limit or an incremental API; do not repair the file. |
+
+`resource-limit` is a resource-availability result, not `UnsupportedOperation` / unsupported mode
+and not a malformed-file refusal identifier. The conformance runner therefore represents it as
+`{"unsupported":"resource-limit"}`, never under the `refused` key used by the invalid corpus.
+API-specific type and status names are recorded in the
+[aggregate decoded-state budget decision](./proposals/aggregate-decoded-budget.md#5-one-category-across-the-sdk-surfaces).
+
+---
+
 ## Attribute ids
 
 Used by the Attribute Stream structure (`0x06`), which lives bare inside a Chunk rather than as a

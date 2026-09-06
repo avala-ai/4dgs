@@ -60,6 +60,7 @@ bytes with no per-language slerp or composition order of its own.
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Births and deaths in deltas                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Configurable aggregate decoded-state budget       | Planned | Planned    | Planned | Planned | Planned | Planned |
 | Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -91,6 +92,14 @@ about the combination — see issue #79.
 - **Planned** — intended for this SDK; not implemented yet.
 - **No** — not intended for this SDK. Conversion tooling, for example, belongs where people run
   batch jobs, not in a browser bundle.
+
+**Aggregate decoded-state budget** means the shared collecting-API contract in
+[specification §3.3](../spec/index.md#33-aggregate-decoded-state-resource-budgets), not merely a
+fixed internal ceiling. A `Yes` requires a configurable 512 MiB default, the `resource-limit` result
+category, and both claimed conformance runners passing the one-byte injected-budget gate. Rust
+already has the fixed 512 MiB gaussian-birth scene ceiling that supplied the shared default, but it
+is not configurable and does not cover retained keyframe-delta sequences; that is therefore useful
+implementation evidence, not a `Yes` for this row.
 
 ## Notes
 

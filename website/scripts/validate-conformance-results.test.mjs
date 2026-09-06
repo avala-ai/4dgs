@@ -24,6 +24,7 @@ function runner(readPath, counts) {
     declines: [],
     exactAggregates: true,
     canonicalStateOrder: true,
+    aggregateDecodedBudget: true,
     command: `./decode_${readPath}`,
     ...counts,
   };
@@ -78,6 +79,7 @@ test("an honest partial, one-path result is valid", () => {
       declines: ["WithObjects", "SHDegree3"],
       exactAggregates: false,
       canonicalStateOrder: false,
+      aggregateDecodedBudget: false,
     },
   ];
   assert.equal(validateCatalog(withResults(partial)).results[0].runners[0].passed, 51);
@@ -131,6 +133,11 @@ const invalidCases = [
     "boolean protocol versions",
     (value) => (value.results[0].runners[0].protocol = true),
     /protocol: expected the integer 1/,
+  ],
+  [
+    "non-boolean aggregate budget capabilities",
+    (value) => (value.results[0].runners[0].aggregateDecodedBudget = 1),
+    /aggregateDecodedBudget: expected true or false/,
   ],
   [
     "runner identity mismatches",

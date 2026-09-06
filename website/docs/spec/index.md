@@ -145,6 +145,41 @@ one), the attribute and component, the contributing stored or composed bin or bi
 step and origin when applicable, and the reconstructed value against the finite binary32 range. Both
 read paths attribute the same bytes to the same physical state record.
 
+### 3.3 Aggregate decoded-state resource budgets
+
+A file is not malformed merely because a caller asks one reader to retain more decoded state than
+that reader is configured to hold. File validity is a property of the bytes and the reconstruction
+rules; available memory is a property of the operation. A reader that reaches its configured
+decoded-state ceiling MUST return the registered `resource-limit` result and MUST NOT attach a
+malformed-file refusal identifier. The useful remedies are a larger caller-selected ceiling or an
+incremental read, not a differently encoded file.
+
+A **collecting API** is one whose successful result retains a whole decoded scene or more than one
+reconstructed state. Every public collecting API MUST accept a finite, positive, caller-configurable
+maximum named `max_decoded_state_bytes` in snake-case APIs and `maxDecodedStateBytes` in camel-case
+APIs. Omitting it MUST select the shared default of **536,870,912 bytes (512 MiB)**. Existing entry
+points MAY preserve their signatures by forwarding to an additive options-bearing entry point with
+that default.
+
+The budget is a ceiling on the peak simultaneous byte capacity of library-owned decoded gaussian
+state and the working storage used to produce it. It includes retained output arrays, retained
+keyframe/reference states, decompressed state-record bodies, decoded bins and attribute streams, and
+assembly or composition buffers while they coexist. It excludes the encoded input resource and
+byte-range cache, parsed front matter and summary records, encoded audio and attachment payloads,
+and caller-owned copies made after a value is yielded. Container and allocator bookkeeping MAY be
+counted as additional usage, but an implementation MUST count at least the element capacity of the
+included buffers at their actual in-memory widths. Equality with the configured maximum is allowed;
+the allocation or retention that would cross it is not. Arithmetic overflow while computing usage is
+likewise `resource-limit`.
+
+Sequential transport does not make a result incremental: a front-to-back function that returns a
+whole `Scene`, or every `keyframe-delta` state, is a collecting API and owes the aggregate budget. A
+true streaming iterator/callback that yields one state or chunk and permits the library to release
+it, and an indexed/current-reference API that reconstructs only one requested state, remain
+incremental. They MUST keep their own current state and working buffers bounded, but MUST NOT charge
+already released output or caller-owned retained values against a historical aggregate. A caller
+that chooses to collect yielded values owns that additional memory policy.
+
 ---
 
 ## 4. File layout
@@ -1758,6 +1793,7 @@ and the text was the bug.
 | §5.3 added: `step_time` MUST be strictly positive and a reader refuses a non-positive value                                               | rule added                |
 | §5.8 added: decoded Chunk Index counts MUST agree with parsed operations and the composed population                                      | clarification, rule added |
 | §3.2/§5.3 added: derived binary32 attributes MUST stay finite and in range; finite quantization has no global cap                         | clarification, rule added |
+| §3.3 added: collecting APIs have a configurable 512 MiB decoded-state budget; exhaustion is `resource-limit`, never malformed             | reader contract added     |
 | §4 added: defined front matter MUST precede the first state record; an observed late record is `late-front-matter-record`                 | clarification, rule added |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
@@ -1825,6 +1861,13 @@ binary32 value, because the same large step is harmless beside a zero bin and in
 whose value cannot fit. That makes `decoded-f32-overflow` a malformed-file result without inventing
 a declaration ceiling, and keeps `sigma_t = +inf` exclusively as the value selected by the existing
 `never_fades` bit.
+
+The §3.3 row changes no file and adds no refusal. It makes a resource boundary that readers already
+need portable across SDKs: a collecting convenience call has a caller-visible finite maximum and a
+shared default, while chunk-at-a-time and current-state calls do not accumulate a history they have
+already released. The limit measures the decoder's own decoded state and working buffers, not source
+bytes or front matter. Crossing it says that this operation cannot retain the requested resource; it
+says nothing false about the file that requested it.
 
 The §4 front-matter row is a deliberate compatibility tightening, not a new wire field. It makes
 malformed an abstract shape the earlier positional wording permitted: a defined front-matter record
