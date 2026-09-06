@@ -37,7 +37,7 @@ fn main() -> ExitCode {
         }
         // A refusal is an answer, not a crash: stdout and exit 0, so the harness can
         // diff it against the expectation instead of only seeing that we fell over.
-        Err(Failure::Refused(code)) => {
+        Err(Failure::Refused { code, .. }) => {
             println!("{}", refusal_json(code));
             ExitCode::SUCCESS
         }
