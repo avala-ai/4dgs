@@ -1743,6 +1743,33 @@ void main() {
       },
     );
 
+    test('an index count refusal points at the state record', () async {
+      // The mismatched value lives in the Chunk Index, but its claim is about
+      // a state record. All validators place this refusal at that record so a
+      // user lands on the bytes whose decoded population disproves the index.
+      final Uint8List data = _keyframeDeltaWithEmptyDelta(
+        indexGaussianCount: 1,
+      );
+      final FourdgsWalk walk = await walkFourdgsFraming(FourdgsBytes(data));
+      final FourdgsFrame delta = walk.first(opDeltaChunk)!;
+      final List<String> out = <String>[];
+
+      final int code = await tool.run(
+        <String>['validate', await write('wrong-index-count.4dgs', data)],
+        out.add,
+        (_) {},
+      );
+
+      expect(code, tool.exitRefused);
+      expect(
+        out,
+        contains(
+          '  refusal index-record-mismatch at byte ${delta.offset} '
+          '(the DeltaChunk record)',
+        ),
+      );
+    });
+
     test(
       'a path that does not exist is the tool failing, not the file',
       () async {
@@ -1874,6 +1901,7 @@ void main() {
         'non-positive-step-time': 154,
         'unknown-stream-codec': 659,
         'window-index-out-of-range': 2506,
+        'index-record-mismatch': 903,
       };
       final List<File> expectations =
           Directory('$_corpus/invalid')
