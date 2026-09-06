@@ -248,10 +248,13 @@ class FourdgsRefusalSite {
 
 /// A refusal with a name, and where it is if the tool could place it.
 class FourdgsNamedRefusal {
-  const FourdgsNamedRefusal(this.code, this.site);
+  const FourdgsNamedRefusal(this.code, this.site, {this.lateFrontMatter});
 
   final String code;
   final FourdgsRefusalSite? site;
+
+  /// Both physical records for a structured placement refusal.
+  final FourdgsLateFrontMatterFile? lateFrontMatter;
 
   @override
   String toString() {
@@ -296,7 +299,11 @@ FourdgsNamedRefusal? describeFourdgsRefusal(
   if (error is! FourdgsException) return null;
   final String? code = error.refusalCode;
   if (code == null) return null;
-  return FourdgsNamedRefusal(code, site ?? _placeFrontMatter(walk, code));
+  return FourdgsNamedRefusal(
+    code,
+    site ?? _placeFrontMatter(walk, code),
+    lateFrontMatter: error is FourdgsLateFrontMatterFile ? error : null,
+  );
 }
 
 FourdgsRefusalSite? _placeFrontMatter(FourdgsWalk? walk, String code) {

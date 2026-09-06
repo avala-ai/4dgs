@@ -129,13 +129,43 @@ class FourdgsMalformedFile extends FourdgsException {
   const FourdgsMalformedFile(super.message, {super.refusalCode});
 }
 
+/// One physical top-level record carried by a structured refusal.
+class FourdgsRecordSite {
+  const FourdgsRecordSite({required this.opcode, required this.offset});
+
+  /// The record's opcode byte.
+  final int opcode;
+
+  /// The physical offset of that opcode byte in the file.
+  final int offset;
+}
+
+/// A late-front-matter refusal with both records that prove the placement.
+///
+/// This remains a [FourdgsMalformedFile], so existing catches and status handling
+/// are unchanged. The subtype adds machine-readable evidence for callers that
+/// must not recover physical provenance by parsing [message].
+class FourdgsLateFrontMatterFile extends FourdgsMalformedFile {
+  const FourdgsLateFrontMatterFile(
+    super.message, {
+    required this.lateRecord,
+    required this.firstStateRecord,
+  }) : super(refusalCode: refusalLateFrontMatterRecord);
+
+  /// The defined front-matter record found after state began.
+  final FourdgsRecordSite lateRecord;
+
+  /// The first Chunk or Delta Chunk that established the placement boundary.
+  final FourdgsRecordSite firstStateRecord;
+}
+
 /// The placement refusal at the point both physical record sites are known.
 ///
 /// Kept beside the refusal vocabulary so both streamed temporal-model readers
 /// and the validator use one sentence. [lateOffset] and [firstStateOffset] name
 /// opcode bytes, not record content, which is the physical provenance spec
 /// section 4 requires.
-FourdgsMalformedFile lateFrontMatterRecord({
+FourdgsLateFrontMatterFile lateFrontMatterRecord({
   required int lateOpcode,
   required int lateOffset,
   required int firstStateOpcode,
@@ -144,13 +174,17 @@ FourdgsMalformedFile lateFrontMatterRecord({
   String hex(int opcode) =>
       '0x${opcode.toRadixString(16).padLeft(2, '0').toUpperCase()}';
 
-  return FourdgsMalformedFile(
+  return FourdgsLateFrontMatterFile(
     '${opcodeName(lateOpcode)} record (opcode ${hex(lateOpcode)}) at byte '
     '$lateOffset appears after the first state record, '
     '${opcodeName(firstStateOpcode)} (opcode ${hex(firstStateOpcode)}) at byte '
     '$firstStateOffset; expected every defined front-matter record before the '
     'first Chunk or Delta Chunk',
-    refusalCode: refusalLateFrontMatterRecord,
+    lateRecord: FourdgsRecordSite(opcode: lateOpcode, offset: lateOffset),
+    firstStateRecord: FourdgsRecordSite(
+      opcode: firstStateOpcode,
+      offset: firstStateOffset,
+    ),
   );
 }
 

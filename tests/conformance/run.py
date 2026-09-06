@@ -155,7 +155,7 @@ REFUSAL_FAMILIES = frozenset({"python", "rust", "typescript", "cpp", "swift", "d
 # Structured late-placement diagnosis is a narrower claim than the existing refusal
 # vocabulary. The corpus layer adds no family here: each SDK layer opts in only after its
 # streamed runner emits both physical sites and its validator suite proves the same rule.
-LATE_FRONT_MATTER_FAMILIES: frozenset[str] = frozenset({"python", "rust", "typescript"})
+LATE_FRONT_MATTER_FAMILIES: frozenset[str] = frozenset({"dart", "python", "rust", "typescript"})
 
 # Exact canonical-unit aggregation is introduced as a stacked conformance change. The
 # transition is field-level: families absent here still compare every variant and every

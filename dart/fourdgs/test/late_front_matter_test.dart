@@ -118,11 +118,24 @@ Matcher _diagnostic(_LateFixture fixture, int lateOpcode) => allOf(
 );
 
 Matcher _lateRefusal(_LateFixture fixture, int lateOpcode) =>
-    isA<FourdgsMalformedFile>()
+    isA<FourdgsLateFrontMatterFile>()
         .having(
           (error) => error.refusalCode,
           'refusal code',
           refusalLateFrontMatterRecord,
+        )
+        .having(
+          (error) => (error.lateRecord.opcode, error.lateRecord.offset),
+          'late record',
+          (lateOpcode, fixture.lateOffset),
+        )
+        .having(
+          (error) => (
+            error.firstStateRecord.opcode,
+            error.firstStateRecord.offset,
+          ),
+          'first state record',
+          (fixture.firstStateOpcode, fixture.firstStateOffset),
         )
         .having(
           (error) => error.message,
@@ -143,6 +156,15 @@ Future<void> _expectValidatorRefusal(
   expect(finding.message, _diagnostic(fixture, lateOpcode));
   expect(finding.refusal!.site!.offset, fixture.lateOffset);
   expect(finding.refusal!.site!.what, 'the ${opcodeName(lateOpcode)} record');
+  final placement = finding.refusal!.lateFrontMatter!;
+  expect(
+    (placement.lateRecord.opcode, placement.lateRecord.offset),
+    (lateOpcode, fixture.lateOffset),
+  );
+  expect(
+    (placement.firstStateRecord.opcode, placement.firstStateRecord.offset),
+    (fixture.firstStateOpcode, fixture.firstStateOffset),
+  );
 }
 
 void main() {
