@@ -147,10 +147,10 @@ int gaussianSetAssemblyBytes(List<FourdgsDecodedChunk> chunks) {
     count += chunk.count;
   }
   int bytesPerGaussian = 21 * 4;
-  if (chunks.isNotEmpty && chunks.every((chunk) => chunk.sourceGroup != null)) {
+  if (chunks.any((chunk) => chunk.sourceGroup != null)) {
     bytesPerGaussian += 4;
   }
-  if (chunks.isNotEmpty && chunks.every((chunk) => chunk.sourceIndex != null)) {
+  if (chunks.any((chunk) => chunk.sourceIndex != null)) {
     bytesPerGaussian += 4;
   }
   if (chunks.any((chunk) => chunk.objectId != null)) {

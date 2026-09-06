@@ -8,6 +8,12 @@ All notable changes to the Dart package are documented here, following
 
 ### Fixed
 
+- **Omitted optional identity lanes reconstruct as logical zero.** Gaussian-birth assembly now
+  zero-fills mixed-Chunk `source_group`, `source_index`, and `object_id` columns. Keyframe-delta
+  keyframes and births use the same introducing-record default, while update omission carries the
+  reference label and a present update replaces it absolutely. The full same-bit `u32` object-id
+  bridge is preserved on streamed and indexed reads, and implicit rows remain inside the decoded-
+  state budget.
 - **Decoded Chunk Index counts are verified by name.** Streamed and indexed readers now refuse
   `gaussian_count` or `live_count` values that disagree with a decoded Chunk or composed state as
   `index-record-mismatch`, including intermediate links in a selected keyframe-delta chain. Range

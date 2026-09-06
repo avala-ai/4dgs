@@ -68,24 +68,21 @@ const Set<int> keyframeDeltaGopInvariant = <int>{
 const Set<int> keyframeDeltaAbsoluteInUpdate = <int>{
   attrRotationIndex,
   attrRotation,
+  attrSourceGroup,
+  attrSourceIndex,
+  attrObjectId,
 };
 
-/// The attribute a row may lack and still have a value: §6.6 says a chunk that
-/// omits `object_id` "is read as though every gaussian in that chunk carried
-/// `0`". That is the only such rule in the specification, so it is the only
-/// lane that pads here — the composed column must still line up with the whole
-/// population, and zero is what §6.6 says fills it.
+/// Exact identity labels whose physical omission has logical value zero.
 ///
-/// `source_group` and `source_index` were in this set and are not any more.
-/// §6.1 calls them optional, which says a file may omit the stream; it does not
-/// say what a composed column holds for a row whose birth omitted one, and no
-/// section supplies a value the way §6.6 does. Padding them made this SDK
-/// accept, and silently label `0`, a file that Python, Rust and Swift all
-/// refuse as `incomplete-birth` — one file with two meanings, which AGENTS.md
-/// rule 8 forbids. Whether the specification should give those two lanes a
-/// default is a question for the specification; until it does, this reads what
-/// is written.
-const Set<int> _zeroDefaultIdentityAttributes = <int>{attrObjectId};
+/// Complete keyframes and births introduce zero; update omission carries the
+/// reference label forward. A present update is absolute, as declared by
+/// [keyframeDeltaAbsoluteInUpdate], because labels are not metric differences.
+const Set<int> _zeroDefaultIdentityAttributes = <int>{
+  attrSourceGroup,
+  attrSourceIndex,
+  attrObjectId,
+};
 
 /// The optional identity lanes that reach the public API as their own arrays.
 ///
@@ -124,6 +121,20 @@ class KeyframeDeltaState {
   final Map<int, _Column> _bins;
 
   int get count => ids.length;
+
+  /// The three logical optional identity values for population [row].
+  ///
+  /// A physically absent column reads as zero. The object id reinterprets the
+  /// signed Attribute Stream code through the same-bit `u32` bridge.
+  ({int sourceGroup, int sourceIndex, int objectId}) identityAt(int row) {
+    RangeError.checkValidIndex(row, ids, 'row');
+    int value(int attribute) => _bins[attribute]?.values[row] ?? 0;
+    return (
+      sourceGroup: value(attrSourceGroup),
+      sourceIndex: value(attrSourceIndex),
+      objectId: value(attrObjectId).toUnsigned(32),
+    );
+  }
 
   /// Whether this composed population carries [attribute].
   ///
@@ -199,6 +210,16 @@ BigInt _streamDecodeWorkingBytes(Uint8List blob) {
   return bytes;
 }
 
+bool _streamCarriesAttribute(Uint8List blob, int attribute) {
+  final cursor = FourdgsCursor(blob);
+  while (cursor.remaining > 0) {
+    final header = readStreamHeader(cursor);
+    cursor.skip(header.payloadLength);
+    if (header.attributeId == attribute) return true;
+  }
+  return false;
+}
+
 BigInt _deltaCompositionWorkingBytes(
   KeyframeDeltaState reference,
   FourdgsDeltaChunkBody body,
@@ -212,6 +233,27 @@ BigInt _deltaCompositionWorkingBytes(
           ? BigInt.zero
           : referenceBytes ~/ BigInt.from(reference.count);
 
+  // An optional identity lane can be physically smaller than the logical
+  // column composition creates. One update row may introduce a zero prefix for
+  // the whole surviving population, and an omitted birth lane may append a
+  // zero suffix. Charge those implicit rows before decoding either group.
+  var implicitIdentityBytes = BigInt.zero;
+  for (final attribute in _zeroDefaultIdentityAttributes) {
+    final referenceHas = reference._bins.containsKey(attribute);
+    final updateHas = _streamCarriesAttribute(body.updates, attribute);
+    final birthHas = _streamCarriesAttribute(body.births, attribute);
+    final resultHas = referenceHas || updateHas || birthHas;
+    if (!referenceHas && resultHas) {
+      implicitIdentityBytes +=
+          BigInt.from(reference.count) * BigInt.from(Int32List.bytesPerElement);
+    }
+    if (!referenceHas && updateHas && !birthHas) {
+      implicitIdentityBytes +=
+          BigInt.from(body.header.birthCount) *
+          BigInt.from(Int32List.bytesPerElement);
+    }
+  }
+
   // Composition can hold a filtered/copied state and a grown state at once.
   // Attribute extensions in update or birth groups are included wholesale so
   // private/future streams cannot escape a fixed known-lane row estimate.
@@ -219,7 +261,8 @@ BigInt _deltaCompositionWorkingBytes(
       referenceBytes +
       updateBytes +
       birthBytes +
-      BigInt.from(body.header.birthCount) * referenceBytesPerRow;
+      BigInt.from(body.header.birthCount) * referenceBytesPerRow +
+      implicitIdentityBytes;
   return referenceBytes +
       updateBytes +
       birthBytes +
@@ -326,8 +369,12 @@ KeyframeDeltaState _applyDelta(
         );
       }
       var target = bins[attribute];
-      if (target == null && attribute == attrObjectId) {
-        target = _Column(1, Int32List(ids.length));
+      if (target == null &&
+          _zeroDefaultIdentityAttributes.contains(attribute)) {
+        target = _Column(
+          delta.channels,
+          Int32List(ids.length * delta.channels),
+        );
         bins[attribute] = target;
       }
       if (target == null) {
@@ -381,9 +428,9 @@ KeyframeDeltaState _applyDelta(
     // eleven required ids are wanted whatever the reference happens to carry —
     // a keyframe with `count == 0` carries none of them, and asking only what
     // the reference has accepted a birth stating position alone. And every
-    // attribute the reference *does* carry is wanted too: a birth that omits
-    // the state's `object_id` is not saying "background", it is failing to say
-    // anything. The zero-default ids are the exemption to both.
+    // non-identity attribute the reference *does* carry is wanted too: a birth
+    // that omits the state's position is not saying "the origin", it is failing
+    // to say anything. The zero-default identities are the exemption to both.
     //
     // Getting this wrong is not a diagnosis lost. The column merged below is
     // sized from the attributes present, so a birth missing one produced a
