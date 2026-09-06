@@ -1197,8 +1197,9 @@ jobs:
   swift-darwin:
     # visionOS and iOS are the platforms this package exists for, and a Linux build proves
     # nothing about either. The macOS runner is where the platform declarations in
-    # Package.swift meet a real SDK — and, now that the package links the core, where the
-    # Rust staticlib is proved to cross-compile for those platforms at all.
+    # Package.swift meet real SDKs. The job separately proves that the current Rust core can
+    # produce the next release artifact and that Swift consumes the already-published,
+    # checksummed artifact exactly as an out-of-tree Apple package does.
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
@@ -1218,8 +1219,8 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' rust/fourdgs/Cargo.toml | head -1)
           scripts/build_apple_xcframework.sh "$version" "$RUNNER_TEMP/apple-core"
-      - name: Build for macOS
-        run: swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
+      - name: Build for macOS through the published binary target
+        run: swift build --scratch-path swift/.build
       - name: Build for visionOS and iOS
         # xcodebuild resolves the package from the working directory, which is the
         # repository root now that the manifest lives there — there is nothing to cd into.
@@ -1229,7 +1230,6 @@ jobs:
             set -- $spec
             echo "::group::$1"
             xcodebuild -scheme FourDGS -destination "generic/platform=$1" \
-              -skipPackagePluginValidation \
-              OTHER_LDFLAGS="-L$PWD/target/$2/release" build | tail -5
+              -skipPackagePluginValidation build | tail -5
             echo "::endgroup::"
           done

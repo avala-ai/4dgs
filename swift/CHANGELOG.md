@@ -6,6 +6,16 @@ All notable changes to the Swift package are documented here, following
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-05
+
+### Added
+
+- Apple consumers now receive the Rust 0.7.1 core as a checksummed SwiftPM binary target. Its
+  XCFramework contains macOS, iOS device/simulator and visionOS device/simulator slices, so an
+  out-of-tree app can build and run the package without Cargo or a checkout of this repository.
+  Linux development keeps the source-built system-library route and tests the binding against the
+  current checkout's C ABI.
+
 ### Changed
 
 - **A finite `Quantization.step_time` at or below zero crosses the binding as a named refusal.**
