@@ -16,8 +16,8 @@ jobs:
     # its own and requires the gate to go red. A gate nobody tests is a gate that passes.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: |
           pip install -e './python/fourdgs[dev]'
@@ -39,8 +39,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: |
           pip install -e ./python/fourdgs
@@ -59,10 +59,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: "22" }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - name: Build the runners
         run: |
@@ -88,10 +88,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: corpus
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: "22" }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - name: Build the TypeScript runner and the Rust reference
         run: |
@@ -132,8 +132,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: corpus
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
 
       # Both versions are pinned for the same reason ruff is: a compiler that floats is a
@@ -168,8 +168,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - name: Build the runners
         run: cargo build --workspace --release
@@ -200,8 +200,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: corpus
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - name: Build the core, then the binding
         run: |
@@ -237,10 +237,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: corpus
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dart-lang/setup-dart@v1
         with: { sdk: "3.13.1" }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       # Compiled rather than run from source. `run.py` finds a runner by testing its
       # path for existence, and a .dart script always exists — so `dart run` would
@@ -277,7 +277,7 @@ jobs:
     container: swift:6.1
     needs: corpus
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain and the core's build are cached separately on purpose: a Rust
       # source change should not throw away the compiler. On a hit the job fetches no
       # toolchain at all, which is the point — an unretried network dependency on the
