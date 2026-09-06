@@ -1,11 +1,12 @@
 # Decision record: front matter ends at the first state record
 
-**Status: accepted and folded into [the specification](../index.md); SDK and corpus implementation
-remain tracked in [#78](https://github.com/avala-ai/4dgs/issues/78).** This document is the decision
-record and supporting audit. The normative rule is now spec §4: every defined front-matter record
-precedes the first state record, where a state record is a Chunk or Delta Chunk. The proposal text
-below retains its original first-Chunk wording where it describes the implementations and evidence
-that informed the decision; the specification controls if the two differ.
+**Status: accepted and folded into [the specification](../index.md); SDK activation remains tracked
+in [#78](https://github.com/avala-ai/4dgs/issues/78), and §6 records the shared corpus gate.** This
+document is the decision record and supporting audit. The normative rule is now spec §4: every
+defined front-matter record precedes the first state record, where a state record is a Chunk or
+Delta Chunk. The proposal text below retains its original first-Chunk wording where it describes the
+implementations and evidence that informed the decision; the specification controls if the two
+differ.
 
 The question in #78 is short and the answer decides geometry: **may a provenance-family record
 (`0x20`–`0x2F`) appear after the first `Chunk`?** Auditing the two read paths exposes the same
@@ -303,66 +304,47 @@ with:
 
 ---
 
-## 6. The conformance variant that pins it
+## 6. The conformance variants that pin it
 
-One variant, in `data/invalid/`, because after this proposal the file is not a legal file.
+The invalid corpus carries 15 gaussian-birth variants, one for every opcode in §4's closed
+front-matter class: `LateHeader`, `LateQuantization`, `LateWindowTable`, `LateLegacyAudio`,
+`LateCamera`, `LateMetadata`, `LateAttachment`, `LateAudioSource`, `LateAudioData`,
+`LateCoordinateFrame`, `LateSensorCalibration`, `LateRigTrajectory`, `LateGeodeticAnchor`,
+`LateObjectTable` and `LateObjectTrack`. One provenance example cannot stand in for five other
+parser branches, nor can it prove legacy Audio, Camera or either half of the Audio Source/Data pair.
 
-- **`LateProvenance`** — a well-formed scene carrying an `object_id` stream, an Object Table in
-  front matter, and one Object Track record spliced between the last `Chunk` and the first
-  `Chunk Index`, with `summary_start` adjusted. Every other byte is a conforming file: the index is
-  correct, the summary CRC is correct, and both read paths currently open it without complaint.
-- **What it asserts:** a streamed decode MUST refuse, naming opcode `0x25` and the record's byte
-  offset. It joins the nine files already in `data/invalid/`, which are all single-value refusals —
-  a bad magic, an unknown scheme, a window index out of range — so a record-position refusal is a
-  new shape for that directory rather than a variation on one already there.
-- **The rest of the positional family is independently pinned.** Add `LateCoordinateFrame`,
-  `LateSensorCalibration`, `LateRigTrajectory`, `LateGeodeticAnchor`, `LateObjectTable` and
-  `LateObjectTrack`, plus `LateQuantization`, `LateLegacyAudio`, `LateCamera`, `LateMetadata`,
-  `LateAttachment`, `LateWindowTable`, `LateAudioSource` and `LateAudioData`, using the same splice.
-  The six provenance opcodes dispatch through separate parser branches, so Object Track cannot stand
-  in for the other five; likewise, one provenance example cannot prove Quantization or the branches
-  for unrelated legacy opcodes, and Audio Source and Audio Data have separate refusal branches. Each
-  expectation names its opcode and offset; the last two close both halves of the pre-existing §5.17
-  gap while the rest prevent this proposal from documenting a broader rule than the suite proves.
-- **Opcode and offset are machine-checked, not prose around a generic refusal.** Before adding the
-  variants, the invalid-runner result grows optional `opcode` and `at` fields sourced from the
-  structured exception, and these expectations contain all three values, for example
-  `{"refused":"late-front-matter-record","opcode":37,"at":1234}` for an Object Track at byte 1234.
-  Every SDK's late-record refusal must retain those fields, and each conformance runner must
-  serialize them; comparing only today's `refused` string would not prove the diagnostic rule this
-  proposal adds. Existing invalid cases whose rule names no opcode keep their current one-field
-  expectations.
-- **The validator is exercised separately from the decode runners.** `tests/conformance/run.py`
-  currently invokes decoders only, so these files do not by themselves prove `fourdgs.validate`. The
-  corpus change therefore lands with a validator test that runs the Python validator over every
-  `Late*` file and asserts the same `refused`, `opcode` and `at` triple. Each SDK's inspect/validate
-  milestone adds the equivalent assertion to that language's validator suite before claiming this
-  rule in the feature matrix. Decoder coverage and validator coverage are two independent gates;
-  neither is cited as evidence for the other.
-- **Why an invalid variant and not a valid one:** a valid variant can only assert that the two paths
-  agree, and under this proposal they agree because the file cannot exist. The thing worth pinning
-  is the refusal — without it, an implementation that keeps today's silent behaviour passes.
-- **No indexed verdict is asserted.** An indexed reader MAY stop at the first Chunk, so it may never
-  observe the late record; an implementation that scans farther may instead issue the specified
-  refusal. Both behaviours conform. Before these files are added, the harness gains a
-  `STREAMED_ONLY_INVALID` set containing every `Late*` variant, and `supports()` returns false for
-  indexed runners when the variant is in that set. The same harness change makes refusal execution
-  explicit for **every streamed runner family**, including Dart: it replaces the current
-  family-level "at least one runner ran" audit with a `(runner, variant)` audit and fails unless
-  every streamed runner executed every applicable `Late*` case. A streamed family may not skip the
-  invalid corpus merely because it is absent from today's `REFUSAL_FAMILIES`; it must serialize the
-  structured late-record refusal first. This is a variant-specific indexed exclusion, not a shared
-  refusal expectation that silently asks indexed implementations to detect what they are allowed not
-  to scan.
-- **Both temporal-model stream loops are exercised, including skipped opcodes.** Build
-  `LateKeyframeDeltaQuantization`, `LateKeyframeDeltaWindowTable` and
-  `LateKeyframeDeltaObjectTrack`. The first two reach branches the keyframe-delta loop already
-  dispatches; the third reaches a defined opcode that loop currently skips entirely. All are decoded
-  through the keyframe-delta front-to-back entry point and every expectation names the late opcode
-  and offset. Together with the ordinary `gaussian-birth` `Late*` files, they require a shared
-  opcode-level positional guard (or equivalent checks in every loop), rather than permitting a port
-  to patch only the Window Table branch while late Quantization, Metadata or provenance records
-  remain silently accepted.
+`LateKeyframeDeltaQuantization`, `LateKeyframeDeltaWindowTable` and `LateKeyframeDeltaObjectTrack`
+repeat representative parsed and skipped opcodes through the independent keyframe-delta
+front-to-back loop. Together, the 18 cases require an opcode-level guard on both stream
+implementations rather than a special case in one parser branch.
+
+Each witness inserts an empty, correctly framed record between the last state record and the first
+Chunk Index, then adjusts Footer `summary_start`. The Chunk Index, summary bytes and summary CRC
+stay valid. Empty content makes parsing the record fail if placement is checked too late; Header,
+Quantization and Window Table are already present, so those cases also require placement to win over
+duplicate detection.
+
+The expectation machine-checks the complete §4 diagnosis rather than prose around an identifier:
+
+```json
+{
+  "firstStateRecord": { "at": "516", "opcode": 5 },
+  "lateRecord": { "at": "2374", "opcode": 1 },
+  "refused": "late-front-matter-record"
+}
+```
+
+The decode harness invokes readers, not validators. Each SDK therefore runs the same fixtures
+through its validator suite and proves both sites before adding its family to
+`LATE_FRONT_MATTER_FAMILIES` or changing its feature-matrix cell. Decoder and validator coverage are
+independent gates.
+
+All 18 names live in the shared `STREAMED_ONLY_REFUSALS` registry used by both `run.py` and the
+downloadable corpus manifest. A streamed runner opts into all of them with `lateFrontMatterRecords`;
+an indexed runner is never asked them even though each file has a valid index. This preserves §4's
+permission to stop at the first state rather than disguising the exemption as a missing refusal.
+Generator tests insert unknown `0x7D` and private `0x91` records at the same site and require both
+temporal-model readers to continue accepting them.
 
 These variants regenerate nothing already committed. The corpus gains files; nothing existing moves.
 

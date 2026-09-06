@@ -25,6 +25,7 @@ function runner(readPath, counts) {
     exactAggregates: true,
     canonicalStateOrder: true,
     aggregateDecodedBudget: true,
+    lateFrontMatterRecords: true,
     command: `./decode_${readPath}`,
     ...counts,
   };
@@ -80,6 +81,7 @@ test("an honest partial, one-path result is valid", () => {
       exactAggregates: false,
       canonicalStateOrder: false,
       aggregateDecodedBudget: false,
+      lateFrontMatterRecords: false,
     },
   ];
   assert.equal(validateCatalog(withResults(partial)).results[0].runners[0].passed, 51);
@@ -140,6 +142,16 @@ const invalidCases = [
     /aggregateDecodedBudget: expected true or false/,
   ],
   [
+    "non-boolean late front matter capabilities",
+    (value) => (value.results[0].runners[0].lateFrontMatterRecords = 1),
+    /lateFrontMatterRecords: expected true or false/,
+  ],
+  [
+    "late front matter without refusal diagnosis",
+    (value) => (value.results[0].runners[0].refusals = false),
+    /lateFrontMatterRecords: cannot be true when refusals is false/,
+  ],
+  [
     "runner identity mismatches",
     (value) => (value.results[0].runners[0].name = "other/decode_streamed"),
     /runners\[0\]\.name: expected "example\/decode_streamed"/,
@@ -191,6 +203,7 @@ const invalidCases = [
         {
           ...runner("streamed", { passed: 74, skipped: 0, failed: 0 }),
           refusals: false,
+          lateFrontMatterRecords: false,
         },
       ];
     },

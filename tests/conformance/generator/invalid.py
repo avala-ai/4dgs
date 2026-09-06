@@ -60,6 +60,15 @@ class Refusal:
     rule: str
     #: bytes -> bytes. Must break exactly one rule.
     mutate: Callable[[bytes], bytes]
+    #: Extra canonical result fields that prove a structured diagnosis. Most refusals
+    #: need only their identifier; placement also names both physical record sites.
+    details: Callable[[bytes], dict] | None = None
+
+    def expectation(self, data: bytes) -> dict:
+        out = {"refused": self.code}
+        if self.details is not None:
+            out.update(self.details(data))
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -72,6 +81,26 @@ class Refusal:
 
 _RECORD_HEADER = struct.Struct("<BQ")
 _MAGIC_LEN = 8
+_STATE_OPCODES = frozenset({0x05, 0x10})
+_FRONT_MATTER_OPCODES = frozenset(
+    {
+        0x01,  # Header
+        0x03,  # Quantization
+        0x04,  # Window Table
+        0x09,  # legacy Audio
+        0x0A,  # Camera
+        0x0B,  # Metadata
+        0x0D,  # Attachment
+        0x11,  # Audio Source
+        0x12,  # Audio Data
+        0x20,  # Coordinate Frame
+        0x21,  # Sensor Calibration
+        0x22,  # Rig Trajectory
+        0x23,  # Geodetic Anchor
+        0x24,  # Object Table
+        0x25,  # Object Track
+    }
+)
 
 
 def _records(data: bytes):
@@ -107,6 +136,62 @@ def _replace_once(data: bytes, old: bytes, new: bytes) -> bytes:
     count = data.count(old)
     assert count == 1, f"{old!r} occurs {count} times in the base file, expected once"
     return data.replace(old, new)
+
+
+def _insert_before_summary(data: bytes, opcode: int, content: bytes = b"") -> bytes:
+    """Insert one framed record after state and repair the Footer's absolute site.
+
+    The two selected bases end their state-record run exactly where their indexed summary
+    begins. Inserting there leaves every Chunk Index entry and the summary bytes/CRC intact;
+    only Footer.summary_start moves. Keeping an index is deliberate even though the harness
+    exempts indexed openers: the exemption is about what that path need not scan, not about
+    handing it a file it could never open.
+    """
+    footer_content, footer_length = _find(data, 0x02)
+    assert footer_length >= 20, "the Footer is shorter than its version-1 fields"
+    summary_start, summary_offset_start, declared_crc = struct.unpack_from("<QQI", data, footer_content)
+    assert summary_start > 0, "a late-record witness must carry an indexed summary"
+    assert summary_offset_start == 0, "the selected witness bases must not carry Summary Offset records"
+    footer_start = footer_content - _RECORD_HEADER.size
+    assert zlib.crc32(data[summary_start:footer_start]) & 0xFFFFFFFF == declared_crc
+
+    state_end = max(
+        content_offset + length
+        for record_opcode, content_offset, length in _records(data)
+        if record_opcode in _STATE_OPCODES
+    )
+    assert state_end == summary_start, "the selected witness base has records between state and summary"
+
+    record = _RECORD_HEADER.pack(opcode, len(content)) + content
+    mutated = data[:summary_start] + record + data[summary_start:]
+    shifted_footer_content = footer_content + len(record)
+    return _patch(mutated, shifted_footer_content, struct.pack("<Q", summary_start + len(record)))
+
+
+def _late(opcode: int) -> Callable[[bytes], bytes]:
+    def mutate(data: bytes) -> bytes:
+        # Empty content makes every defined structured record malformed on its own. The
+        # positional refusal must fire before a parser reaches that body; for Header,
+        # Quantization and Window Table it must also win over duplicate detection.
+        return _insert_before_summary(data, opcode)
+
+    return mutate
+
+
+def _late_record_details(data: bytes) -> dict:
+    first_state: tuple[int, int] | None = None
+    for opcode, content, _length in _records(data):
+        at = content - _RECORD_HEADER.size
+        if first_state is None and opcode in _STATE_OPCODES:
+            first_state = opcode, at
+            continue
+        if first_state is not None and opcode in _FRONT_MATTER_OPCODES:
+            first_opcode, first_at = first_state
+            return {
+                "firstStateRecord": {"at": str(first_at), "opcode": first_opcode},
+                "lateRecord": {"at": str(at), "opcode": opcode},
+            }
+    raise AssertionError("the late-record witness carries no defined front matter after state")
 
 
 # --------------------------------------------------------------------------
@@ -275,6 +360,78 @@ INDEX_COUNT_REFUSALS: tuple[Refusal, ...] = (
     Refusal("WrongIndexLiveCount", "index-record-mismatch", "spec 5.8", _wrong_index_live_count),
 )
 
+#: Spec section 4's complete closed placement class, and the names shared by diagnostics.
+_LATE_GAUSSIAN_CASES = (
+    ("LateHeader", 0x01),
+    ("LateQuantization", 0x03),
+    ("LateWindowTable", 0x04),
+    ("LateLegacyAudio", 0x09),
+    ("LateCamera", 0x0A),
+    ("LateMetadata", 0x0B),
+    ("LateAttachment", 0x0D),
+    ("LateAudioSource", 0x11),
+    ("LateAudioData", 0x12),
+    ("LateCoordinateFrame", 0x20),
+    ("LateSensorCalibration", 0x21),
+    ("LateRigTrajectory", 0x22),
+    ("LateGeodeticAnchor", 0x23),
+    ("LateObjectTable", 0x24),
+    ("LateObjectTrack", 0x25),
+)
+
+#: Three branches from the independent keyframe-delta streamed loop: two records it
+#: parses and one defined provenance record it used to skip. Together with the complete
+#: gaussian-birth table above, these prevent a fix in only one temporal-model loop.
+_LATE_KEYFRAME_DELTA_CASES = (
+    ("LateKeyframeDeltaQuantization", 0x03),
+    ("LateKeyframeDeltaWindowTable", 0x04),
+    ("LateKeyframeDeltaObjectTrack", 0x25),
+)
+
+#: All are path-specific: streamed readers and validators owe the refusal, while an
+#: indexed opener may stop at the first state record and never observe it.
+LATE_GAUSSIAN_BASE = "OneWindow"
+LATE_GAUSSIAN_FLAGS = ("UseChunkIndex", "UseCrc")
+LATE_KEYFRAME_DELTA_BASE = "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics"
+LATE_GAUSSIAN_REFUSALS: tuple[Refusal, ...] = tuple(
+    Refusal(
+        name,
+        "late-front-matter-record",
+        "spec 4",
+        _late(opcode),
+        _late_record_details,
+    )
+    for name, opcode in _LATE_GAUSSIAN_CASES
+)
+LATE_KEYFRAME_DELTA_REFUSALS: tuple[Refusal, ...] = tuple(
+    Refusal(
+        name,
+        "late-front-matter-record",
+        "spec 4",
+        _late(opcode),
+        _late_record_details,
+    )
+    for name, opcode in _LATE_KEYFRAME_DELTA_CASES
+)
+
+#: Qualified invalid names whose rule is observable only by a front-to-back path. They
+#: live below ``invalid/late-front-matter/`` so SDK unit suites which deliberately claim
+#: the baseline invalid family by scanning ``invalid/*.4dgs`` do not accidentally claim a
+#: separately gated capability as soon as the shared corpus grows. This registry is shared
+#: by the live harness and the release manifest so neither can accidentally turn the spec's
+#: indexed-open exemption into an obligation.
+LATE_FRONT_MATTER_PREFIX = "invalid/late-front-matter/"
+STREAMED_ONLY_REFUSALS = frozenset(
+    f"{LATE_FRONT_MATTER_PREFIX}{refusal.name}" for refusal in (*LATE_GAUSSIAN_REFUSALS, *LATE_KEYFRAME_DELTA_REFUSALS)
+)
+
+#: Invalid witnesses cut from a keyframe-delta base. The release manifest needs the wire
+#: model, not the directory's default.
+KEYFRAME_DELTA_REFUSALS = frozenset(
+    tuple(f"invalid/{refusal.name}" for refusal in INDEX_COUNT_REFUSALS)
+    + tuple(f"{LATE_FRONT_MATTER_PREFIX}{refusal.name}" for refusal in LATE_KEYFRAME_DELTA_REFUSALS)
+)
+
 #: Invalid variants the encoder writes directly rather than a mutation producing.
 #:
 #: A byte patch cannot make this one: shortening a length-prefixed string moves every
@@ -298,4 +455,12 @@ ENCODED: tuple[tuple[str, str, str, dict], ...] = (
 
 #: Every identifier the suite knows. A runner may produce no other, and a new refusal is
 #: added here rather than invented in one language.
-CODES = frozenset(r.code for r in (*REFUSALS, *INDEX_COUNT_REFUSALS)) | {code for _, code, _, _ in ENCODED}
+CODES = frozenset(
+    r.code
+    for r in (
+        *REFUSALS,
+        *INDEX_COUNT_REFUSALS,
+        *LATE_GAUSSIAN_REFUSALS,
+        *LATE_KEYFRAME_DELTA_REFUSALS,
+    )
+) | {code for _, code, _, _ in ENCODED}

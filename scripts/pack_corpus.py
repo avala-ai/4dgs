@@ -42,6 +42,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 DATA = os.path.join(ROOT, "tests", "conformance", "data")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
+sys.path.insert(0, os.path.join(ROOT, "tests", "conformance"))
+
+from generator import invalid as invalid_corpus
 
 #: The corpus's version, and the only place it is written. The release job asserts the tag
 #: `releases/corpus/vX.Y.Z` against this string before it builds anything, exactly as every
@@ -129,7 +132,7 @@ def describe(name: str, directory: str, path: str, expectation_path: str) -> dic
     which refusal identifier a conforming reader must produce.
     """
     qualified = f"{directory}/{name}" if directory else name
-    invalid = directory == "invalid"
+    invalid = directory == "invalid" or directory.startswith("invalid/")
     refusal = None
     if invalid:
         with open(expectation_path, encoding="utf-8") as handle:
@@ -142,14 +145,18 @@ def describe(name: str, directory: str, path: str, expectation_path: str) -> dic
         "bytes": os.path.getsize(path),
         "sha256": sha256(path),
         "expectationSha256": sha256(expectation_path),
-        "temporalModel": "keyframe-delta" if directory == "keyframe" else "gaussian-birth",
+        "temporalModel": (
+            "keyframe-delta"
+            if directory == "keyframe" or qualified in invalid_corpus.KEYFRAME_DELTA_REFUSALS
+            else "gaussian-birth"
+        ),
         # Whether a runner that reads through the chunk index may be asked this variant. A
-        # file written without an index cannot be read that way at all; the invalid corpus
-        # is the exception, cut from a base that carries one precisely so both read paths
-        # can be asked to refuse it. This mirrors `supports()` in the harness, and it is
-        # here so an out-of-tree harness does not have to reimplement that rule by reading
-        # Python.
-        "indexed": invalid or "UseChunkIndex" in name,
+        # file written without an index cannot be read that way at all. Most invalid files
+        # are cut from an indexed base precisely so both read paths can be asked to refuse
+        # them. Late-front-matter witnesses are the normative exception: they retain their
+        # valid indexes, but an indexed opener may stop at the first state and is not asked
+        # to scan the tail. This mirrors `supports()` from one shared variant registry.
+        "indexed": (invalid or "UseChunkIndex" in name) and qualified not in invalid_corpus.STREAMED_ONLY_REFUSALS,
         # `null` for a valid variant: it must decode. For an invalid one this is the whole
         # expectation — the identifier of the rule a conforming reader refuses it under.
         "refusal": refusal,
@@ -198,7 +205,8 @@ them usable by somebody who has not cloned it.
     <variant>.json   exactly what a correct decoder must produce from it
     keyframe/        the keyframe-delta temporal model
     object/          the object layer: an Object Table and SE(3) tracks
-    invalid/         files a conforming reader must refuse
+    invalid/         baseline files a conforming reader must refuse
+      late-front-matter/  streamed-only, independently gated placement refusals
 ```
 
 {counts}
@@ -225,7 +233,7 @@ implementation supports, then compare parsed JSON rather than text:
 
 ```bash
 mode=streamed # or indexed
-families=valid,keyframe,object,invalid # remove families this runner does not implement
+families=valid,keyframe,object,invalid,invalid/late-front-matter # remove unsupported families
 allowlist= # optional file: one MANIFEST variant name per line
 selection=$(mktemp) || exit 1
 trap 'rm -f "$selection"' EXIT
@@ -314,10 +322,11 @@ exit "$failed"
 ```
 
 `MANIFEST.json` says which variants a runner may skip and why: `family` separates the base,
-keyframe-delta, object-layer and invalid corpora; `indexed` is false for a variant no index-reading
-runner can answer; and `refusal` is non-null for a file that must be refused. For those the document
-to print is `{{"refused": "<identifier>"}}` and the exit status is still 0, because a refusal is a
-result rather than a crash. A feature-level partial implementation sets `allowlist` to a text file
+keyframe-delta, object-layer and invalid corpora; `indexed` is false for a variant an indexed reader
+is not obligated to answer; and `refusal` is non-null for a file that must be refused. The JSON beside
+the file is the exact answer: ordinarily `{{"refused": "<identifier>"}}`, while a rule that requires
+structured evidence carries those additional fields too. The exit status is still 0, because a
+refusal is a result rather than a crash. A feature-level partial implementation sets `allowlist` to a text file
 containing the exact manifest `name` values it supports; unknown names, malformed manifest data and
 an empty selection all fail before the runner is invoked. Any non-zero runner status fails its
 variant before stdout is compared.

@@ -21,6 +21,23 @@ What each part of the version means here:
 
 ## [Unreleased]
 
+### Added
+
+- Eighteen streamed-only `late-front-matter-record` refusal variants: one for every defined
+  front-matter opcode under `gaussian-birth`, plus Quantization, Window Table and Object Track
+  through the independent `keyframe-delta` loop. Each expectation includes the exact physical late
+  record and first state record opcodes and byte offsets.
+
+- The optional `lateFrontMatterRecords` runner capability. It activates the whole structured family
+  only for streamed readers and requires the existing `refusals` capability; indexed readers retain
+  spec §4's exemption from scanning beyond the first state record. The independent-results catalog
+  preserves and validates the same capability in published runner evidence.
+
+### Changed
+
+- Release manifests now use the same streamed-only registry as the live harness, and correctly
+  identify invalid witnesses cut from keyframe-delta bases.
+
 ## [0.1.0] - 2026-09-05
 
 The first publication of the corpus. Until now the only route to the `.4dgs` files was cloning the
