@@ -29,9 +29,11 @@ import fourdgs
 import numpy as np
 import pytest
 from fourdgs import keyframe_delta_file as kdf
+from fourdgs import opcode as op
 from fourdgs.exceptions import MalformedFile, TruncatedFile
 from fourdgs.indexed_reader import open_indexed
 from fourdgs.readable import BytesReadable
+from fourdgs.validate import validate
 
 CONFORMANCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "conformance")
 SHARED_CONFORMANCE = os.path.join(CONFORMANCE, "..", "..", "tests", "conformance")
@@ -156,6 +158,21 @@ def test_index_count_mismatches_are_one_named_refusal_on_both_read_paths(refusal
         if field == "gaussian_count"
         else decoded.state.count
     )
+
+    # The validator's refusal belongs to the physical state record named by the
+    # disagreeing entry, not to the summary entry that carries the wrong count. This
+    # assertion runs from the staged witnesses before they join the invalid corpus, so
+    # the corpus-driven placement sweep cannot silently lose coverage while activation
+    # is waiting on another SDK layer.
+    report = validate(data)
+    placed = next(
+        finding.refusal
+        for finding in report.findings
+        if finding.refusal is not None and finding.refusal.code == "index-record-mismatch"
+    )
+    assert placed.site is not None
+    assert placed.site.offset == wrong.chunk_offset
+    assert data[placed.site.offset] == op.DELTA_CHUNK
 
     # The whole streamed decoder and the ordinary indexed decoder both own the rule.
     for decode in (kdf.decode_streamed, kdf.decode_indexed):
