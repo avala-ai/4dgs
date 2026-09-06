@@ -172,10 +172,19 @@ int main(int argc, char** argv) {
   // A file refused this early — bad magic, a major version from the future — never reaches a
   // Scene, so the refusal is answered here as well as below.
   if (!model) return refusedOrFailed(model.error());
+  Result<std::optional<std::string>> marker = fourdgs::peekHeaderAttribute(
+      fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()), "conformance");
+  if (!marker) return refusedOrFailed(marker.error());
+  const bool optionalIdentity =
+      marker->has_value() && fourdgs::conformance::isOptionalIdentityWitness(**marker);
   if (*model == "keyframe-delta") {
-    Result<std::string> json = fourdgs::keyframeDeltaStatesJson(
-        fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()), /*indexed=*/false,
-        options);
+    Result<std::string> json =
+        optionalIdentity ? fourdgs::keyframeDeltaIdentityStatesJson(
+                               fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()),
+                               /*indexed=*/false, options)
+                         : fourdgs::keyframeDeltaStatesJson(
+                               fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()),
+                               /*indexed=*/false, options);
     if (!json) return refusedOrFailed(json.error());
     std::printf("%s\n", json->c_str());
     return 0;
@@ -196,6 +205,11 @@ int main(int argc, char** argv) {
   // during the load, and a refusal the suite would miss if only the open were answered.
   Result<void> loaded = scene.loadAll(3, options);
   if (!loaded) return refusedOrFailed(loaded.error());
+  if (optionalIdentity) {
+    const GaussianView gaussians = scene.gaussians();
+    std::printf("%s\n", fourdgs::conformance::optionalIdentityGaussianBirthJson(gaussians).c_str());
+    return 0;
+  }
   fourdgs::conformance::SceneRecords records;
   Result<void> collected = fourdgs::conformance::collectRecords(scene, &records);
   if (!collected) return refusedOrFailed(collected.error());

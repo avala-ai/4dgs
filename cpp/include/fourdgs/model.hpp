@@ -187,6 +187,11 @@ struct GaussianView {
   Span<const float> sigmaT;
   Span<const float> winLo;
   Span<const float> winHi;
+  /// Optional producer grouping labels. Empty is the storage-optimized form of a logical
+  /// all-zero column; mixed Chunk presence is materialized to `count` rows.
+  Span<const std::int64_t> sourceGroups;
+  /// Optional producer-stable labels, with the same zero/default convention.
+  Span<const std::int64_t> sourceIndices;
   /// Object membership (spec §6.6), or empty when the scene carries no `object_id`
   /// stream. Empty and all-zero are different claims: no membership at all, versus every
   /// gaussian assigned to background.

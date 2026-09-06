@@ -103,7 +103,14 @@ Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(Span<const Keyfram
 }
 
 Result<std::string> peekTemporalModel(Span<const std::uint8_t>) { return notImplemented(); }
+Result<std::optional<std::string>> peekHeaderAttribute(Span<const std::uint8_t>,
+                                                       const std::string&) {
+  return notImplemented();
+}
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t>, bool, std::uint64_t) {
+  return notImplemented();
+}
+Result<std::string> keyframeDeltaIdentityStatesJson(Span<const std::uint8_t>, bool, std::uint64_t) {
   return notImplemented();
 }
 Result<std::string> provenanceJson(Handle&) { return notImplemented(); }

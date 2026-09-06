@@ -383,6 +383,8 @@ GaussianView loadedGaussians(const Handle& handle) {
   view.sigmaT = spanOf(fourdgs_scene_sigma_t(scene), n);
   view.winLo = spanOf(fourdgs_scene_win_lo(scene), n);
   view.winHi = spanOf(fourdgs_scene_win_hi(scene), n);
+  view.sourceGroups = spanOf(fourdgs_scene_source_groups(scene), n);
+  view.sourceIndices = spanOf(fourdgs_scene_source_indices(scene), n);
   // Null stays empty rather than becoming zeros: a scene with no membership and one where
   // everything is background are different files.
   view.objectIds = spanOf(fourdgs_scene_object_ids(scene), n);
@@ -938,24 +940,50 @@ Result<std::string> ownedStringCall(int (*call)(const std::uint8_t*, std::size_t
   return out;
 }
 
+using KeyframeJsonCall = int (*)(const std::uint8_t*, std::size_t, int, std::uint64_t, const char**,
+                                 std::size_t*);
+
+Result<std::string> ownedKeyframeJsonCall(KeyframeJsonCall call, Span<const std::uint8_t> bytes,
+                                          bool indexed, std::uint64_t maxDecodedStateBytes) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  const int status =
+      call(bytes.data(), bytes.size(), indexed ? 1 : 0, maxDecodedStateBytes, &data, &length);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
+  fourdgs_string_free(data, length);
+  return out;
+}
+
 }  // namespace
 
 Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes) {
   return ownedStringCall(&fourdgs_peek_temporal_model, bytes);
 }
 
-Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed,
-                                            std::uint64_t maxDecodedStateBytes) {
+Result<std::optional<std::string>> peekHeaderAttribute(Span<const std::uint8_t> bytes,
+                                                       const std::string& key) {
   const char* data = nullptr;
   std::size_t length = 0;
-  // Sequenced deliberately, like every two-out-parameter call: the status is read first, the
-  // out parameters only after it is OK.
-  const int status = fourdgs_keyframe_delta_states_json_with_options(
-      bytes.data(), bytes.size(), indexed ? 1 : 0, maxDecodedStateBytes, &data, &length);
+  const int status = fourdgs_peek_header_attribute(bytes.data(), bytes.size(), key.data(),
+                                                   key.size(), &data, &length);
   if (status != FOURDGS_STATUS_OK) return failure(status).error();
-  std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
+  if (data == nullptr) return std::optional<std::string>();
+  std::string out(data, length);
   fourdgs_string_free(data, length);
-  return out;
+  return std::optional<std::string>(std::move(out));
+}
+
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                            std::uint64_t maxDecodedStateBytes) {
+  return ownedKeyframeJsonCall(&fourdgs_keyframe_delta_states_json_with_options, bytes, indexed,
+                               maxDecodedStateBytes);
+}
+
+Result<std::string> keyframeDeltaIdentityStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                                    std::uint64_t maxDecodedStateBytes) {
+  return ownedKeyframeJsonCall(&fourdgs_keyframe_delta_identity_states_json_with_options, bytes,
+                               indexed, maxDecodedStateBytes);
 }
 
 Result<std::string> provenanceJson(Handle& handle) {
