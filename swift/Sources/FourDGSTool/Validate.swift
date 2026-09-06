@@ -821,6 +821,17 @@ private func isAuxiliaryRecord(_ opcode: UInt8) -> Bool {
     (0x0A...0x0F).contains(opcode) || (0x20...0x25).contains(opcode)
 }
 
+/// The exact front-matter placement class from the registry. This is deliberately a closed set:
+/// unknown and private records keep their section 4.2 skip rule after state begins.
+private func isDefinedFrontMatterRecord(_ opcode: UInt8) -> Bool {
+    switch opcode {
+    case 0x01, 0x03, 0x04, 0x09, 0x0A, 0x0B, 0x0D, 0x11, 0x12, 0x20...0x25:
+        return true
+    default:
+        return false
+    }
+}
+
 private func diagnosticOffset(_ error: FourDGSError) -> UInt64? {
     let offset: Int64?
     switch error {
@@ -831,6 +842,8 @@ private func diagnosticOffset(_ error: FourDGSError) -> UInt64? {
         offset = at
     case .unsupportedMajorVersion:
         offset = 5
+    case .lateFrontMatterRecord(let records):
+        return records.lateRecord.offset
     case .noChunkIndex, .unreadableSource, .core, .notImplemented:
         offset = nil
     }
@@ -3123,7 +3136,8 @@ func validate(_ source: ToolReader) -> Report {
     var firstProvenance: UInt8?
     var unknownCount: UInt64 = 0
     var firstUnknown: UInt8?
-    var stateSeen = false
+    var firstStateRecord: Frame?
+    var lateFrontMatterRecord: Frame?
     var pendingFooter: UInt64?
     var firstNonFinalFooter: UInt64?
     var nonFinalFooterCount: UInt64 = 0
@@ -3154,8 +3168,22 @@ func validate(_ source: ToolReader) -> Report {
                 }
             },
             visit: { frame, intact in
-                guard intact else { return }
                 let opcode = frame.opcode
+                // A complete nine-byte header proves placement before its body is parsed or
+                // even shown to fit. Preserve that precedence for a truncated late body.
+                if firstStateRecord == nil,
+                    opcode == Opcode.chunk || opcode == Opcode.deltaChunk
+                {
+                    firstStateRecord = frame
+                }
+                if firstStateRecord != nil, lateFrontMatterRecord == nil,
+                    isDefinedFrontMatterRecord(opcode)
+                {
+                    lateFrontMatterRecord = frame
+                }
+                if lateFrontMatterRecord != nil { return }
+                guard intact else { return }
+
                 if let footer = pendingFooter {
                     if firstNonFinalFooter == nil { firstNonFinalFooter = footer }
                     if nonFinalFooterCount < UInt64.max { nonFinalFooterCount += 1 }
@@ -3167,12 +3195,6 @@ func validate(_ source: ToolReader) -> Report {
                 if opcode == Opcode.header { hasHeader = true }
                 if opcode == Opcode.quantization { hasQuantization = true }
                 if opcode == Opcode.footer { hasFooter = true }
-                if opcode == Opcode.chunk || opcode == Opcode.deltaChunk { stateSeen = true }
-                if stateSeen && (opcode == Opcode.audioSource || opcode == Opcode.audioData) {
-                    report.error(
-                        "\(opcodeName(opcode)) at byte \(frame.offset) appears after the first "
-                            + "Chunk or DeltaChunk; audio records must precede state records")
-                }
                 if opcode == Opcode.audio {
                     if legacyAudioCount < UInt64.max { legacyAudioCount += 1 }
                     do {
@@ -3261,6 +3283,16 @@ func validate(_ source: ToolReader) -> Report {
             })
     } catch {
         report.refused("", asFourDGS(error), nil, nil)
+        return report
+    }
+
+    if let late = lateFrontMatterRecord, let state = firstStateRecord {
+        let records = LateFrontMatterRecords(
+            lateRecord: RecordSite(opcode: late.opcode, offset: late.offset),
+            firstStateRecord: RecordSite(opcode: state.opcode, offset: state.offset))
+        report.refused(
+            "", .lateFrontMatterRecord(records: records), walked,
+            Site(offset: late.offset, what: "the late \(opcodeName(late.opcode)) record"))
         return report
     }
 

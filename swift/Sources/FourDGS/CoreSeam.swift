@@ -624,6 +624,9 @@ enum Core {
     /// path: `false` composes front to back, `true` walks each instant's chain through the
     /// index. Both must agree, which is why the suite runs this on both.
     static func keyframeDeltaStatesJson(_ bytes: [UInt8], indexed: Bool) throws -> String {
+        if !indexed {
+            try StreamedRecordPlacement.validate(InMemoryReader(bytes))
+        }
         var out: UnsafePointer<CChar>?
         var length = 0
         let status = bytes.withUnsafeBufferPointer { buffer in
@@ -896,7 +899,8 @@ enum Core {
         guard fourdgs_last_refusal_code(&pointer, &length) == ok else { return nil }
         guard pointer != nil, length > 0 else { return nil }
         // An identifier this build has no case for is `nil` rather than a fabricated one: a
-        // core that grows a ninth refusal should look unnamed here, not misnamed.
+        // core that grows a refusal this binding does not know should look unnamed here,
+        // not misnamed.
         return RefusalCode(rawValue: string(pointer, length))
     }
 

@@ -8,6 +8,12 @@ All notable changes to the Swift package are documented here, following
 
 ### Changed
 
+- Explicit streamed reads and `4dgs validate` now refuse every defined front-matter opcode found
+  after the first Chunk or Delta Chunk as `late-front-matter-record`, carrying both physical
+  opcode/byte sites as typed data. The bounded Swift framing pass also gives Apple consumers the
+  rule while the published 0.7.1 XCFramework predates it; indexed open keeps the specification's
+  permitted early stop. `FourDGSError.lateFrontMatterRecord` is an additive public enum case, so an
+  exhaustive consumer switch must add a corresponding arm.
 - Chunk Index count mismatches now cross the Rust core boundary as the named `index-record-mismatch`
   refusal, including through the Swift conformance runners and CLI.
 

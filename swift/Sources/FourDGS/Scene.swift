@@ -139,6 +139,12 @@ public final class SceneReader {
         // can at the boundary is the job, not duplication for its own sake.
         try Core.validateMagic(&probe)
 
+        // Explicit streamed reads observe the whole physical record sequence, including the
+        // placement evidence an indexed opener is permitted not to seek past the first state.
+        if case .streamed = readPath {
+            try StreamedRecordPlacement.validate(source)
+        }
+
         let handle = try Core.open(source, mode: readPath.mode)
         self.handle = handle
         try Core.loadRecords(handle)

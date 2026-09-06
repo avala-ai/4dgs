@@ -290,6 +290,15 @@ public struct Site {
 public struct Named: CustomStringConvertible {
     public let code: RefusalCode
     public let site: Site?
+    public let lateFrontMatterRecords: LateFrontMatterRecords?
+
+    public init(
+        code: RefusalCode, site: Site?, lateFrontMatterRecords: LateFrontMatterRecords? = nil
+    ) {
+        self.code = code
+        self.site = site
+        self.lateFrontMatterRecords = lateFrontMatterRecords
+    }
 
     public var description: String {
         guard let site else { return "refusal \(code.rawValue)" }
@@ -309,7 +318,8 @@ func frontMatterSite(_ walk: Walk?, _ code: RefusalCode) -> Site? {
     case .unknownQuantizationScheme, .nonPositiveStepTime:
         opcode = Opcode.quantization
         what = "the Quantization record"
-    case .unknownStreamCodec, .windowIndexOutOfRange, .indexRecordMismatch:
+    case .unknownStreamCodec, .windowIndexOutOfRange, .indexRecordMismatch,
+        .lateFrontMatterRecord:
         return nil
     }
     guard let walk else { return nil }
@@ -320,7 +330,13 @@ func frontMatterSite(_ walk: Walk?, _ code: RefusalCode) -> Site? {
 
 public func describe(_ error: FourDGSError, walk: Walk?, site: Site?) -> Named? {
     guard let code = error.refusalCode else { return nil }
-    return Named(code: code, site: site ?? frontMatterSite(walk, code))
+    let records = error.lateFrontMatterRecords
+    let placed = records.map {
+        Site(offset: $0.lateRecord.offset, what: "the late \(opcodeName($0.lateRecord.opcode)) record")
+    }
+    return Named(
+        code: code, site: site ?? placed ?? frontMatterSite(walk, code),
+        lateFrontMatterRecords: records)
 }
 
 public struct IndexEntry {
