@@ -207,7 +207,7 @@ class Capabilities:
     #: without one.
     indexed: bool
     #: Whether this runner answers the invalid corpus with a refusal identifier. A runner
-    #: that does not skips all nine, and the feature matrix is where that shows up.
+    #: that does not skips all eleven, and the feature matrix is where that shows up.
     refusals: bool
     #: Name fragments this runner has not implemented; a variant containing one is skipped.
     declines: tuple[str, ...] = ()
@@ -236,11 +236,11 @@ def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
 
 
 def supports(caps: Capabilities, variant: str) -> bool:
-    # The invalid corpus is decided by `refusals` alone, and all nine or none of it.
+    # The invalid corpus is decided by `refusals` alone, and all eleven or none of it.
     # `declines` names features of the *valid* corpus, and letting a fragment reach across
     # here silently unmakes the claim the runner just made: a runner declining `Unknown`
     # because it has not implemented unknown record types would answer two refusals while
-    # the handshake line said it answered the nine. That is the overstatement this suite
+    # the handshake line said it answered the eleven. That is the overstatement this suite
     # exists to prevent, and it is not the runner's fault — the collision is between a
     # feature name and a filename. Built-in families work the same way: `REFUSAL_FAMILIES`
     # is all-or-nothing, so an outside runner is held to neither more nor less.

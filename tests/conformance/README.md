@@ -82,7 +82,7 @@ cannot name is one the suite cannot check: fail the invocation rather than answe
 it skips the invalid corpus exactly as it would skip any variant it declines, and the feature matrix
 is where that shows up publicly. A runner from outside this repository does not appear in that set
 and does not need to: it says `"refusals": true` in its own declaration (see
-[below](#running-a-runner-that-lives-outside-this-repository)) and is scored on all nine.
+[below](#running-a-runner-that-lives-outside-this-repository)) and is scored on all eleven.
 
 ### Every rule belongs to version 1
 
@@ -251,7 +251,7 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
 | `name`                | yes      | exactly `<family>/decode_<readPath>`, such as `go/decode_indexed`; it must agree with both keys         |
 | `family`              | no       | defaults to `name` up to the first `/`                                                                  |
 | `readPath`            | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
-| `refusals`            | no       | `true` to be scored on all nine invalid variants. Absent means no, and the nine are skipped             |
+| `refusals`            | no       | `true` to be scored on all eleven invalid variants. Absent means no, and the eleven are skipped         |
 | `declines`            | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
 | `exactAggregates`     | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent means the transition omits them   |
 | `canonicalStateOrder` | no       | `true` makes `states[*].sample` strict; absent means the transition omits it                            |
@@ -262,7 +262,7 @@ The runner opts into the invalid corpus itself, so it does not need its family a
 rather than something the harness records about it, so a partial implementation can be scored
 honestly on its first day.
 
-**`refusals` is all nine or none, and `declines` cannot quietly reduce it.** The two keys describe
+**`refusals` is all eleven or none, and `declines` cannot quietly reduce it.** The two keys describe
 different corpora, so a fragment is matched against the valid variants only. Otherwise a runner
 declining `Unknown` — because it has not implemented unknown record types, a feature of the valid
 corpus — would also stop being asked `invalid/UnknownStreamCodec`,
@@ -417,10 +417,10 @@ is a failure there, never a skip.
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
 C++, Swift and Dart run it on Linux. Every platform decodes the same generated corpus and compares
-against the same committed expectations. A fully supporting family makes 143 passing comparisons;
+against the same committed expectations. A fully supporting family makes 147 passing comparisons;
 the single `decode_indexed` variant that declares no chunk index is skipped everywhere. A language
 layer that has not landed exact canonical-unit sums and emitted-state ordering still runs those same
-143 checks: the shared transition omits only `positionSum`/`opacitySum` and `states[*].sample`,
+147 checks: the shared transition omits only `positionSum`/`opacitySum` and `states[*].sample`,
 while every other field remains strict.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a

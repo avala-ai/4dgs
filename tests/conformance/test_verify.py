@@ -113,9 +113,8 @@ def test_index_count_refusal_witnesses_change_only_the_claim_and_repair_summary_
     assert struct.unpack_from("<Q", base, live_field) == (population,)
     assert zlib.crc32(base[summary_start:footer_start]) & 0xFFFFFFFF == base_crc
     assert {refusal.code for refusal in invalid.INDEX_COUNT_REFUSALS} == {"index-record-mismatch"}
-    assert {refusal.name for refusal in invalid.INDEX_COUNT_REFUSALS}.isdisjoint(
-        refusal.name for refusal in invalid.REFUSALS
-    ), "the witnesses stay staged until all SDK layers can pass the all-or-none invalid corpus"
+    active_names = {name for name, _data, _expectation in generate.build_invalid()}
+    assert {refusal.name for refusal in invalid.INDEX_COUNT_REFUSALS} <= active_names
     assert "index-record-mismatch" in invalid.CODES
 
     witnesses = {refusal.name: refusal.mutate(base) for refusal in invalid.INDEX_COUNT_REFUSALS}

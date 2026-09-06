@@ -24,7 +24,7 @@ the decode harness matches fragments to select runners, and the encode gate make
 per-band-depth pass only when the name contains `SHDegree`. Most variants sit at the top of `data/`;
 three families live in subdirectories — `data/keyframe/`, `data/object/` and `data/invalid/` — and a
 variant there is named with its directory as a prefix. Today that is 48 valid variants at the top
-level, 5 keyframe-delta, 10 object-layer and 9 invalid.
+level, 5 keyframe-delta, 10 object-layer and 11 invalid.
 
 ## The corpus is generated, not committed
 
@@ -184,7 +184,7 @@ argument. It must exit zero and print one JSON object:
 `protocol` is the integer `1`; a boolean is rejected even though Python normally compares `true`
 equal to `1`. `readPath` is `streamed` or `indexed`, and `name` must be exactly
 `<family>/decode_<readPath>`. `family` may be omitted when it is the part of `name` before the first
-slash. `refusals` defaults to false and says whether the runner answers all nine invalid variants.
+slash. `refusals` defaults to false and says whether the runner answers all eleven invalid variants.
 `declines` defaults to an empty list and contains nonempty variant-name fragments for known valid
 features the runner does not implement. `exactAggregates` and `canonicalStateOrder` default to false
 and opt into strict comparison of exact root/state totals and composed-state samples. During the
@@ -322,7 +322,7 @@ runner whose name ends in `decode_indexed`. Exactly one valid variant, `TenWindo
 that position, and it is skipped for the indexed path in every language.
 
 The invalid corpus is the exception, deliberately. It is cut from a base file that carries an index
-precisely so that both paths can be asked to refuse all nine, and both are asked. A refusal check
+precisely so that both paths can be asked to refuse all eleven, and both are asked. A refusal check
 written into only one read path refuses half the files it should, and there is no other way to
 notice.
 
@@ -331,7 +331,7 @@ version prefix to their indexed opener, so their indexed magic/version checks ow
 `FutureMajorVersion`. TypeScript instead calls `checkMagic` in its bounded temporal-model probe; C++
 and Swift call `peekTemporalModel` on a whole-file buffer. Those three therefore produce the right
 refusal before their indexed opener is called, and deleting the corresponding check from the indexed
-core can leave both prefix variants green. The other seven invalid variants do reach those indexed
+core can leave both prefix variants green. The other nine invalid variants do reach those indexed
 paths. This is a property of how the runners are written rather than of the corpus, which is why it
 is recorded here instead of credited as two-path proof.
 
@@ -450,10 +450,10 @@ cannot name a decoder error must fail the invocation rather than copy those empt
 
 For built-ins, whether any of this runs is gated at family granularity by `REFUSAL_FAMILIES`, which
 today holds every built-in family: `python`, `rust`, `typescript`, `cpp`, `swift` and `dart`. None
-of them skips the invalid corpus. A family absent from the set skips all nine invalid variants, and
-the feature matrix is where that shows up publicly. An out-of-tree runner makes the same claim with
-`"refusals": true` in its capabilities object, so it needs no harness edit and is held to all nine
-or none of them.
+of them skips the invalid corpus. A family absent from the set skips all eleven invalid variants,
+and the feature matrix is where that shows up publicly. An out-of-tree runner makes the same claim
+with `"refusals": true` in its capabilities object, so it needs no harness edit and is held to all
+eleven or none of them.
 
 The Python and Rust **indexed** runners inspect the version prefix before Header dispatch. If it is
 the exact version-1 magic, they read through the Header's length-prefixed `profile` and `library`
