@@ -56,6 +56,11 @@ What each part of the version means here:
 
 ### Changed
 
+- The keyframe-delta optional-identity witness now stores `mu_t` as bins at its effective 1/32 s
+  pitch. Later keyframes and births reconstruct at their state-record timestamps instead of treating
+  those timestamps as raw bins and triggering `keyframe-mu-t-mismatch` before the identity behavior
+  could be tested.
+
 - Release manifests now use the same streamed-only registry as the live harness, and correctly
   identify invalid witnesses cut from keyframe-delta bases.
 

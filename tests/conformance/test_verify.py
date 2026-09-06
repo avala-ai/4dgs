@@ -381,6 +381,10 @@ def test_optional_identity_witnesses_pin_physical_omission_and_every_transition(
     assert group_maps[1][0][op.A_SOURCE_GROUP][:, 0].tolist() == [-17]
     assert group_maps[1][0][op.A_SOURCE_INDEX][:, 0].tolist() == [23]
     assert group_maps[1][0][op.A_OBJECT_ID][:, 0].tolist() == [-1]
+    assert group_maps[0][0][op.A_MU_T][:, 0].tolist() == [0, 0]
+    assert group_maps[2][1][op.A_MU_T][:, 0].tolist() == [64]
+    assert group_maps[5][0][op.A_MU_T][:, 0].tolist() == [160, 160]
+    assert group_maps[6][1][op.A_MU_T][:, 0].tolist() == [192]
     assert all(group_maps[4][0][attribute][:, 0].tolist() == [0] for attribute in identity)
     assert group_maps[6][1][op.A_SOURCE_GROUP][:, 0].tolist() == [2**31 - 1]
     assert group_maps[6][1][op.A_SOURCE_INDEX][:, 0].tolist() == [-(2**31)]
