@@ -27,9 +27,10 @@ All notable changes to the Python package are documented here, following
 
 - **Defined front matter encountered after the first state record is refused as
   `late-front-matter-record`.** Streamed readers and validators now enforce §4 before parsing the
-  late record, and diagnostics name both physical opcodes and byte offsets. Unknown, reserved and
-  private opcodes retain their position-independent skip behavior; indexed openers may still stop at
-  the first Chunk or Delta Chunk.
+  late record, and diagnostics name both physical opcodes and byte offsets. Exceptions now retain
+  those sites structurally, and the streamed conformance runner reports them without parsing the
+  message. Unknown, reserved and private opcodes retain their position-independent skip behavior;
+  indexed openers may still stop at the first Chunk or Delta Chunk.
 
 - **Decoded Chunk Index counts are verified as `index-record-mismatch`.** Both ordinary read paths
   now compare `gaussian_count` with validated Chunk rows or Delta operations, and keyframe-delta

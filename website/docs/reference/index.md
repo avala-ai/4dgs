@@ -65,7 +65,7 @@ per-language slerp or composition order of its own.
 | Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Late front matter (streamed + validator diagnosis) | Planned | Yes        | Planned | Planned | Planned | Planned |
+| Late front matter (streamed + validator diagnosis) | Yes    | Yes        | Planned | Planned | Planned | Planned |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |

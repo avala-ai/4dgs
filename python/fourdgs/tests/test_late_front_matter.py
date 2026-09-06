@@ -104,6 +104,8 @@ def test_streamed_readers_refuse_every_defined_front_matter_opcode(
         with pytest.raises(fourdgs.MalformedFile) as caught:
             read(broken)
         assert caught.value.code == "late-front-matter-record"
+        assert caught.value.late_record == fourdgs.RecordSite(opcode=opcode, at=late_at)
+        assert caught.value.first_state_record == fourdgs.RecordSite(opcode=state.opcode, at=state.offset)
         _assert_diagnostic(str(caught.value), opcode, late_at, state.opcode, state.offset)
 
 

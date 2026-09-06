@@ -11,7 +11,17 @@ ours and broken.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from . import opcode as op
+
+
+@dataclass(frozen=True)
+class RecordSite:
+    """One physical top-level record named by a structured refusal."""
+
+    opcode: int
+    at: int
 
 
 class FourdgsError(Exception):
@@ -32,9 +42,18 @@ class FourdgsError(Exception):
     fine.
     """
 
-    def __init__(self, message: str, *, code: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "",
+        late_record: RecordSite | None = None,
+        first_state_record: RecordSite | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.late_record = late_record
+        self.first_state_record = first_state_record
 
 
 class UnsupportedVersion(FourdgsError):
@@ -93,6 +112,8 @@ def check_front_matter_placement(
             f"appears after the first state {op.name(first_opcode)} record (opcode 0x{first_opcode:02X}) "
             f"at byte {first_offset}; every defined front-matter record must precede the first state record",
             code="late-front-matter-record",
+            late_record=RecordSite(opcode=opcode, at=offset),
+            first_state_record=RecordSite(opcode=first_opcode, at=first_offset),
         )
     if first_state is None and opcode in op.STATE_OPCODES:
         return opcode, offset
