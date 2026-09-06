@@ -4,24 +4,23 @@
 import Layout from "@theme/Layout";
 import React from "react";
 
-const VIEWER = "https://viewer.4dgs.dev";
+const VIEWER = "https://avala-ai.github.io/4dgs-viewer/";
 
 /**
  * A signpost, because the viewer is not in this repository.
  *
  * Rendering is out of scope here (AGENTS.md §5) — no ordering, culling, device tiering or
- * shader code — so the viewer lives in `avala-ai/4dgs-viewer` and deploys to
- * `viewer.4dgs.dev`. This path existed briefly and is kept so its links resolve.
+ * shader code — so the viewer lives in `avala-ai/4dgs-viewer` and deploys with that
+ * repository's GitHub Pages site. This path existed briefly and is kept so its links resolve.
  */
 export default function Viewer() {
   return (
-    <Layout title="Viewer" description="The .4dgs viewer lives at viewer.4dgs.dev">
+    <Layout title="Viewer" description="The .4dgs viewer is hosted on GitHub Pages">
       <main style={{ maxWidth: "42rem", margin: "0 auto", padding: "4rem 1rem" }}>
         <h1>The viewer moved</h1>
         <p>
-          It is at <a href={VIEWER}>viewer.4dgs.dev</a> — open a <code>.4dgs</code> file from your
-          machine or a URL, and it is drawn in the browser. Local files stay local; there is no
-          backend.
+          Open the <a href={VIEWER}>4dgs viewer</a> to load a <code>.4dgs</code> file from your
+          machine or a URL and draw it in the browser. Local files stay local; there is no backend.
         </p>
         <p>
           It lives in <a href="https://github.com/avala-ai/4dgs-viewer">avala-ai/4dgs-viewer</a>{" "}
