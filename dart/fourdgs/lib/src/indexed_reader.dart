@@ -529,17 +529,6 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
       'index says this chunk covers [${entry.t0}, ${entry.t1}), the chunk says [${body.header.t0}, ${body.header.t1})',
     );
   }
-  if (body.header.count != entry.gaussianCount) {
-    // The index is a summary of the chunks, so the two saying different things
-    // means one of them is wrong and there is no way to tell which. Cheap to
-    // check, and it catches an index built against a different revision of the
-    // file — which otherwise shows up as a scene that is quietly missing part
-    // of itself.
-    throw FourdgsMalformedFile(
-      'index says this chunk holds ${entry.gaussianCount} gaussians, the chunk says ${body.header.count}',
-    );
-  }
-
   final bandRecords = <int, Uint8List>{};
   final bandContentOffsets = <int, int>{};
   for (final band in entry.bands) {
@@ -554,7 +543,7 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
     bandContentOffsets[band.band] = band.offset + recordHeaderBytes;
   }
 
-  return decodeChunkStreams(
+  final decoded = decodeChunkStreams(
     body.streams,
     body.header.count,
     FourdgsSteps.of(scene.quantization),
@@ -567,6 +556,13 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
     chunkOffset: entry.chunkOffset,
     streamsOffset: entry.chunkOffset + recordHeaderBytes + body.streamsOffset,
   );
+  checkIndexCount(
+    entry,
+    'gaussian_count',
+    decoded.count,
+    "the decoded Chunk's validated gaussian row count",
+  );
+  return decoded;
 }
 
 /// The embedded track's bytes, fetched independently of any gaussian data.

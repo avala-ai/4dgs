@@ -1169,9 +1169,14 @@ void main() {
         FourdgsBytes(_keyframeDelta(liveCount: 2)),
       );
       expect(report.ok, isFalse);
+      expect(_refusals(report).single.code, refusalIndexRecordMismatch);
       expect(
         _messages(report, FourdgsSeverity.error),
-        contains(contains('declares live_count 2 for a keyframe whose chunk')),
+        contains(
+          contains(
+            'declares live_count 2; the composed state\'s live population is 1',
+          ),
+        ),
       );
     });
 
@@ -1385,10 +1390,14 @@ void main() {
           FourdgsBytes(_keyframeDeltaWithEmptyDelta(indexGaussianCount: 7)),
         );
         expect(report.ok, isFalse);
+        expect(_refusals(report).single.code, refusalIndexRecordMismatch);
         expect(
           _messages(report, FourdgsSeverity.error),
           contains(
-            contains('chunk carries 0 update, birth, and death operations'),
+            contains(
+              'declares gaussian_count 7; the decoded Delta Chunk\'s '
+              'validated operation count is 0',
+            ),
           ),
         );
       },

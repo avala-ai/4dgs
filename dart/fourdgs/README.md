@@ -132,7 +132,9 @@ class HttpRangeReadable implements FourdgsReadable {
 Everything this package throws is a `FourdgsException`, which extends `FormatException` — so one
 `catch` covers the family, and code already written against `FormatException` keeps working. The
 subtypes separate the cases worth telling apart: `FourdgsTruncatedFile`,
-`FourdgsUnsupportedVersion`, `FourdgsUnsupportedCodec` and `FourdgsMalformedFile`.
+`FourdgsUnsupportedVersion`, `FourdgsUnsupportedCodec`, `FourdgsReaderLimit` and
+`FourdgsMalformedFile`. `FourdgsReaderLimit` means the file may be legal but exceeds a finite
+ceiling of this reader; it is distinct from malformed input.
 
 ## Inspect and validate from a shell
 
