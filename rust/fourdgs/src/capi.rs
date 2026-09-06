@@ -54,6 +54,8 @@ pub const FOURDGS_STATUS_OUT_OF_RANGE: c_int = 7;
 pub const FOURDGS_STATUS_INTERNAL: c_int = 8;
 /// A legal request on the wrong read path. Not a bad file and not a bad argument.
 pub const FOURDGS_STATUS_UNSUPPORTED_MODE: c_int = 9;
+/// A supported operation crossed a caller-configured implementation resource ceiling.
+pub const FOURDGS_STATUS_RESOURCE_LIMIT: c_int = 10;
 
 thread_local! {
     /// The last error message, owned per thread so two threads decoding two files never
@@ -100,10 +102,7 @@ fn status_of(error: &Error) -> c_int {
         Error::UnsupportedModel(_) => FOURDGS_STATUS_UNSUPPORTED_CODEC,
         Error::BoundViolation(_) => FOURDGS_STATUS_MALFORMED,
         Error::UnsupportedOperation(_) => FOURDGS_STATUS_UNSUPPORTED_MODE,
-        // The dedicated C status is an additive ABI layer of its own. Until that lands,
-        // preserve the existing public status surface while Rust callers receive the new
-        // ResourceLimit category directly.
-        Error::ResourceLimit(_) => FOURDGS_STATUS_UNSUPPORTED_MODE,
+        Error::ResourceLimit(_) => FOURDGS_STATUS_RESOURCE_LIMIT,
         // Reachable through the encoders: an empty sample sequence, samples that do not
         // tile the timeline, or a GOP-invariant attribute changing inside an update group
         // all arrive here. It is the caller's input that is wrong, not a file.
@@ -243,6 +242,7 @@ pub extern "C" fn fourdgs_status_message(status: c_int) -> *const c_char {
         FOURDGS_STATUS_OUT_OF_RANGE => c"out of range",
         FOURDGS_STATUS_INTERNAL => c"internal error",
         FOURDGS_STATUS_UNSUPPORTED_MODE => c"unsupported on this read path",
+        FOURDGS_STATUS_RESOURCE_LIMIT => c"resource limit",
         _ => c"unknown status",
     };
     text.as_ptr()
@@ -362,28 +362,6 @@ pub struct fourdgs_state {
     inner: StateAt,
 }
 
-fn open_from(source: Box<dyn Readable>, out: *mut *mut fourdgs_scene) -> c_int {
-    if out.is_null() {
-        set_last_error("the out parameter is null".into());
-        return FOURDGS_STATUS_INVALID_ARGUMENT;
-    }
-    match SceneReader::open(source) {
-        Ok(inner) => {
-            let audio_descriptors = vec![None; inner.audio_source_count()];
-            let scene = Box::new(fourdgs_scene {
-                inner,
-                strings: Vec::new(),
-                audio_descriptors,
-            });
-            // SAFETY: `out` was checked non-null; the caller owns the result and frees it
-            // with `fourdgs_scene_free`.
-            unsafe { *out = Box::into_raw(scene) };
-            FOURDGS_STATUS_OK
-        }
-        Err(e) => report(e),
-    }
-}
-
 /// Open a scene from bytes the caller owns. The bytes are copied, so the caller's buffer
 /// may be released immediately.
 #[no_mangle]
@@ -392,19 +370,16 @@ pub unsafe extern "C" fn fourdgs_open_memory(
     length: usize,
     out: *mut *mut fourdgs_scene,
 ) -> c_int {
-    guarded(|| {
-        if data.is_null() && length != 0 {
-            set_last_error("a non-empty buffer was passed as null".into());
-            return FOURDGS_STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: the caller states `data` points at `length` readable bytes.
-        let copied = if length == 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(data, length) }.to_vec()
-        };
-        open_from(Box::new(OwnedBytes { data: copied }), out)
-    })
+    // SAFETY: forwarded with the legacy automatic mode and shared default.
+    unsafe {
+        fourdgs_open_memory_with_options(
+            data,
+            length,
+            FOURDGS_OPEN_AUTO,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+            out,
+        )
+    }
 }
 
 /// Open a scene from a filesystem path, NUL-terminated and UTF-8.
@@ -413,24 +388,15 @@ pub unsafe extern "C" fn fourdgs_open_path(
     path: *const c_char,
     out: *mut *mut fourdgs_scene,
 ) -> c_int {
-    guarded(|| {
-        if path.is_null() {
-            set_last_error("the path is null".into());
-            return FOURDGS_STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: the caller states `path` is a NUL-terminated string.
-        let path = match unsafe { CStr::from_ptr(path) }.to_str() {
-            Ok(p) => p,
-            Err(_) => {
-                set_last_error("the path is not valid UTF-8".into());
-                return FOURDGS_STATUS_INVALID_ARGUMENT;
-            }
-        };
-        match FileReadable::open(path) {
-            Ok(source) => open_from(Box::new(source), out),
-            Err(e) => report(e),
-        }
-    })
+    // SAFETY: forwarded with the legacy automatic mode and shared default.
+    unsafe {
+        fourdgs_open_path_with_options(
+            path,
+            FOURDGS_OPEN_AUTO,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+            out,
+        )
+    }
 }
 
 /// Open a scene over a caller-supplied byte-range source. The scene takes ownership of the
@@ -440,13 +406,15 @@ pub unsafe extern "C" fn fourdgs_open_reader(
     reader: fourdgs_reader,
     out: *mut *mut fourdgs_scene,
 ) -> c_int {
-    guarded(|| {
-        if reader.size.is_none() || reader.read.is_none() {
-            set_last_error("a reader needs both a size and a read callback".into());
-            return FOURDGS_STATUS_INVALID_ARGUMENT;
-        }
-        open_from(Box::new(CallbackSource { reader }), out)
-    })
+    // SAFETY: ownership is forwarded once with the legacy automatic mode and shared default.
+    unsafe {
+        fourdgs_open_reader_with_options(
+            reader,
+            FOURDGS_OPEN_AUTO,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+            out,
+        )
+    }
 }
 
 /// Release a scene and everything borrowed from it. Null is accepted and ignored.
@@ -908,12 +876,49 @@ pub unsafe extern "C" fn fourdgs_scene_load_all(
     scene: *mut fourdgs_scene,
     max_sh_band: u8,
 ) -> c_int {
+    // SAFETY: forwarded with the shared default decoded-state budget.
+    unsafe {
+        fourdgs_scene_load_all_with_options(
+            scene,
+            max_sh_band,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+        )
+    }
+}
+
+/// Decode every chunk under a caller-selected decoded-state budget.
+///
+/// The selected limit applies to this collection only. It is checked even when the requested
+/// whole-scene result is already resident, and a failed replacement leaves the prior working set
+/// intact.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_load_all_with_options(
+    scene: *mut fourdgs_scene,
+    max_sh_band: u8,
+    max_decoded_state_bytes: u64,
+) -> c_int {
     guarded(|| {
+        if max_decoded_state_bytes == 0 {
+            set_last_error("max_decoded_state_bytes must be greater than zero".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let max_decoded_state_bytes = match usize::try_from(max_decoded_state_bytes) {
+            Ok(limit) => limit,
+            Err(_) => {
+                set_last_error(format!(
+                    "max_decoded_state_bytes {max_decoded_state_bytes} is past this platform's addressable range"
+                ));
+                return FOURDGS_STATUS_INVALID_ARGUMENT;
+            }
+        };
         let Some(scene) = (unsafe { scene.as_mut() }) else {
             set_last_error("the scene pointer is null".into());
             return FOURDGS_STATUS_INVALID_ARGUMENT;
         };
-        match scene.inner.load_all(max_sh_band) {
+        match scene
+            .inner
+            .load_all_with_decoded_state_limit(max_sh_band, max_decoded_state_bytes)
+        {
             Ok(_) => FOURDGS_STATUS_OK,
             Err(e) => report(e),
         }
@@ -1163,16 +1168,48 @@ fn open_mode(mode: c_int) -> Option<crate::reader::OpenMode> {
     }
 }
 
-fn open_from_with(source: Box<dyn Readable>, mode: c_int, out: *mut *mut fourdgs_scene) -> c_int {
+fn checked_open_options(
+    mode: c_int,
+    max_decoded_state_bytes: u64,
+    out: *mut *mut fourdgs_scene,
+) -> std::result::Result<(crate::reader::OpenMode, crate::stream_reader::ReadOptions), c_int> {
     if out.is_null() {
         set_last_error("the out parameter is null".into());
-        return FOURDGS_STATUS_INVALID_ARGUMENT;
+        return Err(FOURDGS_STATUS_INVALID_ARGUMENT);
     }
     let Some(mode) = open_mode(mode) else {
         set_last_error(format!("{mode} is not a fourdgs_open_mode"));
-        return FOURDGS_STATUS_INVALID_ARGUMENT;
+        return Err(FOURDGS_STATUS_INVALID_ARGUMENT);
     };
-    match SceneReader::open_with(source, mode) {
+    if max_decoded_state_bytes == 0 {
+        set_last_error("max_decoded_state_bytes must be greater than zero".into());
+        return Err(FOURDGS_STATUS_INVALID_ARGUMENT);
+    }
+    let max_decoded_state_bytes = match usize::try_from(max_decoded_state_bytes) {
+        Ok(limit) => limit,
+        Err(_) => {
+            set_last_error(format!(
+                "max_decoded_state_bytes {max_decoded_state_bytes} is past this platform's addressable range"
+            ));
+            return Err(FOURDGS_STATUS_INVALID_ARGUMENT);
+        }
+    };
+    Ok((
+        mode,
+        crate::stream_reader::ReadOptions {
+            max_decoded_state_bytes,
+            ..Default::default()
+        },
+    ))
+}
+
+fn open_from_with_options(
+    source: Box<dyn Readable>,
+    mode: crate::reader::OpenMode,
+    options: &crate::stream_reader::ReadOptions,
+    out: *mut *mut fourdgs_scene,
+) -> c_int {
+    match SceneReader::open_with_mode_and_options(source, mode, options) {
         Ok(inner) => {
             let audio_descriptors = vec![None; inner.audio_source_count()];
             let scene = Box::new(fourdgs_scene {
@@ -1196,7 +1233,32 @@ pub unsafe extern "C" fn fourdgs_open_memory_ex(
     mode: c_int,
     out: *mut *mut fourdgs_scene,
 ) -> c_int {
+    // SAFETY: forwarded with the shared default decoded-state budget.
+    unsafe {
+        fourdgs_open_memory_with_options(
+            data,
+            length,
+            mode,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+            out,
+        )
+    }
+}
+
+/// Open from bytes on a chosen read path with a caller-selected decoded-state budget.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_open_memory_with_options(
+    data: *const u8,
+    length: usize,
+    mode: c_int,
+    max_decoded_state_bytes: u64,
+    out: *mut *mut fourdgs_scene,
+) -> c_int {
     guarded(|| {
+        let (mode, options) = match checked_open_options(mode, max_decoded_state_bytes, out) {
+            Ok(options) => options,
+            Err(status) => return status,
+        };
         if data.is_null() && length != 0 {
             set_last_error("a non-empty buffer was passed as null".into());
             return FOURDGS_STATUS_INVALID_ARGUMENT;
@@ -1207,7 +1269,7 @@ pub unsafe extern "C" fn fourdgs_open_memory_ex(
         } else {
             unsafe { std::slice::from_raw_parts(data, length) }.to_vec()
         };
-        open_from_with(Box::new(OwnedBytes { data: copied }), mode, out)
+        open_from_with_options(Box::new(OwnedBytes { data: copied }), mode, &options, out)
     })
 }
 
@@ -1218,7 +1280,30 @@ pub unsafe extern "C" fn fourdgs_open_path_ex(
     mode: c_int,
     out: *mut *mut fourdgs_scene,
 ) -> c_int {
+    // SAFETY: forwarded with the shared default decoded-state budget.
+    unsafe {
+        fourdgs_open_path_with_options(
+            path,
+            mode,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+            out,
+        )
+    }
+}
+
+/// Open from a path on a chosen read path with a caller-selected decoded-state budget.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_open_path_with_options(
+    path: *const c_char,
+    mode: c_int,
+    max_decoded_state_bytes: u64,
+    out: *mut *mut fourdgs_scene,
+) -> c_int {
     guarded(|| {
+        let (mode, options) = match checked_open_options(mode, max_decoded_state_bytes, out) {
+            Ok(options) => options,
+            Err(status) => return status,
+        };
         if path.is_null() {
             set_last_error("the path is null".into());
             return FOURDGS_STATUS_INVALID_ARGUMENT;
@@ -1232,7 +1317,7 @@ pub unsafe extern "C" fn fourdgs_open_path_ex(
             }
         };
         match FileReadable::open(path) {
-            Ok(source) => open_from_with(Box::new(source), mode, out),
+            Ok(source) => open_from_with_options(Box::new(source), mode, &options, out),
             Err(e) => report(e),
         }
     })
@@ -1246,12 +1331,39 @@ pub unsafe extern "C" fn fourdgs_open_reader_ex(
     mode: c_int,
     out: *mut *mut fourdgs_scene,
 ) -> c_int {
+    // SAFETY: ownership is forwarded once with the shared default decoded-state budget.
+    unsafe {
+        fourdgs_open_reader_with_options(
+            reader,
+            mode,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+            out,
+        )
+    }
+}
+
+/// Open over a caller source on a chosen read path with a decoded-state budget.
+/// Ownership of `reader.ctx` transfers even when an option or callback is invalid.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_open_reader_with_options(
+    reader: fourdgs_reader,
+    mode: c_int,
+    max_decoded_state_bytes: u64,
+    out: *mut *mut fourdgs_scene,
+) -> c_int {
     guarded(|| {
-        if reader.size.is_none() || reader.read.is_none() {
+        // Take ownership before checking any argument so `release` runs exactly once on every
+        // return path. No callback is invoked until the options have been validated.
+        let source = CallbackSource { reader };
+        let (mode, options) = match checked_open_options(mode, max_decoded_state_bytes, out) {
+            Ok(options) => options,
+            Err(status) => return status,
+        };
+        if source.reader.size.is_none() || source.reader.read.is_none() {
             set_last_error("a reader needs both a size and a read callback".into());
             return FOURDGS_STATUS_INVALID_ARGUMENT;
         }
-        open_from_with(Box::new(CallbackSource { reader }), mode, out)
+        open_from_with_options(Box::new(source), mode, &options, out)
     })
 }
 
@@ -2450,19 +2562,64 @@ pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json(
     out: *mut *const c_char,
     out_len: *mut usize,
 ) -> c_int {
+    // SAFETY: forwarded with the shared default decoded-state budget.
+    unsafe {
+        fourdgs_keyframe_delta_states_json_with_options(
+            data,
+            length,
+            indexed,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+            out,
+            out_len,
+        )
+    }
+}
+
+/// Decode a `keyframe-delta` file under a caller-selected decoded-state budget.
+///
+/// The budget reaches the decoded sequence collector unchanged. The canonical JSON returned by
+/// this ABI is serialization output, not decoded gaussian state or decode working storage, and
+/// §3.3 does not include serialization buffers in the decoded-state boundary.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json_with_options(
+    data: *const u8,
+    length: usize,
+    indexed: c_int,
+    max_decoded_state_bytes: u64,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
     guarded(|| {
         if out.is_null() || out_len.is_null() {
             set_last_error("a string out parameter is null".into());
             return FOURDGS_STATUS_INVALID_ARGUMENT;
         }
+        if max_decoded_state_bytes == 0 {
+            set_last_error("max_decoded_state_bytes must be greater than zero".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let max_decoded_state_bytes = match usize::try_from(max_decoded_state_bytes) {
+            Ok(limit) => limit,
+            Err(_) => {
+                set_last_error(format!(
+                    "max_decoded_state_bytes {max_decoded_state_bytes} is past this platform's addressable range"
+                ));
+                return FOURDGS_STATUS_INVALID_ARGUMENT;
+            }
+        };
         let Some(bytes) = borrow_bytes(data, length) else {
             set_last_error("a non-empty buffer was passed as null".into());
             return FOURDGS_STATUS_INVALID_ARGUMENT;
         };
+        let options = crate::stream_reader::ReadOptions {
+            max_decoded_state_bytes,
+            ..Default::default()
+        };
         let decoded = if indexed != 0 {
-            crate::keyframe_delta_file::decode_indexed(bytes).map(|(seq, _)| seq)
+            crate::keyframe_delta_file::decode_indexed_with_options(bytes, &options)
+                .map(|(seq, _)| seq)
         } else {
-            crate::keyframe_delta_file::decode_streamed(bytes)
+            crate::keyframe_delta_file::decode_streamed_with_options(bytes, &options)
         };
         match decoded {
             Ok(seq) => put_owned_string(

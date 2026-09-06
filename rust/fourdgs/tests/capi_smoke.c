@@ -37,6 +37,9 @@ static void check_null_safety(void) {
     check(fourdgs_state_orientations(NULL) == NULL, "orientations of a null state is null");
     check(fourdgs_scene_load_all(NULL, 3) == FOURDGS_STATUS_INVALID_ARGUMENT,
           "loading a null scene is an invalid argument");
+    check(fourdgs_scene_load_all_with_options(NULL, 3, 1) ==
+              FOURDGS_STATUS_INVALID_ARGUMENT,
+          "options-bearing load of a null scene is an invalid argument");
     check(fourdgs_scene_state_at(NULL, 0.0, 3, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
           "state of a null scene is an invalid argument");
     /* The free functions accept null rather than crashing on a partially built object. */
@@ -48,6 +51,11 @@ static void check_null_safety(void) {
     check(fourdgs_last_error_offset(NULL, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
           "a null error-offset out parameter is an invalid argument");
     fourdgs_reader missing_reader = {0};
+    fourdgs_scene *missing_scene = NULL;
+    check(fourdgs_open_reader_with_options(missing_reader, FOURDGS_OPEN_INDEXED, 1,
+                                           &missing_scene) ==
+              FOURDGS_STATUS_INVALID_ARGUMENT,
+          "the options-bearing open rejects a missing reader");
     uint64_t declared_count = 0;
     check(fourdgs_validate_keyframe_delta_reader(missing_reader, FOURDGS_OPEN_INDEXED,
                                                  NULL, NULL, &declared_count) ==
@@ -55,6 +63,10 @@ static void check_null_safety(void) {
           "the bounded keyframe-delta validator rejects a missing reader");
     check(strcmp(fourdgs_status_message(FOURDGS_STATUS_OK), "ok") == 0,
           "status 0 is named ok");
+    check(FOURDGS_STATUS_RESOURCE_LIMIT == 10,
+          "the resource-limit status is appended without moving existing values");
+    check(strcmp(fourdgs_status_message(FOURDGS_STATUS_RESOURCE_LIMIT), "resource limit") == 0,
+          "the resource-limit status has its own name");
 }
 
 /* A file that is not ours must be refused as a version problem, not as corruption. */
@@ -224,6 +236,12 @@ static void check_forced_paths(const char *path) {
         fourdgs_scene_free(sequential);
     }
 
+    fourdgs_scene *configured = NULL;
+    check(fourdgs_open_path_with_options(path, FOURDGS_OPEN_SEQUENTIAL, 536870912,
+                                         &configured) == FOURDGS_STATUS_OK,
+          "a path opens with an explicit decoded-state budget");
+    fourdgs_scene_free(configured);
+
     fourdgs_scene *indexed = NULL;
     check(fourdgs_open_path_ex(path, FOURDGS_OPEN_INDEXED, &indexed) == FOURDGS_STATUS_OK,
           "a file opens indexed on request");
@@ -326,6 +344,23 @@ static void check_writer(void) {
             fourdgs_scene_free(reopened);
         }
 
+        fourdgs_scene *over_budget = NULL;
+        check(fourdgs_open_memory_with_options(data, length, FOURDGS_OPEN_SEQUENTIAL, 1,
+                                               &over_budget) ==
+                  FOURDGS_STATUS_RESOURCE_LIMIT,
+              "a tiny sequential decoded-state budget reports resource-limit at open");
+        check(over_budget == NULL, "a resource-limited open leaves the scene untouched");
+
+        check(fourdgs_open_memory_with_options(data, length, FOURDGS_OPEN_INDEXED, 536870912,
+                                               &over_budget) == FOURDGS_STATUS_OK,
+              "an indexed scene opens with an explicit decoded-state budget");
+        if (over_budget != NULL) {
+            check(fourdgs_scene_load_all_with_options(over_budget, 3, 1) ==
+                      FOURDGS_STATUS_RESOURCE_LIMIT,
+                  "a tiny indexed decoded-state budget reports resource-limit at load");
+            fourdgs_scene_free(over_budget);
+        }
+
         /* The additive keyframe-delta surface, exercised on a real in-memory file. These
          * bytes are a gaussian-birth scene, so peeking names that model and the
          * keyframe-delta decoder refuses them as the wrong reader, not a bad file. */
@@ -344,6 +379,10 @@ static void check_writer(void) {
         check(fourdgs_keyframe_delta_states_json(data, length, 0, &states, &states_len) ==
                   FOURDGS_STATUS_UNSUPPORTED_CODEC,
               "the keyframe-delta decoder refuses a gaussian-birth file on the streamed path");
+        check(fourdgs_keyframe_delta_states_json_with_options(
+                  data, length, 0, 536870912, &states, &states_len) ==
+                  FOURDGS_STATUS_UNSUPPORTED_CODEC,
+              "the options-bearing keyframe-delta decoder reaches the core");
         const char *wrong_model_code = NULL;
         size_t wrong_model_code_len = 0;
         check(fourdgs_last_refusal_code(&wrong_model_code, &wrong_model_code_len) ==
