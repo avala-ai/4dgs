@@ -54,7 +54,7 @@ per-language slerp or composition order of its own.
 | Provenance: sensor calibration                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Provenance: rig trajectory + pose interpolation   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Object membership (`object_id`)                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Optional identity zero defaults                   | Yes    | Planned    | Yes     | Planned | Planned | Planned |
+| Optional identity zero defaults                   | Yes    | Yes        | Yes     | Planned | Planned | Planned |
 | Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Temporal model `keyframe-delta`, decode           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |

@@ -46,8 +46,19 @@ export class GaussianSet {
   readonly sh: ShCoefficients | null;
   readonly shDegree: number;
   /**
-   * `count` object ids (spec §6.6), or `null` when no chunk carried the stream. `0` is
-   * background: a gaussian that belongs to no object and no track may transform.
+   * `count` exact producer-group labels, or `null` when every chunk omitted the lane.
+   * Physically absent rows have logical value `0`.
+   */
+  readonly sourceGroup: Int32Array | null;
+  /**
+   * `count` exact producer-local indices, or `null` when every chunk omitted the lane.
+   * Physically absent rows have logical value `0`.
+   */
+  readonly sourceIndex: Int32Array | null;
+  /**
+   * `count` object ids (spec §6.6), or `null` when every chunk omitted the lane. Physically
+   * absent rows have logical value `0`, which is background: a gaussian that belongs to no
+   * object and no track may transform.
    *
    * Unsigned: the ids span the whole `u32` range and are compared for equality
    * against a track's `object_id`, which is parsed as `u32`.
@@ -67,6 +78,8 @@ export class GaussianSet {
     winHi: Float32Array;
     sh?: ShCoefficients | null;
     shDegree?: number;
+    sourceGroup?: Int32Array | null;
+    sourceIndex?: Int32Array | null;
     objectId?: Uint32Array | null;
   }) {
     this.count = fields.count;
@@ -81,6 +94,8 @@ export class GaussianSet {
     this.winHi = fields.winHi;
     this.sh = fields.sh ?? null;
     this.shDegree = fields.shDegree ?? 0;
+    this.sourceGroup = fields.sourceGroup ?? null;
+    this.sourceIndex = fields.sourceIndex ?? null;
     this.objectId = fields.objectId ?? null;
   }
 
@@ -211,12 +226,20 @@ export function assembleGaussians(
   const winLo = new Float32Array(count);
   const winHi = new Float32Array(count);
 
-  // Membership is per chunk and optional, so a file may carry it on some chunks and not
-  // others. A chunk without the stream contributes background rather than a hole: the
-  // merged array exists when any chunk had one, which is what makes `null` mean "this
-  // scene has no object membership" rather than "the last chunk did not".
+  // Identity is per chunk and optional, so a file may carry a lane on some chunks and not
+  // others. A chunk without it contributes zero rather than a hole. The merged array exists
+  // when any chunk had the lane, leaving `null` as the physical fact that every chunk
+  // omitted it while preserving the same logical all-zero column either way.
+  let sawSourceGroup = false;
+  let sawSourceIndex = false;
   let sawObjectId = false;
-  for (const chunk of chunks) sawObjectId ||= chunk.objectId !== null;
+  for (const chunk of chunks) {
+    sawSourceGroup ||= chunk.sourceGroup !== null;
+    sawSourceIndex ||= chunk.sourceIndex !== null;
+    sawObjectId ||= chunk.objectId !== null;
+  }
+  const sourceGroup = sawSourceGroup ? new Int32Array(count) : null;
+  const sourceIndex = sawSourceIndex ? new Int32Array(count) : null;
   const objectId = sawObjectId ? new Uint32Array(count) : null;
 
   const table = windowTableOrDefault(windows);
@@ -230,6 +253,8 @@ export function assembleGaussians(
     motions.set(chunk.motions, at * 3);
     muT.set(chunk.muT, at);
     sigmaT.set(chunk.sigmaT, at);
+    if (sourceGroup !== null && chunk.sourceGroup !== null) sourceGroup.set(chunk.sourceGroup, at);
+    if (sourceIndex !== null && chunk.sourceIndex !== null) sourceIndex.set(chunk.sourceIndex, at);
     if (objectId !== null && chunk.objectId !== null) objectId.set(chunk.objectId, at);
     for (let i = 0; i < chunk.count; i++) {
       const w = checkWindowIndex(chunk.windowIndex[i]!, windowCount);
@@ -252,6 +277,8 @@ export function assembleGaussians(
     winHi,
     sh,
     shDegree,
+    sourceGroup,
+    sourceIndex,
     objectId,
   });
 }

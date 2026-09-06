@@ -185,7 +185,7 @@ AGGREGATE_DECODED_BUDGET_FAMILIES: frozenset[str] = frozenset({"cpp", "dart", "p
 # Optional identity zero-defaults are introduced as a stacked conformance change.  A
 # family enters only after both maintained read paths return the exact logical rows for
 # both temporal models.  The shared corpus layer intentionally claims no SDK.
-OPTIONAL_IDENTITY_DEFAULTS_FAMILIES: frozenset[str] = frozenset({"python", "rust"})
+OPTIONAL_IDENTITY_DEFAULTS_FAMILIES: frozenset[str] = frozenset({"python", "rust", "typescript"})
 
 # A family enters this set only after both read paths implement the explicit gaussian-
 # birth instant query and the streamed path also passes the no-index witness. The shared

@@ -34,6 +34,11 @@ import { FileHandleReadable } from "@4dgs/nodejs";
 
 import { canonical, refusalAnswer, summarize } from "./canonical.js";
 import { checkIndexedInvariants, CountingReadable } from "./checks.js";
+import {
+  gaussianBirthIdentityJson,
+  isOptionalIdentityWitness,
+  keyframeDeltaIdentityJson,
+} from "./optionalIdentity.js";
 
 /** How much of the front is read to learn the temporal model without decoding gaussians. */
 const HEADER_PROBE_BYTES = 64 * 1024;
@@ -67,10 +72,11 @@ export async function run(
       // Agreeing across the two paths is most of what makes an indexed keyframe-delta reader
       // trustworthy.
       const data = await source.read(0n, BigInt(size));
+      const decoded = (await decodeKeyframeDeltaIndexed(data, { maxDecodedStateBytes })).sequence;
       return canonical(
-        keyframeDeltaStatesJson(
-          (await decodeKeyframeDeltaIndexed(data, { maxDecodedStateBytes })).sequence,
-        ),
+        isOptionalIdentityWitness(decoded.header)
+          ? keyframeDeltaIdentityJson(decoded)
+          : keyframeDeltaStatesJson(decoded),
       );
     }
     const decodedStateBudget = new DecodedStateBudget(maxDecodedStateBytes);
@@ -94,16 +100,22 @@ export async function run(
 
     await checkIndexedInvariants(scene, source);
 
+    const gaussians = assembleGaussians(
+      chunks,
+      scene.windows,
+      scene.header.shDegree,
+      concatenateSh(shParts, decodedStateBudget),
+      { decodedStateBudget },
+    );
+
+    if (isOptionalIdentityWitness(scene.header)) {
+      return canonical(gaussianBirthIdentityJson(gaussians));
+    }
+
     return canonical(
       summarize({
         header: scene.header,
-        gaussians: assembleGaussians(
-          chunks,
-          scene.windows,
-          scene.header.shDegree,
-          concatenateSh(shParts, decodedStateBudget),
-          { decodedStateBudget },
-        ),
+        gaussians,
         audioSources,
         chunkIntervals: scene.index.map((entry) => [entry.t0, entry.t1] as const),
         camera,

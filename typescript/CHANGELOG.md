@@ -20,6 +20,12 @@ The four packages version together.
 
 ### Fixed
 
+- **Omitted optional identity lanes now have their specified logical zero values.** Mixed
+  gaussian-birth Chunks preserve `source_group`, `source_index`, and `object_id`, zero-filling rows
+  from Chunks that omit a lane. Keyframe-delta complete states and births likewise default omitted
+  identities to zero; an omitted update carries its reference value, while a present identity update
+  is an absolute label replacement. `object_id` keeps the same signed-stream-bit to `u32` bridge
+  across the full unsigned range.
 - **Keyframe-delta decoders skip unknown attribute payloads by length.** Reserved and private
   attributes no longer invoke a codec or materialize constant expansions the version-1 reader does
   not understand. Defined attribute widths are checked before payload decode, keeping malformed

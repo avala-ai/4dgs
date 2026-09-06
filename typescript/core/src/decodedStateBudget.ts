@@ -115,11 +115,16 @@ export function decodedChunkStateBytes(chunk: ChunkGaussians): number {
 /** Capacity of the arrays allocated by final gaussian-birth assembly. */
 export function gaussianSetAssemblyBytes(chunks: readonly ChunkGaussians[]): bigint {
   let count = 0n;
+  let sourceGroup = false;
+  let sourceIndex = false;
   let objectId = false;
   for (const chunk of chunks) {
     count += BigInt(chunk.count);
+    sourceGroup ||= chunk.sourceGroup !== null;
+    sourceIndex ||= chunk.sourceIndex !== null;
     objectId ||= chunk.objectId !== null;
   }
   // 21 f32 lanes: position, scale, rotation, colour, motion, mu, sigma, winLo, winHi.
-  return count * BigInt(21 * Float32Array.BYTES_PER_ELEMENT + (objectId ? 4 : 0));
+  const identityLanes = Number(sourceGroup) + Number(sourceIndex) + Number(objectId);
+  return count * BigInt(21 * Float32Array.BYTES_PER_ELEMENT + identityLanes * 4);
 }
