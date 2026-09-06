@@ -387,7 +387,7 @@ is rules whose whole content is a refusal — an out-of-range window index, an u
 temporal model the reader does not know — and a decoder that ignores all of them passes every valid
 variant.
 
-`generator/invalid.py` declares the other half: six mutations of one valid base file, each breaking
+`generator/invalid.py` declares the other half: ten mutations of valid base files, each breaking
 exactly one rule, plus one directly encoded case, each paired with the **refusal identifier** a
 conforming reader must produce. The mutations are length-preserving wherever they can be, so nothing
 after the patch shifts and the file is wrong in exactly one way; a mutation that moved offsets would
@@ -406,9 +406,9 @@ and the runner exits 0, because a refusal is a result rather than a crash.
 The identifier matters more than it looks. "Both decoders raised an error" is not agreement: one of
 them may have refused for the wrong reason, which is precisely the failure a negative test exists to
 catch. The identifier names the rule, and it is the same string in every language. The current
-invalid corpus uses seven, declared as constants in `mod refusal` in
+invalid corpus uses eight, declared as constants in `mod refusal` in
 [`rust/fourdgs/src/error.rs`](https://github.com/avala-ai/4dgs/blob/main/rust/fourdgs/src/error.rs)
-and gathered as `CODES` in `invalid.py`. That registry is closed for these nine expectations: a
+and gathered as `CODES` in `invalid.py`. That registry is closed for these eleven expectations: a
 runner may not substitute another identifier for them, and a new invalid-corpus refusal is added
 there rather than invented in one language. Other features have their own named refusals —
 keyframe-delta includes `depth-mismatch`, for example — and future corpus families may exercise
@@ -425,16 +425,27 @@ those without adding them to `invalid.CODES`.
 | `NegativeStepTime`          | `non-positive-step-time`      | the birth-time quantization grid has negative spacing                  | §5.3     |
 | `UnknownStreamCodec`        | `unknown-stream-codec`        | an attribute stream declares a codec this build does not implement     | §5.5     |
 | `WindowIndexOutOfRange`     | `window-index-out-of-range`   | a gaussian's `window_index` names a row the Window Table does not have | §5.4     |
+| `WrongIndexGaussianCount`   | `index-record-mismatch`       | an index entry's operation count disagrees with its state record       | §5.8     |
+| `WrongIndexLiveCount`       | `index-record-mismatch`       | an index entry's live count disagrees with the composed population     | §5.8     |
 
-Nine variants use seven identifiers, and neither shared pair is redundant. An unknown temporal-model
-name is what a _future_ writer produces; the empty string is what a struct left at its zero value
-produces, which is the shape a **bug** writes. Zero and a negative `step_time` separately pin the
-strict boundary and the forbidden side of the same positive-spacing rule. Each pair breaks one rule
-from different directions and must be refused under one name. A useful side effect: the identifier
-cannot be derived from the variant name, which is as it should be, since it names the rule and not
-the file.
+Eleven variants use eight identifiers, and none of the three shared pairs is redundant. An unknown
+temporal-model name is what a _future_ writer produces; the empty string is what a struct left at
+its zero value produces, which is the shape a **bug** writes. Zero and a negative `step_time`
+separately pin the strict boundary and the forbidden side of the same positive-spacing rule. Each
+pair breaks one rule from different directions and must be refused under one name. A useful side
+effect: the identifier cannot be derived from the variant name, which is as it should be, since it
+names the rule and not the file.
 
-For the current invalid corpus, only an error carrying the expected one of those seven identifiers
+A refusal identifier belongs to the format contract before it necessarily has a witness in the
+current corpus. Spec §3.2 therefore defines `decoded-f32-overflow` for a derived binary32 attribute
+that is non-finite or outside the finite binary32 range. When that rule is added to the invalid
+corpus, `step_scale_log = 1` with scale bin `100`, and the corresponding unflagged `sigma_t` case,
+pin the overflow side. A valid control using the greatest finite `f64` step and bin `0` pins the
+other side: it reconstructs `exp(0) = 1` and prevents a decoder from replacing the result rule with
+an undeclared Quantization-parameter ceiling. The `never_fades` flag's specified `sigma_t = +inf` is
+the legal sentinel control and must not be refused.
+
+For the current invalid corpus, only an error carrying the expected one of those eight identifiers
 is a refusal answer. More generally, a named refusal is an answer only when the expectation names
 it. If decoding fails without one — a truncated transport, an I/O error, an ordinary parse failure —
 the runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In
