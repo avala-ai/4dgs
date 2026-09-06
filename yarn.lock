@@ -7234,12 +7234,21 @@ __metadata:
   languageName: node
   linkType: hard
 
-"image-size@npm:^2.0.2":
+"image-size@npm:2.0.2":
   version: 2.0.2
   resolution: "image-size@npm:2.0.2"
   bin:
     image-size: bin/image-size.js
   checksum: 10c0/f09dd0f7cf8511cd20e4f756bdb5a7cb6d2240de3323f41bde266bed8373392a293892bf12e907e2995f52833fd88dd27cf6b1a52ab93968afc716cb78cd7b79
+  languageName: node
+  linkType: hard
+
+"image-size@patch:image-size@npm%3A2.0.2#~/.yarn/patches/image-size-npm-2.0.2-43abbcfb5c.patch":
+  version: 2.0.2
+  resolution: "image-size@patch:image-size@npm%3A2.0.2#~/.yarn/patches/image-size-npm-2.0.2-43abbcfb5c.patch::version=2.0.2&hash=cacc8a"
+  bin:
+    image-size: bin/image-size.js
+  checksum: 10c0/6693ae90b952a068c1e8343b4cb3037d230c44def3eba8c5195e7cba5cd3c42e7bd7472460520162c4731bde774cd6671387e33acc428792472ac0aa0f2e0f7e
   languageName: node
   linkType: hard
 

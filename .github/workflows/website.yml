@@ -42,6 +42,9 @@ jobs:
         env:
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
 
+      - name: Reject zero-length image boxes without hanging
+        run: yarn workspace website test:security
+
       # `onBrokenLinks: throw` makes this the link check too: a relative link between docs
       # that no longer resolves fails here rather than shipping as a 404.
       - name: Build
