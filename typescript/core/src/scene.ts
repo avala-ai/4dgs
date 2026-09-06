@@ -18,7 +18,12 @@ import {
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
-import { duplicateStructuralRecord, MalformedFile, TruncatedFile } from "./errors.js";
+import {
+  duplicateStructuralRecord,
+  ExceedsReaderLimit,
+  MalformedFile,
+  TruncatedFile,
+} from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
 import { Opcode } from "./opcodes.js";
 import { ObjectLayer } from "./objects.js";
@@ -36,6 +41,7 @@ import {
   type Statistics,
   type SummaryOffset,
   RECORD_HEADER_BYTES,
+  checkIndexCount,
   parseAttachment,
   parseAudioSource,
   parseCamera,
@@ -139,6 +145,14 @@ export interface AudioPayloadChunk {
 }
 
 const DEFAULT_BLOCK_SIZE = 1 << 20;
+/**
+ * Maximum state Chunks one whole-scene streamed decode retains.
+ *
+ * This is a reader resource limit, not a format limit. The returned Scene already owns one
+ * decoded population per Chunk; the same ceiling also bounds the one-integer-per-Chunk index
+ * observations retained until the trailing summary arrives.
+ */
+export const MAX_STREAMED_SCENE_CHUNKS = 262_144;
 // Kept in step with the indexed reader's bounded prefix read. A codec name is a registry
 // descriptor, not payload; letting its u32 length size an allocation would give a few
 // hostile bytes a multi-gigabyte memory effect.
@@ -207,6 +221,9 @@ export async function decodeScene(
   let chunkOptions: DecodeChunkOptions | null = null;
 
   const chunks: ChunkGaussians[] = [];
+  // The summary follows the chunks, so keep one bounded observation per decoded Chunk
+  // until its index entry arrives. Never retain a second copy of a population.
+  const decodedChunkRows = new Map<number, number>();
   const chunkBands: Map<number, Int32Array>[] = [];
   const metadata: Metadata[] = [];
   const attachments: Attachment[] = [];
@@ -311,6 +328,12 @@ export async function decodeScene(
           if (quantization === null || header === null) {
             throw new MalformedFile("a Chunk arrived before the Header or Quantization record");
           }
+          if (chunks.length === MAX_STREAMED_SCENE_CHUNKS) {
+            throw new ExceedsReaderLimit(
+              `streamed scene decode stopped after ${MAX_STREAMED_SCENE_CHUNKS} retained ` +
+                "Chunks; this is the reader's bounded-memory limit, not a malformed-file verdict",
+            );
+          }
           chunkOptions ??= {
             steps: stepsFrom(quantization),
             posOrigin: quantization.posOrigin,
@@ -320,7 +343,9 @@ export async function decodeScene(
           };
           const parsed = parseChunk(content);
           const streamBytes = await chunkStreamBytes(parsed, codecs);
-          chunks.push(await decodeChunkStreams(streamBytes, parsed.header.count, chunkOptions));
+          const decoded = await decodeChunkStreams(streamBytes, parsed.header.count, chunkOptions);
+          chunks.push(decoded);
+          decodedChunkRows.set(record.offset, decoded.count);
           chunkBands.push(new Map());
           break;
         }
@@ -401,9 +426,20 @@ export async function decodeScene(
         case Opcode.Statistics:
           statistics = parseStatistics(content);
           break;
-        case Opcode.ChunkIndex:
-          chunkIndex.push(parseChunkIndexEntry(content));
+        case Opcode.ChunkIndex: {
+          const entry = parseChunkIndexEntry(content);
+          const observed = decodedChunkRows.get(entry.chunkOffset);
+          if (observed !== undefined) {
+            checkIndexCount(
+              entry,
+              "gaussian_count",
+              observed,
+              "the decoded Chunk's validated gaussian row count",
+            );
+          }
+          chunkIndex.push(entry);
           break;
+        }
         case Opcode.SummaryOffset:
           summaryOffsets.push(parseSummaryOffset(content));
           break;

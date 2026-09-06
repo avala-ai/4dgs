@@ -10,6 +10,14 @@ The four packages version together.
 
 ### Fixed
 
+- **Decoded Chunk Index counts are verified against the content they describe.** Gaussian-birth
+  readers compare `gaussian_count` with validated Chunk rows on both streamed and indexed paths.
+  Keyframe-delta readers compare `gaussian_count` with validated keyframe rows or Delta operations
+  and `live_count` with the composed population, including every intermediate link of a selected
+  chain without reading another GOP. A mismatch is the shared `index-record-mismatch` refusal and
+  names the entry, field, declared value, and decoded observation. Whole-scene streamed reads cap
+  retained Chunks and their pending count observations at 262,144, reported as `ExceedsReaderLimit`
+  rather than a malformed file.
 - **A record length past 2^53 is a cut, not a malformed file.** `Cursor.u64()` refuses a value above
   2^53 as malformed, and `readRecord` and the `StreamDecoder` framed every record's length through
   it. So `TenWindows-UseChunkIndex-UseCrc.4dgs` with the top byte of its first Chunk's length set
