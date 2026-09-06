@@ -47,6 +47,36 @@ from generator import invalid
 COMPOSED = "object/ObjectTrackComposed-UseChunkIndex-UseCrc"
 
 
+def _raise(error):
+    raise error
+
+
+def test_encode_gate_accepts_only_the_named_index_count_refusal():
+    message = (
+        "the chunk index entry at 903 declares gaussian_count 4; "
+        "the decoded Delta Chunk's validated operation count is 3"
+    )
+    accepted = encode_roundtrip._expect_index_count_failure(
+        "index/keyframe-delta",
+        lambda: _raise(encode_roundtrip.fourdgs.MalformedFile(message, code="index-record-mismatch")),
+        assertion_field="live_count",
+        refusal_field="gaussian_count",
+    )
+    assert accepted == message
+
+    for error in (
+        encode_roundtrip.fourdgs.MalformedFile(message),
+        encode_roundtrip.fourdgs.MalformedFile("an unrelated index fault", code="index-record-mismatch"),
+    ):
+        with pytest.raises(AssertionError, match="expected refusal code 'index-record-mismatch'"):
+            encode_roundtrip._expect_index_count_failure(
+                "index/keyframe-delta",
+                lambda error=error: _raise(error),
+                assertion_field="live_count",
+                refusal_field="gaussian_count",
+            )
+
+
 def test_non_positive_step_time_refusal_witnesses_change_only_the_field():
     scenario = next(item for item in generate.scenarios.SCENARIOS if item.name == invalid.BASE_SCENARIO)
     base, _ = generate.build(scenario, tuple(sorted(invalid.BASE_FLAGS)))
