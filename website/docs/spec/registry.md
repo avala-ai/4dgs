@@ -60,10 +60,10 @@ top-level record — see spec §5.6.
 | 8      | `sigma_t`        | 1        | log domain; `exp(bin × step_sigma_log)`                                                                      |
 | 9      | `flags`          | 1        | bit 0: never fades (`sigma_t = +inf`)                                                                        |
 | 10     | `window_index`   | 1        | index into the Window Table                                                                                  |
-| 11     | `source_group`   | 1        | optional producer-side grouping id                                                                           |
-| 12     | `source_index`   | 1        | optional producer-side stable id                                                                             |
+| 11     | `source_group`   | 1        | exact `i32` producer-side grouping label; optional; logical `0` when omitted                                 |
+| 12     | `source_index`   | 1        | exact `i32` producer-side stable label; optional; logical `0` when omitted                                   |
 | 13     | `gaussian_id`    | 1        | `u32` identity; required in every chunk of a `keyframe-delta` file, absent from `gaussian-birth`; spec §11.2 |
-| 14     | `object_id`      | 1        | exact `u32` membership; same-bit signed stream code; spec §6.6                                               |
+| 14     | `object_id`      | 1        | exact `u32` membership; optional; logical `0` when omitted; same-bit signed stream code; spec §6.6           |
 | 15–31  | reserved         |          |                                                                                                              |
 | 32     | `surface_normal` | 3        | reserved — relighting block, see below                                                                       |
 | 33     | `base_color`     | 3        | reserved — relighting block, see below                                                                       |
@@ -74,9 +74,12 @@ top-level record — see spec §5.6.
 | 48–63  | reserved         |          |                                                                                                              |
 | 64–127 | private          |          | application-defined, readers skip                                                                            |
 
-Ids 0–10 are required in every chunk. Ids 11, 12 and 14 are optional. The first two let a producer
-round-trip stable source identities; id 14 carries exact object membership and defaults to `0` when
-omitted from a chunk.
+Ids 0–10 are required in every chunk. Ids 11, 12 and 14 are optional exact identity labels. Each
+defaults logically to `0` when omitted from a complete Chunk or Delta Chunk birth; an omitted update
+lane carries the reference value. When present in a `keyframe-delta` update, all three are absolute
+restatements rather than bin differences (spec §6.1, §11.3, §11.5). The first two let a producer
+round-trip source identities; id 14 carries object membership through the unsigned bridge §6.6
+defines.
 
 Ids 13–63 are the extension pool for per-gaussian attributes. Object membership has taken id 14; ids
 32–47 remain the **relighting block** below. Everything in 13–63 not defined here stays reserved: a

@@ -1,10 +1,13 @@
 # Proposal: the object layer under `keyframe-delta`
 
-**Status: proposed, not normative, not implemented.** This document resolves
-[#79](https://github.com/avala-ai/4dgs/issues/79). It states where object-track composition sits
-relative to delta application, closes the two smaller holes that answer depends on, and names the
-conformance variant that would pin it. Nothing here is in force until it is folded into
-[the specification](../index.md).
+**Status: object-track composition remains proposed, not normative, and not implemented.** This
+document resolves [#79](https://github.com/avala-ai/4dgs/issues/79). Its optional-identity audit
+also found two smaller holes: omitted-row defaults and whether `object_id` updates are absolute.
+Those were independently decided for all three optional identity lanes by
+[#225](https://github.com/avala-ai/4dgs/issues/225) and are now normative in §§5.18, 6.1, 11.3 and
+11.5; the [identity decision record](./optional-identity-zero-defaults.md) controls where this older
+draft differs. That narrow adoption does **not** put this proposal's Object Track composition,
+`objects` profile rewrite, conformance variants or SDK work into force.
 
 The layer and the temporal model were designed a revision apart, each correctly, and neither says
 what happens when a file carries both. Five implementations would each guess, and the guesses would
@@ -47,7 +50,7 @@ the family. The object-layer changelog note in §13 says the layer "composes wit
 > the same types — and **§3's arithmetic then applies verbatim**. This model changes _where the
 > state comes from_ and nothing about what the state means.
 
-### 1.2 What that leaves open
+### 1.2 What that left open when audited
 
 Read together, §11.3 and §3 arguably already answer the composition question: the chain produces a
 §3 state, §3 says a track is applied to a §3 state, therefore the track is applied after the chain.
@@ -77,9 +80,11 @@ The [object-layer proposal](./object-layer.md) answered both, in its §3.4:
 > a gaussian at time `t` is the one matching its `object_id` **at `t`**, composed after the delta
 > chain has produced that id.
 
-**That paragraph never reached the specification.** `object_id` appears in the normative text at
-lines describing §3, §5.3, §5.15.6, §5.15.7, §6.1 and §6.6, and nowhere in §5.18 or §11. The design
-decision exists; the normative statement does not. That gap is the real content of #79.
+**At the time of this audit, that paragraph had never reached the specification.** The
+[optional-identity decision](./optional-identity-zero-defaults.md) later put its `object_id`
+absoluteness and omission mechanics into §§5.18, 6.1, 11.3 and 11.5, alongside the two producer
+identity lanes. The remaining #79 gap is Object Track composition onto the state that chain
+reconstruction produces.
 
 ---
 
@@ -219,6 +224,9 @@ difference would be meaningless.
 after §3's arithmetic; and `object_id` in a delta's update group is an absolute restatement, not a
 bin difference.**
 
+The second half, (i), is now normative through #225. The first half, (a), remains this proposal's
+recommendation and is not adopted by that narrower identity decision.
+
 Three reasons.
 
 1. **(a) is not a new rule, it is §11.3 held to its word.** §11.3 promises that a composed state is
@@ -244,7 +252,11 @@ one.
 
 ---
 
-## 5. The normative text
+## 5. Proposed normative text for #79
+
+The optional identity parts of §§5.2–5.4 have since landed through #225 in a generalized form that
+also covers `source_group` and `source_index`. They remain here as design history. The Object Track
+composition and `objects` profile text remain proposed.
 
 ### 5.1 Into §11.3, replacing the composed-state paragraph immediately before its final paragraph
 
