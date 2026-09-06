@@ -887,6 +887,104 @@ fn churn_sequence() -> Vec<u8> {
     .expect("the churn witness encodes")
 }
 
+fn delta_scale_overflow_sequence() -> Vec<u8> {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions, Sample};
+
+    let state = |position_10: f32, scale_20: f32| fourdgs::GaussianSet {
+        positions: vec![position_10, 0.0, 0.0, 0.0, 0.0, 0.0],
+        scales: vec![1.0, 1.0, 1.0, scale_20, 1.0, 1.0],
+        rotations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        colors: vec![0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 1.0],
+        motions: vec![0.0; 6],
+        mu_t: vec![0.0; 2],
+        sigma_t: vec![1.0; 2],
+        win_lo: vec![0.0; 2],
+        win_hi: vec![2.0; 2],
+        ..Default::default()
+    };
+    let samples = [
+        Sample {
+            t0: 0.0,
+            ids: vec![10, 20],
+            gaussians: state(0.0, 1.0),
+        },
+        Sample {
+            t0: 1.0,
+            ids: vec![10, 20],
+            gaussians: state(0.1, 2.0),
+        },
+    ];
+    let mut bytes = write_sequence(
+        &samples,
+        2.0,
+        &KeyframeDeltaOptions {
+            keyframe_every: 4,
+            ..Default::default()
+        },
+    )
+    .expect("the delta overflow witness encodes");
+    let record = fourdgs::serialization::Records::new(&bytes, fourdgs::MAGIC.len())
+        .map(|record| record.unwrap())
+        .find(|record| record.opcode == fourdgs::opcode::QUANTIZATION)
+        .unwrap();
+    let at = record.offset;
+    let old_len = fourdgs::serialization::RECORD_HEADER_SIZE + record.content.len();
+    let mut quantization = fourdgs::records::Quantization::parse(record.content).unwrap();
+    quantization.step_scale_log = f64::MAX;
+    let encoded = quantization.encode(&[]);
+    assert_eq!(encoded.len(), old_len);
+    bytes[at..at + old_len].copy_from_slice(&encoded);
+    bytes
+}
+
+#[test]
+fn decoded_delta_overflow_names_its_physical_update_row_on_every_read_path() {
+    use fourdgs::keyframe_delta_file::{decode_indexed, decode_streamed};
+    use fourdgs::keyframe_delta_validate::{validate, ValidationMode};
+
+    let bytes = delta_scale_overflow_sequence();
+    let delta_at = fourdgs::serialization::Records::new(&bytes, fourdgs::MAGIC.len())
+        .map(|record| record.unwrap())
+        .find(|record| record.opcode == fourdgs::opcode::DELTA_CHUNK)
+        .unwrap()
+        .offset as u64;
+    let streamed = decode_streamed(&bytes).expect_err("the streamed path decodes the delta");
+    let indexed = decode_indexed(&bytes).expect_err("the indexed path decodes the delta");
+    for error in [streamed, indexed] {
+        assert_eq!(
+            error.refusal_code(),
+            Some(fourdgs::error::refusal::DECODED_F32_OVERFLOW)
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("Delta Chunk record at byte {delta_at}")),
+            "{message}"
+        );
+        assert!(message.contains("update row 1 gaussian_id 20"), "{message}");
+        assert!(message.contains("stored delta bin"), "{message}");
+        assert!(message.contains("composed bin"), "{message}");
+    }
+
+    for mode in [ValidationMode::Streamed, ValidationMode::Indexed] {
+        let mut source = fourdgs::BytesReadable::new(&bytes);
+        let failure = validate(&mut source, mode, |_offset, _id| Ok(()))
+            .expect_err("both validators decode the delta");
+        assert_eq!(
+            failure.error.refusal_code(),
+            Some(fourdgs::error::refusal::DECODED_F32_OVERFLOW)
+        );
+        assert_eq!(failure.offset, Some(delta_at));
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("update row 1 gaussian_id 20"),
+            "{}",
+            failure.error
+        );
+    }
+}
+
 fn with_wrong_delta_index_count(
     data: &[u8],
     field: &str,

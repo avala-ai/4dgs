@@ -392,6 +392,66 @@ fn two_window_file() -> Vec<u8> {
     fourdgs::write_to_vec(&g, 2.0, &options, &Default::default()).expect("the fixture encodes")
 }
 
+fn with_step_scale_log(mut bytes: Vec<u8>, step: f64) -> Vec<u8> {
+    let record = Records::new(&bytes, MAGIC.len())
+        .map(|record| record.expect("the writer produced framed records"))
+        .find(|record| record.opcode == op::QUANTIZATION)
+        .expect("the writer emits Quantization");
+    let at = record.offset;
+    let old_len = RECORD_HEADER_SIZE + record.content.len();
+    let mut quantization = Quantization::parse(record.content).unwrap();
+    quantization.step_scale_log = step;
+    let encoded = quantization.encode(&[]);
+    assert_eq!(encoded.len(), old_len);
+    bytes[at..at + old_len].copy_from_slice(&encoded);
+    bytes
+}
+
+fn positive_scale_file() -> Vec<u8> {
+    let mut gaussians = fourdgs::model::GaussianSet::default();
+    gaussians.positions.extend_from_slice(&[0.0, 0.0, 0.0]);
+    gaussians.scales.extend_from_slice(&[2.0, 1.0, 1.0]);
+    gaussians.rotations.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+    gaussians.colors.extend_from_slice(&[0.5, 0.5, 0.5, 1.0]);
+    gaussians.motions.extend_from_slice(&[0.0, 0.0, 0.0]);
+    gaussians.mu_t.push(0.5);
+    gaussians.sigma_t.push(0.25);
+    gaussians.win_lo.push(0.0);
+    gaussians.win_hi.push(1.0);
+    fourdgs::write_to_vec(&gaussians, 1.0, &Default::default(), &Default::default())
+        .expect("the fixture encodes")
+}
+
+#[test]
+fn decoded_f32_overflow_names_the_physical_chunk_on_both_read_paths() {
+    let bytes = with_step_scale_log(positive_scale_file(), f64::MAX);
+    let chunk_at = Records::new(&bytes, MAGIC.len())
+        .map(|record| record.unwrap())
+        .find(|record| record.opcode == op::CHUNK)
+        .unwrap()
+        .offset as u64;
+
+    let streamed = fourdgs::read_bytes(&bytes).expect_err("the streamed path decodes the scale");
+    let mut source = fourdgs::BytesReadable::new(&bytes);
+    let scene = fourdgs::indexed_reader::open_indexed(&mut source).unwrap();
+    let entry = scene.index[0].clone();
+    let indexed = fourdgs::indexed_reader::read_chunk(&mut source, &scene, &entry, 3)
+        .expect_err("the indexed path decodes the scale");
+
+    for error in [streamed, indexed] {
+        assert_eq!(
+            error.refusal_code(),
+            Some(fourdgs::error::refusal::DECODED_F32_OVERFLOW)
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("Chunk record at byte {chunk_at}")),
+            "{message}"
+        );
+        assert!(message.contains("attribute scale component 0"), "{message}");
+    }
+}
+
 fn with_wrong_first_index_gaussian_count(mut bytes: Vec<u8>) -> (Vec<u8>, u64, u32, u32) {
     let footer_at = bytes.len() - MAGIC.len() - Footer::default().encode().len();
     let mut footer = Footer::parse(&bytes[footer_at + RECORD_HEADER_SIZE..]).unwrap();

@@ -6,6 +6,16 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Changed
+
+- **Readers refuse decoded binary32 attribute overflow by name.** Gaussian-birth and keyframe-delta
+  decoding now complete each floating reconstruction in `f64`, then return `decoded-f32-overflow`
+  before narrowing any NaN, infinity, or out-of-range result into state. Diagnostics identify the
+  physical Chunk or Delta Chunk byte, row, identity where present, attribute component, contributing
+  bin, effective step and origin where applicable. Zero bins remain legal beside the largest finite
+  `f64` steps, ordinary underflow remains legal, and the `never_fades` sigma infinity remains the
+  format's sole sentinel exception.
+
 ## [0.7.1] - 2026-09-05
 
 ### Changed

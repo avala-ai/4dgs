@@ -15,9 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::keyframe_delta::State;
 use crate::keyframe_delta_file::{
-    check_index_count, check_keyframe_mu_t, compose_delta_chunk, open_indexed, ranged_framing,
-    ranged_front_matter_content, ranged_header, ranged_record, read_delta_entry,
-    read_keyframe_entry,
+    check_decoded_f32_state, check_index_count, check_keyframe_mu_t, compose_delta_chunk_checked,
+    open_indexed, ranged_framing, ranged_front_matter_content, ranged_header, ranged_record,
+    read_delta_entry_checked, read_keyframe_entry,
 };
 use crate::opcode as op;
 use crate::records as rec;
@@ -523,6 +523,7 @@ fn finish_bands(owner: u64, rows: usize, degree: u8, bands: &mut Vec<u8>) -> Val
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_delta<R: Readable + ?Sized>(
     source: &mut R,
     entry: &rec::ChunkIndexEntry,
@@ -530,6 +531,8 @@ fn validate_delta<R: Readable + ?Sized>(
     current: Option<&(u64, u16, u32, State)>,
     keyframe: Option<&(u64, u32, State)>,
     windows: &[(f64, f64)],
+    quantization: &rec::Quantization,
+    cutoff: f64,
 ) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
     if entry.reference_offset >= entry.chunk_offset {
         return Err(Error::Malformed(format!(
@@ -579,7 +582,8 @@ fn validate_delta<R: Readable + ?Sized>(
             entry.depth
         )));
     }
-    let (state, head, births) = read_delta_entry(source, entry, reference, windows)?;
+    let (state, head, births) =
+        read_delta_entry_checked(source, entry, reference, windows, quantization, cutoff)?;
     check_population(entry.chunk_offset, "composed state", state.count())?;
     if head.level != reference_level {
         return Err(Error::Malformed(format!(
@@ -903,6 +907,13 @@ where
             }
             crate::keyframe_delta_file::check_composed_population(entry, &state)
                 .map_err(|error| ValidationFailure::at(error, at))?;
+            check_decoded_f32_state(
+                &state,
+                &sequence.quantization,
+                &sequence.windows,
+                sequence.header.cutoff,
+            )
+            .map_err(|error| ValidationFailure::at(error.at_record("Chunk record", at), at))?;
             let ids = introductions(current.as_ref().map(|(_, _, _, state)| state), &state);
             emit_introductions(&ids, at, introduce)?;
             birth_bands.clear();
@@ -917,6 +928,8 @@ where
                 current.as_ref(),
                 keyframe.as_ref(),
                 &sequence.windows,
+                &sequence.quantization,
+                sequence.header.cutoff,
             )
             .map_err(|error| ValidationFailure::at(error, at))?;
             check_repeated_birth_invariants(
@@ -1085,6 +1098,14 @@ where
                             Error::Malformed("a keyframe Chunk appears before Quantization".into())
                         })?;
                         check_keyframe_mu_t(&state, head.t0, quantization)?;
+                        let cutoff = header
+                            .as_ref()
+                            .ok_or_else(|| {
+                                Error::Malformed("a keyframe Chunk appears before Header".into())
+                            })?
+                            .cutoff;
+                        check_decoded_f32_state(&state, quantization, &windows, cutoff)
+                            .map_err(|error| error.at_record("Chunk record", at))?;
                         if previous_t1.is_none() && head.t0 != 0.0 {
                             return Err(Error::Malformed(format!(
                                 "the state chunks start at {}; they tile the timeline from 0 (section 11.1)",
@@ -1201,7 +1222,24 @@ where
                             declared.depth, declared.keyframe_offset, declared.level
                         )));
                     }
-                    compose_delta_chunk(reference, &content, &windows).and_then(
+                    let quantization = quantization.as_ref().ok_or_else(|| {
+                        Error::Malformed("a Delta Chunk appears before Quantization".into())
+                    })?;
+                    let cutoff = header
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::Malformed("a Delta Chunk appears before Header".into())
+                        })?
+                        .cutoff;
+                    compose_delta_chunk_checked(
+                        reference,
+                        &content,
+                        &windows,
+                        quantization,
+                        cutoff,
+                        at,
+                    )
+                    .and_then(
                         |(state, head, births)| {
                             check_population(at, "composed state", state.count())?;
                             crate::keyframe_delta_file::check_streamed_population(

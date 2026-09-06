@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyframe_delta::{
-    apply_delta, chain_ending_at, check_tiling, check_timeline_endpoints, keyframe_state, BinArray,
-    State, ABSOLUTE_IN_UPDATE, GOP_INVARIANT,
+    apply_delta_with_rows, chain_ending_at, check_tiling, check_timeline_endpoints, keyframe_state,
+    BinArray, State, ABSOLUTE_IN_UPDATE, GOP_INVARIANT,
 };
 use crate::model::GaussianSet;
 use crate::opcode as op;
@@ -1581,13 +1581,17 @@ fn decode_delta(content: &[u8]) -> Result<DecodedDelta> {
     decode_delta_with_retained(content, 0)
 }
 
-fn compose_delta(
-    reference: &State,
-    content: &[u8],
-) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+struct ComposedDelta {
+    state: State,
+    decoded: DecodedDelta,
+    update_rows: Vec<usize>,
+    birth_start: usize,
+}
+
+fn compose_delta(reference: &State, content: &[u8]) -> Result<ComposedDelta> {
     let decoded = decode_delta_with_retained(content, state_resident_bytes(reference)?)?;
     check_composition_working_set(reference, &decoded, content.len())?;
-    let state = apply_delta(
+    let (state, update_rows, birth_start) = apply_delta_with_rows(
         reference,
         &decoded.update_ids,
         &decoded.update_bins,
@@ -1595,7 +1599,12 @@ fn compose_delta(
         &decoded.birth_bins,
         &decoded.death_ids,
     )?;
-    Ok((state, decoded.head, decoded.birth_ids))
+    Ok(ComposedDelta {
+        state,
+        decoded,
+        update_rows,
+        birth_start,
+    })
 }
 
 /// Decode one keyframe chunk's streams, check the state they make, and keep neither.
@@ -1684,9 +1693,32 @@ pub fn compose_delta_chunk(
     content: &[u8],
     windows: &[(f64, f64)],
 ) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
-    let (state, head, births) = compose_delta(reference, content)?;
-    check_window_indices(&state, windows)?;
-    Ok((state, head, births))
+    let composed = compose_delta(reference, content)?;
+    check_window_indices(&composed.state, windows)?;
+    Ok((
+        composed.state,
+        composed.decoded.head,
+        composed.decoded.birth_ids,
+    ))
+}
+
+pub(crate) fn compose_delta_chunk_checked(
+    reference: &State,
+    content: &[u8],
+    windows: &[(f64, f64)],
+    quantization: &rec::Quantization,
+    cutoff: f64,
+    record_offset: u64,
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    let composed = compose_delta(reference, content)?;
+    check_window_indices(&composed.state, windows)?;
+    check_decoded_f32_delta(&composed, quantization, windows, cutoff)
+        .map_err(|error| error.at_record("Delta Chunk record", record_offset))?;
+    Ok((
+        composed.state,
+        composed.decoded.head,
+        composed.decoded.birth_ids,
+    ))
 }
 
 /// Front to back: decode each chunk and compose it onto the state it references.
@@ -1733,6 +1765,16 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 })?;
                 check_keyframe_mu_t(&state, head.t0, quantization)?;
                 check_window_indices(&state, &windows)?;
+                check_decoded_f32_state(
+                    &state,
+                    quantization,
+                    &windows,
+                    header
+                        .as_ref()
+                        .map(|value| value.cutoff)
+                        .unwrap_or(crate::quantization::DEFAULT_CUTOFF),
+                )
+                .map_err(|error| error.at_record("Chunk record", record.offset as u64))?;
                 check_streamed_population(record.offset as u64, head.t0, head.t1, &state)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
@@ -1764,12 +1806,27 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                         record.offset, head.reference_offset
                     )));
                 };
-                let (state, head, _) = compose_delta(reference, record.content)?;
+                let composed = compose_delta(reference, record.content)?;
                 // Births in a delta group carry their own `window_index`, so the check
                 // belongs on this branch too — not only where a keyframe is read. The
                 // indexed path validates the composed state for every chunk, so leaving
                 // it off here would accept a birth the other path refuses.
-                check_window_indices(&state, &windows)?;
+                check_window_indices(&composed.state, &windows)?;
+                let quantization = quant.as_ref().ok_or_else(|| {
+                    Error::Malformed("a Delta Chunk appears before Quantization".into())
+                })?;
+                check_decoded_f32_delta(
+                    &composed,
+                    quantization,
+                    &windows,
+                    header
+                        .as_ref()
+                        .map(|value| value.cutoff)
+                        .unwrap_or(crate::quantization::DEFAULT_CUTOFF),
+                )
+                .map_err(|error| error.at_record("Delta Chunk record", record.offset as u64))?;
+                let ComposedDelta { state, decoded, .. } = composed;
+                let head = decoded.head;
                 check_streamed_population(record.offset as u64, head.t0, head.t1, &state)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
@@ -1954,6 +2011,361 @@ fn check_window_indices(state: &State, windows: &[(f64, f64)]) -> Result<()> {
     Ok(())
 }
 
+/// Enforce the binary32 range on one composed keyframe-delta state (§3.2).
+///
+/// Composition stays integer-only; this is where its absolute bins acquire decoded attribute
+/// meaning. Callers add the physical record byte so a delta that first makes a value invalid is
+/// blamed instead of the shared Quantization declaration.
+fn decoded_row_site(row_kind: Option<&str>, row: usize, gaussian_id: i64) -> String {
+    match row_kind {
+        Some(kind) => format!("{kind} row {row} gaussian_id {gaussian_id}"),
+        None => format!("row {row} gaussian_id {gaussian_id}"),
+    }
+}
+
+fn decoded_scalar_bins(
+    stored: Option<&BTreeMap<u8, BinArray>>,
+    row_kind: Option<&str>,
+    attribute: u8,
+    row: usize,
+    component: usize,
+    composed: i64,
+) -> String {
+    let Some(value) = stored
+        .and_then(|bins| bins.get(&attribute))
+        .and_then(|bins| bins.values.get(row * bins.channels + component))
+    else {
+        return format!("composed bin {composed}");
+    };
+    let kind = if row_kind == Some("update") && !ABSOLUTE_IN_UPDATE.contains(&attribute) {
+        "delta"
+    } else {
+        "absolute"
+    };
+    format!("stored {kind} bin {value} and composed bin {composed}")
+}
+
+fn decoded_vector_bins(
+    stored: Option<&BTreeMap<u8, BinArray>>,
+    row_kind: Option<&str>,
+    attribute: u8,
+    row: usize,
+    composed: &[i64],
+) -> String {
+    let Some(values) = stored
+        .and_then(|bins| bins.get(&attribute))
+        .and_then(|bins| {
+            bins.values
+                .get(row * bins.channels..(row + 1) * bins.channels)
+        })
+    else {
+        return format!("composed bins {composed:?}");
+    };
+    let kind = if row_kind == Some("update") && !ABSOLUTE_IN_UPDATE.contains(&attribute) {
+        "delta"
+    } else {
+        "absolute"
+    };
+    format!("stored {kind} bins {values:?} and composed bins {composed:?}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_decoded_f32_rows<F>(
+    state: &State,
+    source_ids: &[i64],
+    state_row: F,
+    stored: Option<&BTreeMap<u8, BinArray>>,
+    row_kind: Option<&str>,
+    quantization: &rec::Quantization,
+    windows: &[(f64, f64)],
+    cutoff: f64,
+) -> Result<()>
+where
+    F: Fn(usize) -> usize,
+{
+    if source_ids.is_empty() {
+        return Ok(());
+    }
+    let missing: Vec<u8> = REQUIRED
+        .iter()
+        .copied()
+        .filter(|attribute| !state.bins.contains_key(attribute))
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::Malformed(format!(
+            "a non-empty composed state is missing required attributes {missing:?}"
+        )));
+    }
+
+    let steps = quantization.steps();
+    let origin = [
+        quantization.pos_origin.first().copied().unwrap_or(0.0),
+        quantization.pos_origin.get(1).copied().unwrap_or(0.0),
+        quantization.pos_origin.get(2).copied().unwrap_or(0.0),
+    ];
+    let table = crate::chunk::window_table_or_default(windows);
+    let position = &state.bins[&op::A_POSITION];
+    let scale = &state.bins[&op::A_SCALE];
+    let rotation_index = &state.bins[&op::A_ROTATION_INDEX];
+    let rotation = &state.bins[&op::A_ROTATION];
+    let color = &state.bins[&op::A_COLOR];
+    let opacity = &state.bins[&op::A_OPACITY];
+    let motion = &state.bins[&op::A_MOTION];
+    let mu = &state.bins[&op::A_MU_T];
+    let sigma = &state.bins[&op::A_SIGMA_T];
+    let flags = &state.bins[&op::A_FLAGS];
+    let window = &state.bins[&op::A_WINDOW_INDEX];
+    let wanted = |attribute: u8| stored.is_none_or(|bins| bins.contains_key(&attribute));
+
+    for (physical_row, &gaussian_id) in source_ids.iter().enumerate() {
+        let row = state_row(physical_row);
+        if wanted(op::A_POSITION) {
+            for (component, &component_origin) in origin.iter().enumerate() {
+                let bin = position.values[row * 3 + component];
+                let value = crate::decoded_f32::linear(bin, steps.pos, component_origin);
+                crate::decoded_f32::ensure(value, || {
+                    format!(
+                        "{} attribute position component {component} from {}, step_pos {}, and origin {}",
+                        decoded_row_site(row_kind, physical_row, gaussian_id),
+                        decoded_scalar_bins(
+                            stored,
+                            row_kind,
+                            op::A_POSITION,
+                            physical_row,
+                            component,
+                            bin
+                        ),
+                        steps.pos,
+                        component_origin
+                    )
+                })?;
+            }
+        }
+
+        if wanted(op::A_SCALE) {
+            for component in 0..3 {
+                let bin = scale.values[row * 3 + component];
+                let value = (bin as f64 * steps.scale_log).exp();
+                crate::decoded_f32::ensure(value, || {
+                    format!(
+                        "{} attribute scale component {component} from {} and step_scale_log {}",
+                        decoded_row_site(row_kind, physical_row, gaussian_id),
+                        decoded_scalar_bins(
+                            stored,
+                            row_kind,
+                            op::A_SCALE,
+                            physical_row,
+                            component,
+                            bin
+                        ),
+                        steps.scale_log
+                    )
+                })?;
+            }
+        }
+
+        if wanted(op::A_ROTATION_INDEX) || wanted(op::A_ROTATION) {
+            let largest = rotation_index.values[row];
+            let rotation_bins = &rotation.values[row * 3..row * 3 + 3];
+            let quaternion =
+                crate::quantization::dequantize_rotation_wide(largest, rotation_bins, steps.rot);
+            for (component, value) in quaternion.into_iter().enumerate() {
+                crate::decoded_f32::ensure(value, || {
+                    format!(
+                        "{} attribute rotation component {component} from rotation_index {}, {}, and step_rot {}",
+                        decoded_row_site(row_kind, physical_row, gaussian_id),
+                        decoded_scalar_bins(
+                            stored,
+                            row_kind,
+                            op::A_ROTATION_INDEX,
+                            physical_row,
+                            0,
+                            largest
+                        ),
+                        decoded_vector_bins(
+                            stored,
+                            row_kind,
+                            op::A_ROTATION,
+                            physical_row,
+                            rotation_bins
+                        ),
+                        steps.rot
+                    )
+                })?;
+            }
+        }
+
+        if wanted(op::A_COLOR) {
+            let color_bins = &color.values[row * 3..row * 3 + 3];
+            let rgb_codes = [
+                color_bins[1] as f64 + color_bins[0] as f64,
+                color_bins[0] as f64,
+                color_bins[2] as f64 + color_bins[0] as f64,
+            ];
+            for (component, code) in rgb_codes.into_iter().enumerate() {
+                let value = (code * steps.rgb).clamp(0.0, 1.0);
+                crate::decoded_f32::ensure(value, || {
+                    format!(
+                        "{} attribute color component {component} from {} and step_rgb {}",
+                        decoded_row_site(row_kind, physical_row, gaussian_id),
+                        decoded_vector_bins(
+                            stored,
+                            row_kind,
+                            op::A_COLOR,
+                            physical_row,
+                            color_bins
+                        ),
+                        steps.rgb
+                    )
+                })?;
+            }
+        }
+        if wanted(op::A_OPACITY) {
+            let opacity_bin = opacity.values[row];
+            let opacity_value = (opacity_bin as f64 * steps.alpha).clamp(0.0, 1.0);
+            crate::decoded_f32::ensure(opacity_value, || {
+                format!(
+                    "{} attribute color component 3 (opacity) from {} and step_alpha {}",
+                    decoded_row_site(row_kind, physical_row, gaussian_id),
+                    decoded_scalar_bins(
+                        stored,
+                        row_kind,
+                        op::A_OPACITY,
+                        physical_row,
+                        0,
+                        opacity_bin
+                    ),
+                    steps.alpha
+                )
+            })?;
+        }
+
+        let sigma_bin = sigma.values[row];
+        let never_fades = flags.values[row] & op::FLAG_NEVER_FADES != 0;
+        if wanted(op::A_SIGMA_T) && !never_fades {
+            let sigma_value = (sigma_bin as f64 * steps.sigma_log).exp();
+            crate::decoded_f32::ensure(sigma_value, || {
+                format!(
+                    "{} attribute sigma_t component 0 from {} and step_sigma_log {}",
+                    decoded_row_site(row_kind, physical_row, gaussian_id),
+                    decoded_scalar_bins(
+                        stored,
+                        row_kind,
+                        op::A_SIGMA_T,
+                        physical_row,
+                        0,
+                        sigma_bin
+                    ),
+                    steps.sigma_log
+                )
+            })?;
+        }
+
+        if wanted(op::A_MOTION) {
+            let window_index = usize::try_from(window.values[row]).map_err(|_| {
+                Error::Malformed(format!(
+                    "{} carries negative window_index {}",
+                    decoded_row_site(row_kind, physical_row, gaussian_id),
+                    window.values[row]
+                ))
+            })?;
+            let (win_lo, win_hi) = table.get(window_index).copied().ok_or_else(|| {
+                Error::Malformed(format!(
+                    "{} carries window_index {window_index} outside the {}-entry table",
+                    decoded_row_site(row_kind, physical_row, gaussian_id),
+                    table.len()
+                ))
+            })?;
+            let class = life_class(
+                sigma_bin,
+                steps.sigma_log,
+                never_fades,
+                win_hi - win_lo,
+                support_k(cutoff),
+            );
+            let effective_motion_step = motion_step(class, steps.motion);
+            for component in 0..3 {
+                let bin = motion.values[row * 3 + component];
+                let value = crate::decoded_f32::linear(bin, effective_motion_step, 0.0);
+                crate::decoded_f32::ensure(value, || {
+                    format!(
+                        "{} attribute motion component {component} from {} and effective step {effective_motion_step}",
+                        decoded_row_site(row_kind, physical_row, gaussian_id),
+                        decoded_scalar_bins(
+                            stored,
+                            row_kind,
+                            op::A_MOTION,
+                            physical_row,
+                            component,
+                            bin
+                        )
+                    )
+                })?;
+            }
+        }
+
+        if wanted(op::A_MU_T) {
+            let effective_mu_step = mu_step(sigma_bin, steps.sigma_log, never_fades, steps.time);
+            let mu_bin = mu.values[row];
+            let mu_value = crate::decoded_f32::linear(mu_bin, effective_mu_step, 0.0);
+            crate::decoded_f32::ensure(mu_value, || {
+                format!(
+                    "{} attribute mu_t component 0 from {} and effective step {effective_mu_step}",
+                    decoded_row_site(row_kind, physical_row, gaussian_id),
+                    decoded_scalar_bins(stored, row_kind, op::A_MU_T, physical_row, 0, mu_bin)
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_decoded_f32_state(
+    state: &State,
+    quantization: &rec::Quantization,
+    windows: &[(f64, f64)],
+    cutoff: f64,
+) -> Result<()> {
+    check_decoded_f32_rows(
+        state,
+        &state.ids,
+        |row| row,
+        None,
+        None,
+        quantization,
+        windows,
+        cutoff,
+    )
+}
+
+fn check_decoded_f32_delta(
+    composed: &ComposedDelta,
+    quantization: &rec::Quantization,
+    windows: &[(f64, f64)],
+    cutoff: f64,
+) -> Result<()> {
+    check_decoded_f32_rows(
+        &composed.state,
+        &composed.decoded.update_ids,
+        |row| composed.update_rows[row],
+        Some(&composed.decoded.update_bins),
+        Some("update"),
+        quantization,
+        windows,
+        cutoff,
+    )?;
+    check_decoded_f32_rows(
+        &composed.state,
+        &composed.decoded.birth_ids,
+        |row| composed.birth_start + row,
+        Some(&composed.decoded.birth_bins),
+        Some("birth"),
+        quantization,
+        windows,
+        cutoff,
+    )
+}
+
 /// Fetch and decode one indexed keyframe through the caller's range source.
 ///
 /// The returned state is one chunk's population. A sequential validator can retain it as
@@ -1994,6 +2406,33 @@ pub fn read_delta_entry<R: crate::Readable + ?Sized>(
     reference: &State,
     windows: &[(f64, f64)],
 ) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    read_delta_entry_inner(source, entry, reference, windows, None)
+}
+
+pub(crate) fn read_delta_entry_checked<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    entry: &rec::ChunkIndexEntry,
+    reference: &State,
+    windows: &[(f64, f64)],
+    quantization: &rec::Quantization,
+    cutoff: f64,
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    read_delta_entry_inner(
+        source,
+        entry,
+        reference,
+        windows,
+        Some((quantization, cutoff)),
+    )
+}
+
+fn read_delta_entry_inner<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    entry: &rec::ChunkIndexEntry,
+    reference: &State,
+    windows: &[(f64, f64)],
+    decoded_guard: Option<(&rec::Quantization, f64)>,
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
     let (opcode, content) = ranged_record(source, entry.chunk_offset, Some(entry.chunk_length))?;
     if opcode != op::DELTA_CHUNK {
         return Err(Error::Malformed(format!(
@@ -2002,7 +2441,18 @@ pub fn read_delta_entry<R: crate::Readable + ?Sized>(
             op::name(opcode)
         )));
     }
-    let decoded = compose_delta_chunk(reference, &content, windows)?;
+    let decoded = if let Some((quantization, cutoff)) = decoded_guard {
+        compose_delta_chunk_checked(
+            reference,
+            &content,
+            windows,
+            quantization,
+            cutoff,
+            entry.chunk_offset,
+        )?
+    } else {
+        compose_delta_chunk(reference, &content, windows)?
+    };
     let operations = u64::from(decoded.1.update_count)
         + u64::from(decoded.1.birth_count)
         + u64::from(decoded.1.death_count);
@@ -2148,6 +2598,17 @@ pub fn compose_chain<R: crate::Readable + ?Sized>(
     quantization: &rec::Quantization,
     windows: &[(f64, f64)],
 ) -> Result<State> {
+    compose_chain_inner(source, index, entry, quantization, windows, None)
+}
+
+fn compose_chain_inner<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    index: &[rec::ChunkIndexEntry],
+    entry: &rec::ChunkIndexEntry,
+    quantization: &rec::Quantization,
+    windows: &[(f64, f64)],
+    decoded_guard: Option<f64>,
+) -> Result<State> {
     // Compose the entry the caller named. Recovering it via a midpoint is equivalent for
     // ordinary half-open intervals, but impossible for a valid empty `[t, t)` entry.
     let chain = chain_ending_at(index, entry)?;
@@ -2155,12 +2616,20 @@ pub fn compose_chain<R: crate::Readable + ?Sized>(
     for link in &chain {
         let (next, record_t0, record_t1) = if link.kind == 0 {
             let (next, head) = read_keyframe_entry(source, link, quantization, windows)?;
+            if let Some(cutoff) = decoded_guard {
+                check_decoded_f32_state(&next, quantization, windows, cutoff)
+                    .map_err(|error| error.at_record("Chunk record", link.chunk_offset))?;
+            }
             (next, head.t0, head.t1)
         } else {
             let reference = state
                 .take()
                 .ok_or_else(|| Error::Malformed("a chain begins with a delta chunk".into()))?;
-            let (next, head, _) = read_delta_entry(source, link, &reference, windows)?;
+            let (next, head, _) = if let Some(cutoff) = decoded_guard {
+                read_delta_entry_checked(source, link, &reference, windows, quantization, cutoff)?
+            } else {
+                read_delta_entry(source, link, &reference, windows)?
+            };
             (next, head.t0, head.t1)
         };
         check_indexed_record_interval(link, record_t0, record_t1)?;
@@ -2357,7 +2826,14 @@ pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkInd
 
     let mut chunks: Vec<ChunkInfo> = Vec::with_capacity(index.len());
     for entry in &index {
-        let state = compose_chain(&mut source, &index, entry, &quantization, &windows)?;
+        let state = compose_chain_inner(
+            &mut source,
+            &index,
+            entry,
+            &quantization,
+            &windows,
+            Some(header.cutoff),
+        )?;
         let (update_count, birth_count, death_count) = if entry.kind != 0 {
             let (_, content) =
                 ranged_record(&mut source, entry.chunk_offset, Some(entry.chunk_length))?;
@@ -2458,7 +2934,7 @@ pub fn reconstruct_at(seq: &DecodedSequence, state: &State, t: f64) -> Reconstru
         }
         out.ids.push(state.ids[i]);
         let sigma_bin = sigma.values[i];
-        let never_fades = flags.values[i] != 0;
+        let never_fades = flags.values[i] & op::FLAG_NEVER_FADES != 0;
         let sigma_f = if never_fades {
             f64::INFINITY
         } else {
@@ -2791,6 +3267,123 @@ mod window_grid_tests {
         let g = grids(Vec::new());
         assert_eq!(g.window_len(0), 0.0);
         assert_eq!(g.window_len(7), 0.0, "the fallback is total, not a panic");
+    }
+}
+
+#[cfg(test)]
+mod decoded_f32_tests {
+    use super::*;
+
+    fn one_row_state(scale_bin: i64, sigma_bin: i64, flags_bin: i64) -> State {
+        let mut bins = BTreeMap::new();
+        for attribute in REQUIRED {
+            let channels = expected_attribute_channels(attribute).unwrap();
+            let mut values = vec![0; channels];
+            if attribute == op::A_SCALE {
+                values[0] = scale_bin;
+            } else if attribute == op::A_SIGMA_T {
+                values[0] = sigma_bin;
+            } else if attribute == op::A_FLAGS {
+                values[0] = flags_bin;
+            }
+            bins.insert(attribute, BinArray::new(values, channels));
+        }
+        State {
+            ids: vec![41],
+            bins,
+        }
+    }
+
+    fn quantization() -> rec::Quantization {
+        rec::Quantization {
+            scheme: "uniform-v1".into(),
+            pos_origin: vec![0.0; 3],
+            step_pos: 1.0,
+            step_scale_log: 1.0,
+            step_rot: 1.0,
+            step_rgb: 1.0,
+            step_alpha: 1.0,
+            step_motion: 1.0,
+            step_time: 1.0,
+            step_sigma_log: 1.0,
+            step_sh: 1,
+            bounds: BTreeMap::new(),
+            sh_bit_depths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn composed_scale_overflow_names_identity_bin_and_step() {
+        let error = check_decoded_f32_state(
+            &one_row_state(100, 0, 0),
+            &quantization(),
+            &[(0.0, 1.0)],
+            0.05,
+        )
+        .unwrap_err()
+        .at_record("Delta Chunk record", 912);
+        assert_eq!(
+            error.refusal_code(),
+            Some(crate::error::refusal::DECODED_F32_OVERFLOW)
+        );
+        let message = error.to_string();
+        for expected in [
+            "Delta Chunk record at byte 912",
+            "row 0",
+            "gaussian_id 41",
+            "attribute scale component 0",
+            "bin 100",
+            "step_scale_log 1",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing {expected:?} in {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_sigma_obeys_overflow_control_and_sentinel_rules() {
+        let mut quantization = quantization();
+        let error = check_decoded_f32_state(
+            &one_row_state(0, 100, 0),
+            &quantization,
+            &[(0.0, 1.0)],
+            0.05,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.refusal_code(),
+            Some(crate::error::refusal::DECODED_F32_OVERFLOW)
+        );
+        assert!(error.to_string().contains("attribute sigma_t"), "{error}");
+
+        quantization.step_scale_log = f64::MAX;
+        quantization.step_sigma_log = f64::MAX;
+        check_decoded_f32_state(&one_row_state(0, 0, 0), &quantization, &[(0.0, 1.0)], 0.05)
+            .unwrap();
+        quantization.step_motion = f64::MAX;
+        quantization.step_time = f64::MAX;
+        check_decoded_f32_state(&one_row_state(0, -1, 0), &quantization, &[(0.0, 1.0)], 0.05)
+            .unwrap();
+        check_decoded_f32_state(
+            &one_row_state(0, 100, op::FLAG_NEVER_FADES),
+            &quantization,
+            &[(0.0, 1.0)],
+            0.05,
+        )
+        .unwrap();
+        let future_flag = check_decoded_f32_state(
+            &one_row_state(0, 100, 2),
+            &quantization,
+            &[(0.0, 1.0)],
+            0.05,
+        )
+        .expect_err("an unrelated future flag must not imply never_fades");
+        assert_eq!(
+            future_flag.refusal_code(),
+            Some(crate::error::refusal::DECODED_F32_OVERFLOW)
+        );
     }
 }
 

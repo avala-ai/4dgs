@@ -145,6 +145,30 @@ pub fn apply_delta(
     birth_bins: &BTreeMap<u8, BinArray>,
     death_ids: &[i64],
 ) -> Result<State, Refusal> {
+    apply_delta_with_rows(
+        state,
+        update_ids,
+        update_bins,
+        birth_ids,
+        birth_bins,
+        death_ids,
+    )
+    .map(|(state, _, _)| state)
+}
+
+/// Compose a delta and retain the already-computed state rows for record-local diagnostics.
+///
+/// `apply_delta` has to resolve update identities to implementation-private state rows anyway.
+/// Returning those rows to the file decoder avoids rebuilding a population-sized lookup solely
+/// to diagnose one malformed reconstructed value. `birth_start` is the first appended birth row.
+pub(crate) fn apply_delta_with_rows(
+    state: &State,
+    update_ids: &[i64],
+    update_bins: &BTreeMap<u8, BinArray>,
+    birth_ids: &[i64],
+    birth_bins: &BTreeMap<u8, BinArray>,
+    death_ids: &[i64],
+) -> Result<(State, Vec<usize>, usize), Refusal> {
     check_groups_disjoint(update_ids, birth_ids, death_ids)?;
     check_unique(update_ids, "an update group")?;
     check_unique(birth_ids, "a birth group")?;
@@ -200,8 +224,9 @@ pub fn apply_delta(
     };
 
     // --- updates ----------------------------------------------------------
+    let mut update_rows = Vec::new();
     if !update_ids.is_empty() {
-        let rows = rows_for(&state.ids, update_ids, "updates")?;
+        update_rows = rows_for(&state.ids, update_ids, "updates")?;
         for (attribute, delta) in update_bins {
             if delta.count() != update_ids.len() {
                 return refuse(
@@ -233,11 +258,11 @@ pub fn apply_delta(
             }
             let channels = base.channels;
             if is_absolute_in_update(*attribute) {
-                for (k, &row) in rows.iter().enumerate() {
+                for (k, &row) in update_rows.iter().enumerate() {
                     base.values[row * channels..(row + 1) * channels].copy_from_slice(delta.row(k));
                 }
             } else {
-                for (k, &row) in rows.iter().enumerate() {
+                for (k, &row) in update_rows.iter().enumerate() {
                     for c in 0..channels {
                         let sum = base.values[row * channels + c] + delta.values[k * channels + c];
                         if !(BIN_MIN..=BIN_MAX).contains(&sum) {
@@ -258,6 +283,7 @@ pub fn apply_delta(
     }
 
     // --- births -----------------------------------------------------------
+    let birth_start = state.ids.len();
     if !birth_ids.is_empty() {
         if let Some(clash) = birth_ids.iter().find(|id| state.ids.contains(id)) {
             return refuse(
@@ -335,7 +361,7 @@ pub fn apply_delta(
     }
 
     check_rotation_indexes(&state)?;
-    Ok(state)
+    Ok((state, update_rows, birth_start))
 }
 
 fn check_absolute_bins(attribute: u8, values: &BinArray, what: &str) -> Result<(), Refusal> {
