@@ -9,10 +9,10 @@ harness skips the rest —
 — and this table is kept in lockstep with what runs. Nothing is marked `Yes` on the strength of code
 existing.
 
-Every row is filled in from a suite that runs: 48 valid variants and 9 invalid ones, plus 5
+Every row is filled in from a suite that runs: 48 valid variants and 11 invalid ones, plus 5
 keyframe-delta and 10 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records. Every language layer runs 143 checks; while the canonical-state stack is
+is what this table records. Every language layer runs 147 checks; while the canonical-state stack is
 landing, a capability-gated comparison omits only exact totals and composed-state samples from SDKs
 whose implementations have not landed yet. It never skips a variant or weakens unrelated fields. C++
 and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor computes

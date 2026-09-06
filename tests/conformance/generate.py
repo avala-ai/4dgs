@@ -330,6 +330,20 @@ def build_invalid() -> list[tuple[str, bytes, str]]:
         if data == base:
             raise AssertionError(f"{name}: the override changed nothing")
         out.append((name, data, canonical({"refused": code})))
+
+    # Count fields have different meanings only in keyframe-delta: gaussian_count is the
+    # operation count while live_count is the composed population. Cut these witnesses from
+    # that corpus rather than corrupting the gaussian-birth base in a second way.
+    index_name, index_base, _ = next(
+        item for item in build_keyframe_delta_corpus() if item[0] == invalid.INDEX_COUNT_BASE
+    )
+    if index_name != invalid.INDEX_COUNT_BASE:
+        raise AssertionError(f"wrong index-count base: {index_name}")
+    for refusal in invalid.INDEX_COUNT_REFUSALS:
+        data = refusal.mutate(index_base)
+        if data == index_base:
+            raise AssertionError(f"{refusal.name}: the mutation changed nothing")
+        out.append((refusal.name, data, canonical({"refused": refusal.code})))
     return out
 
 

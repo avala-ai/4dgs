@@ -266,9 +266,9 @@ REFUSALS: tuple[Refusal, ...] = (
 #: The two witnesses for spec issue #195. They are cut from the churn sequence because
 #: its first delta has two operations over a four-gaussian live population, making the
 #: fields' distinct meanings observable. Each patch changes one count and recomputes the
-#: summary CRC, so checksum failure cannot mask the index-record disagreement. They join
-#: `build_invalid()` only after every SDK layer can name them: the invalid corpus contract
-#: remains all-or-none, while these need a keyframe-delta base rather than `BASE_SCENARIO`.
+#: summary CRC, so checksum failure cannot mask the index-record disagreement. They use a
+#: keyframe-delta base rather than `BASE_SCENARIO`, and `build_invalid()` includes them in the
+#: same all-or-none refusal corpus now that every SDK layer can name them.
 INDEX_COUNT_BASE = "KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics"
 INDEX_COUNT_REFUSALS: tuple[Refusal, ...] = (
     Refusal("WrongIndexGaussianCount", "index-record-mismatch", "spec 5.8", _wrong_index_gaussian_count),
@@ -297,6 +297,5 @@ ENCODED: tuple[tuple[str, str, str, dict], ...] = (
 )
 
 #: Every identifier the suite knows. A runner may produce no other, and a new refusal is
-#: added here rather than invented in one language. The staged index-count identifier is
-#: already vocabulary even though its two corpus files activate only after the SDK stack.
+#: added here rather than invented in one language.
 CODES = frozenset(r.code for r in (*REFUSALS, *INDEX_COUNT_REFUSALS)) | {code for _, code, _, _ in ENCODED}
