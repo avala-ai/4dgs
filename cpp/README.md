@@ -44,6 +44,22 @@ chunks that instant needs, and `gaussians()` views it. The views point into the 
 are invalidated by the next load, so a caller who wants to keep them copies them. `Scene::open`
 takes any `Readable`, which is where an HTTP range reader or a cache plugs in.
 
+Collecting calls accept `ReadOptions.maxDecodedStateBytes`, a positive aggregate ceiling for peak
+library-owned decoded gaussian state and its decode workspace. It defaults to 536,870,912 bytes (512
+MiB); existing overloads use that default. Configure the scene opener for a streamed read and for
+the hidden whole-population collection performed by `objectsJson()`/`objectStatesJson()`, and pass
+the same option to an indexed `loadAll()` or standalone `keyframeDeltaStatesJson()` call. Exhaustion
+returns `ErrorCode::kResourceLimit`; zero returns `kInvalidArgument` before I/O.
+
+```cpp
+fourdgs::ReadOptions limits;
+limits.maxDecodedStateBytes = 64 * 1024 * 1024;
+auto opened = fourdgs::Scene::openPath("scene.4dgs", limits, fourdgs::ReadMode::kIndexed);
+if (opened) {
+  auto loaded = (*opened)->loadAll(/*maxShBand=*/3, limits);
+}
+```
+
 ## Consuming this package from another project
 
 The CMake manifest is `cpp/CMakeLists.txt`, not a `CMakeLists.txt` at the root of the repository —

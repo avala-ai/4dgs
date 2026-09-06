@@ -13,7 +13,9 @@
 /// and a check placed on only one of them refuses half the files it should. A refused file
 /// prints `{"refused": "<id>"}` and exits 0, exactly as it does streamed.
 
+#include <charconv>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -28,6 +30,7 @@ namespace {
 using fourdgs::Error;
 using fourdgs::ErrorCode;
 using fourdgs::ReadMode;
+using fourdgs::ReadOptions;
 using fourdgs::Result;
 using fourdgs::Scene;
 
@@ -43,9 +46,30 @@ int fail(const std::string& message) {
 /// mistake — is a failure and stays on stderr: there is no rule for the suite to check, and
 /// dressing it up as a refusal would let a broken runner answer every invalid variant.
 int refusedOrFailed(const Error& error) {
+  if (error.code == ErrorCode::kResourceLimit) {
+    std::printf("{\"unsupported\":\"resource-limit\"}\n");
+    return 0;
+  }
   if (!error.refusal.has_value()) return fail(error.toString());
   std::printf("%s\n", fourdgs::conformance::refusalJson(*error.refusal).c_str());
   return 0;
+}
+
+bool parseArguments(int argc, char** argv, std::string* path, ReadOptions* options) {
+  if (argc == 2) {
+    *path = argv[1];
+    return true;
+  }
+  if (argc != 4 || std::strcmp(argv[1], "--max-decoded-state-bytes") != 0) return false;
+
+  std::uint64_t limit = 0;
+  const char* begin = argv[2];
+  const char* end = begin + std::strlen(begin);
+  const std::from_chars_result parsed = std::from_chars(begin, end, limit, 10);
+  if (parsed.ec != std::errc() || parsed.ptr != end || limit == 0) return false;
+  options->maxDecodedStateBytes = limit;
+  *path = argv[3];
+  return true;
 }
 
 Result<std::vector<std::uint8_t>> readWhole(const std::string& path) {
@@ -115,11 +139,12 @@ Result<void> checkChunkCost(const std::string& path, Scene& scene) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::fprintf(stderr, "usage: decode_indexed <file.4dgs>\n");
+  std::string path;
+  ReadOptions options;
+  if (!parseArguments(argc, argv, &path, &options)) {
+    std::fprintf(stderr, "usage: decode_indexed [--max-decoded-state-bytes N] <file.4dgs>\n");
     return 2;
   }
-  const std::string path = argv[1];
 
   // keyframe-delta dispatch, before opening: an opened Scene refuses the model. The indexed
   // read path walks each instant's chain through the index; the JSON is computed in Rust and
@@ -133,7 +158,7 @@ int main(int argc, char** argv) {
   if (!model) return refusedOrFailed(model.error());
   if (*model == "keyframe-delta") {
     Result<std::string> json = fourdgs::keyframeDeltaStatesJson(
-        fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()), /*indexed=*/true);
+        fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()), /*indexed=*/true, options);
     if (!json) return refusedOrFailed(json.error());
     std::printf("%s\n", json->c_str());
     return 0;
@@ -144,7 +169,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<fourdgs::FileReadable> raw(*file);
   fourdgs::CountingReadable source(raw.get());
 
-  Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kIndexed);
+  Result<std::unique_ptr<Scene>> opened = Scene::open(source, options, ReadMode::kIndexed);
   if (!opened) return refusedOrFailed(opened.error());
   Scene& scene = **opened;
 
@@ -156,7 +181,7 @@ int main(int argc, char** argv) {
   //
   // It is also where the last of the named refusals fires: not every rule is checked at open,
   // and a window index past the end of its table is a record read during the load.
-  Result<void> loaded = scene.loadAll(3);
+  Result<void> loaded = scene.loadAll(3, options);
   if (!loaded) return refusedOrFailed(loaded.error());
   fourdgs::conformance::SceneRecords records;
   Result<void> collected = fourdgs::conformance::collectRecords(scene, &records);

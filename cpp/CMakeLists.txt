@@ -553,7 +553,8 @@ endif()
 
 if(FOURDGS_BUILD_TESTS)
   enable_testing()
-  foreach(test test_model test_result test_readable test_seam test_decode test_writer)
+  foreach(test test_model test_result test_readable test_seam test_decode test_decoded_budget
+               test_writer)
     add_executable(${test} tests/${test}.cpp)
     target_link_libraries(${test} PRIVATE fourdgs-cpp)
     target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -565,6 +566,9 @@ if(FOURDGS_BUILD_TESTS)
   # overrides for a corpus somewhere else.
   target_compile_definitions(
     test_decode PRIVATE
+    FOURDGS_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/conformance/data")
+  target_compile_definitions(
+    test_decoded_budget PRIVATE
     FOURDGS_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/conformance/data")
 
   if(FOURDGS_BUILD_TOOL)

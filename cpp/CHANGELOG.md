@@ -8,6 +8,12 @@ All notable changes to the C++ package are documented here, following
 
 ### Changed
 
+- **Collecting readers expose a configurable aggregate decoded-state budget.** `ReadOptions`
+  defaults `maxDecodedStateBytes` to 512 MiB and is accepted by all three scene openers, `loadAll`,
+  and `keyframeDeltaStatesJson`; the existing entry points remain default wrappers. Exhaustion is
+  the distinct `kResourceLimit` result, while zero is a caller argument error before filesystem or
+  range-reader I/O. Both conformance runners accept `--max-decoded-state-bytes` and pass the
+  one-byte streamed/indexed capability gate.
 - **A finite `Quantization.step_time` at or below zero crosses the binding as a named refusal.**
   Both front-to-back and indexed opens return `kMalformed` with `non-positive-step-time`, including
   for either sign of zero, while retaining the Rust core's field and record-byte diagnosis. The CLI

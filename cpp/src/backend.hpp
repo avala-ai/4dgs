@@ -52,9 +52,12 @@ class StateHandle {
 
 /// Open, three ways. The `Readable` overload borrows the source: the caller keeps ownership
 /// and must outlive the handle.
-Result<void> openPath(Handle& handle, const std::string& path, int mode);
-Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes, int mode);
-Result<void> openReadable(Handle& handle, Readable& source, int mode);
+Result<void> openPath(Handle& handle, const std::string& path, int mode,
+                      std::uint64_t maxDecodedStateBytes);
+Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes, int mode,
+                        std::uint64_t maxDecodedStateBytes);
+Result<void> openReadable(Handle& handle, Readable& source, int mode,
+                          std::uint64_t maxDecodedStateBytes);
 
 /// Certify one concrete keyframe-delta read path without taking ownership of `source`.
 /// Lifetime identity introductions and their state-record offsets are forwarded to `introduce`,
@@ -98,7 +101,7 @@ std::uint64_t audioSize(const Handle& handle);
 Result<void> readAudio(Handle& handle, std::uint64_t offset, Span<std::uint8_t> into);
 
 /// Fill the working set, and view what is in it. The view is invalidated by the next load.
-Result<void> loadAll(Handle& handle, int maxShBand);
+Result<void> loadAll(Handle& handle, int maxShBand, std::uint64_t maxDecodedStateBytes);
 Result<void> loadAt(Handle& handle, double t, int maxShBand);
 GaussianView loadedGaussians(const Handle& handle);
 
@@ -138,7 +141,8 @@ Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
 /// opening; `keyframeDeltaStatesJson` decodes and returns the canonical states summary the
 /// core computes.
 Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes);
-Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed);
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                            std::uint64_t maxDecodedStateBytes);
 
 /// Canonical provenance JSON for an opened scene (spec §5.15). Empty when the file carries
 /// none — the binding should omit the key rather than emit null.

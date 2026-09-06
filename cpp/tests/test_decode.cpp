@@ -184,6 +184,8 @@ bool isDocumented(const fourdgs::Error& error) {
     case fourdgs::ErrorCode::kUnsupported:
     case fourdgs::ErrorCode::kChecksumMismatch:
     case fourdgs::ErrorCode::kInternal:
+    case fourdgs::ErrorCode::kUnsupportedMode:
+    case fourdgs::ErrorCode::kResourceLimit:
       return !error.message.empty();
     case fourdgs::ErrorCode::kOk:
     case fourdgs::ErrorCode::kNotImplemented:

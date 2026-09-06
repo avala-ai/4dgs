@@ -34,6 +34,8 @@ const char* toString(ErrorCode code) noexcept {
       return "kInternal";
     case ErrorCode::kUnsupportedMode:
       return "kUnsupportedMode";
+    case ErrorCode::kResourceLimit:
+      return "kResourceLimit";
   }
   return "kInternal";
 }
