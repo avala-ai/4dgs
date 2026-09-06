@@ -24,6 +24,7 @@ export { BytesReadable, type IReadable } from "./readable.js";
 export {
   FourdgsError,
   ExceedsReaderLimit,
+  lateFrontMatterRecord,
   MalformedFile,
   Refusal,
   TruncatedFile,
@@ -47,9 +48,11 @@ export {
   PROVENANCE_END,
   PROVENANCE_START,
   REQUIRED_ATTRIBUTES,
+  isFrontMatterOpcode,
   isPrivateOpcode,
   isObjectOpcode,
   isProvenanceOpcode,
+  isStateOpcode,
   opcodeName,
 } from "./opcodes.js";
 

@@ -350,6 +350,29 @@ function indexlessFile(records: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
+/** Add front matter immediately before state and discard the now-stale summary index. */
+function indexlessWithFrontMatter(data: Uint8Array, additions: readonly Uint8Array[]): Uint8Array {
+  const kept: Uint8Array[] = [];
+  let inserted = false;
+  for (const entry of iterateRecords(data, MAGIC.length)) {
+    if (
+      entry.opcode === Opcode.ChunkIndex ||
+      entry.opcode === Opcode.Statistics ||
+      entry.opcode === Opcode.SummaryOffset ||
+      entry.opcode === Opcode.Footer
+    ) {
+      continue;
+    }
+    if (!inserted && (entry.opcode === Opcode.Chunk || entry.opcode === Opcode.DeltaChunk)) {
+      kept.push(...additions);
+      inserted = true;
+    }
+    kept.push(entry.raw.slice());
+  }
+  assert.equal(inserted, true, "fixture has a state record");
+  return indexlessFile(kept);
+}
+
 /**
  * `4dgs validate <file>` in its own process: the lines it printed and the code it exited
  * with, which are the two things the next person to break one of these will see.
@@ -841,7 +864,7 @@ test("regression: an SH band immediately after a Delta Chunk belongs to that sta
   );
 });
 
-test("regression: --decode revisits Chunks that precede Quantization", async (t) => {
+test("regression: a late Quantization refusal precedes the decode pass", async (t) => {
   const variant = "invalid/UnknownStreamCodec";
   if (corpus(variant) === null) return t.skip("corpus not generated");
   const original = bytesOf(variant);
@@ -866,11 +889,13 @@ test("regression: --decode revisits Chunks that precede Quantization", async (t)
   );
 
   const report = await validateFile(late, { decode: true });
-  assert.equal(report.refused?.code, "unknown-stream-codec");
-  assert.equal(report.refused?.at, shiftedChunkOffset);
+  assert.equal(report.refused?.code, "late-front-matter-record");
+  assert.equal(report.refused?.at, shiftedChunkOffset + firstChunk.length);
+  assert.match(report.refused!.message, /Quantization record \(opcode 0x03\)/);
+  assert.match(report.refused!.message, /first state record, Chunk \(opcode 0x05\)/);
 });
 
-test("regression: --decode waits for a Window Table that follows the Chunks", async (t) => {
+test("regression: --decode refuses a Window Table that follows the Chunks", async (t) => {
   const variant = "TenWindows-UseChunkIndex-UseCrc";
   if (corpus(variant) === null) return t.skip("corpus not generated");
   const original = bytesOf(variant);
@@ -887,8 +912,8 @@ test("regression: --decode waits for a Window Table that follows the Chunks", as
     )
     .map((record) => record.raw.slice());
   const report = await validateFile(indexlessFile([...body, window]), { decode: true });
-  assert.equal(report.refused, null);
-  assert.equal(report.ok, true, report.findings.map((finding) => finding.message).join("\n"));
+  assert.equal(report.refused?.code, "late-front-matter-record");
+  assert.match(report.refused!.message, /WindowTable record \(opcode 0x04\)/);
 });
 
 test("regression: an oversized compression name is a validator resource limit", async (t) => {
@@ -1108,11 +1133,7 @@ test("regression: the object layer's cross-record rules are checked, not stepped
   const data = bytesOf("LongLived-UseChunkIndex-UseCrc-WithObjects");
   const track = recordsOf(data).find((record) => record.opcode === Opcode.ObjectTrack)!;
   const copy = data.subarray(track.offset, track.offset + track.length);
-  const summary = parseFooter(
-    data.subarray(data.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
-  ).summaryStart;
-  // After the chunks, so every index entry still frames what it framed before.
-  const doubled = resealSummary(splice(data, summary, copy), copy.length);
+  const doubled = indexlessWithFrontMatter(data, [copy]);
 
   const report = validated(file("TwoTracks.4dgs", doubled));
   assert.equal(report.code, EXIT_FAILED);
@@ -1127,20 +1148,19 @@ test("regression: zero-sample Object Tracks are absent during cross-record check
     return t.skip("corpus not generated");
   }
   const data = bytesOf("LongLived-UseChunkIndex-UseCrc-WithObjects");
-  const summary = parseFooter(
-    data.subarray(data.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
-  ).summaryStart;
   const content = new Uint8Array(9);
   const view = new DataView(content.buffer);
   view.setUint32(0, 7, true);
   content[4] = 0;
   view.setUint32(5, 0, true);
   const empty = framedRecord(Opcode.ObjectTrack, content);
-  const withTwoEmpty = splice(splice(data, summary, empty), summary + empty.length, empty);
-  const report = validated(
-    file("TwoAbsentTracks.4dgs", resealSummary(withTwoEmpty, 2 * empty.length)),
+  const withTwoEmpty = indexlessWithFrontMatter(data, [empty, empty]);
+  const report = validated(file("TwoAbsentTracks.4dgs", withTwoEmpty));
+  assert.equal(report.code, EXIT_WARNINGS, report.out.join("\n"));
+  assert.ok(
+    report.out.every((line) => !line.includes("two ObjectTrack records move object")),
+    report.out.join("\n"),
   );
-  assert.equal(report.code, EXIT_OK, report.out.join("\n"));
 });
 
 test("regression: zero-sample Rig Trajectories are absent during duplicate checks", (t) => {
@@ -1148,9 +1168,6 @@ test("regression: zero-sample Rig Trajectories are absent during duplicate check
     return t.skip("corpus not generated");
   }
   const data = bytesOf("LongLived-UseChunkIndex-UseCrc-WithObjects");
-  const summary = parseFooter(
-    data.subarray(data.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
-  ).summaryStart;
   const content = new Uint8Array(10);
   const view = new DataView(content.buffer);
   view.setUint32(0, 1, true);
@@ -1158,10 +1175,8 @@ test("regression: zero-sample Rig Trajectories are absent during duplicate check
   content[5] = 0;
   view.setUint32(6, 0, true);
   const empty = framedRecord(Opcode.RigTrajectory, content);
-  const withTwoEmpty = splice(splice(data, summary, empty), summary + empty.length, empty);
-  const report = validated(
-    file("TwoAbsentTrajectories.4dgs", resealSummary(withTwoEmpty, 2 * empty.length)),
-  );
+  const withTwoEmpty = indexlessWithFrontMatter(data, [empty, empty]);
+  const report = validated(file("TwoAbsentTrajectories.4dgs", withTwoEmpty));
   assert.equal(report.code, EXIT_WARNINGS, report.out.join("\n"));
   assert.ok(
     report.out.filter((line) => line.includes("carries no samples; it is read as though absent"))
@@ -1215,7 +1230,7 @@ test("regression: decoded SH degree must equal the Header declaration", (t) => {
   );
 });
 
-test("regression: decoded validation reports late malformed windows and every early Footer", (t) => {
+test("regression: late Window placement wins over body parsing and every early Footer", (t) => {
   const path = corpus("TenWindows-UseChunkIndex-UseCrc");
   if (path === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
   const original = bytesOf("TenWindows-UseChunkIndex-UseCrc");
@@ -1231,7 +1246,11 @@ test("regression: decoded validation reports late malformed windows and every ea
   );
   assert.equal(windowReport.code, EXIT_FAILED);
   assert.ok(
-    windowReport.out.some((line) => line.includes("Window Table does not parse")),
+    windowReport.out.some(
+      (line) =>
+        line.includes("WindowTable record (opcode 0x04)") &&
+        line.includes("appears after the first state record"),
+    ),
     windowReport.out.join("\n"),
   );
 
@@ -1256,22 +1275,19 @@ test("regression: decoded validation rejects unordered and NaN Window Table rows
   const variant = "TenWindows-UseChunkIndex-UseCrc";
   if (corpus(variant) === null) return t.skip("corpus not generated");
   const original = bytesOf(variant);
-  const summary = parseFooter(
-    original.subarray(original.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
-  ).summaryStart;
+  const window = [...iterateRecords(original, MAGIC.length)].find(
+    (entry) => entry.opcode === Opcode.WindowTable,
+  )!;
 
   for (const [name, lo, hi] of [
     ["Unordered", 2, 1],
     ["NanLower", Number.NaN, 1],
     ["NanUpper", 0, Number.NaN],
   ] as const) {
-    const content = new Uint8Array(20);
-    const view = new DataView(content.buffer);
-    view.setUint32(0, 1, true);
-    view.setFloat64(4, lo, true);
-    view.setFloat64(12, hi, true);
-    const record = framedRecord(Opcode.WindowTable, content);
-    const changed = resealSummary(splice(original, summary, record), record.length);
+    const changed = original.slice();
+    const view = new DataView(changed.buffer, changed.byteOffset, changed.byteLength);
+    view.setFloat64(window.offset + RECORD_HEADER_BYTES + 4, lo, true);
+    view.setFloat64(window.offset + RECORD_HEADER_BYTES + 12, hi, true);
     const report = await validateFile(changed, { decode: true });
     assert.ok(
       report.findings.some(
@@ -1585,20 +1601,15 @@ test("regression: physical indexes, SH registries and provenance semantics are v
   // Empty name, right-handed, +Y up, +Z forward, registry unit 1 (metres), but a
   // contradictory numerical declaration of two metres per unit.
   const wrongUnit = bytesOf(indexedVariant);
-  const wrongUnitRecords = recordsOf(wrongUnit);
-  const summary = parseFooter(
-    wrongUnit.subarray(wrongUnit.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
-  ).summaryStart;
   const frame = new Uint8Array(16);
   const frameView = new DataView(frame.buffer);
   frameView.setUint32(0, 0, true);
   frame.set([1, 1, 2, 1], 4);
   frameView.setFloat64(8, 2, true);
-  assert.ok(wrongUnitRecords.some((record) => record.offset === summary));
-  const withWrongUnit = splice(wrongUnit, summary, framedRecord(Opcode.CoordinateFrame, frame));
-  const wrongUnitReport = validated(
-    file("ConflictingFrameUnits.4dgs", resealSummary(withWrongUnit, RECORD_HEADER_BYTES + 16)),
-  );
+  const withWrongUnit = indexlessWithFrontMatter(wrongUnit, [
+    framedRecord(Opcode.CoordinateFrame, frame),
+  ]);
+  const wrongUnitReport = validated(file("ConflictingFrameUnits.4dgs", withWrongUnit));
   assert.equal(wrongUnitReport.code, EXIT_FAILED);
   assert.ok(
     wrongUnitReport.out.some((line) => line.includes("a writer must make them agree")),
@@ -1713,8 +1724,11 @@ test("regression: illegal top-level structures and malformed known records are r
     ["ReservedZeroOpcode", framedRecord(0, new Uint8Array(0)), "not a legal top-level record"],
     ["MalformedCamera", framedRecord(Opcode.Camera, new Uint8Array(0)), "Camera record at byte"],
   ] as const) {
-    const changed = splice(original.slice(), summary, record);
-    const verdict = validated(file(`${name}.4dgs`, resealSummary(changed, record.length)));
+    const changed =
+      name === "MalformedCamera"
+        ? indexlessWithFrontMatter(original, [record])
+        : resealSummary(splice(original.slice(), summary, record), record.length);
+    const verdict = validated(file(`${name}.4dgs`, changed));
     assert.equal(verdict.code, EXIT_FAILED);
     assert.ok(
       verdict.out.some((line) => line.includes(expected)),
@@ -1749,7 +1763,7 @@ test("regression: illegal top-level structures and malformed known records are r
   );
 });
 
-test("regression: indexed opening discovers legal legacy Audio after a Chunk", async (t) => {
+test("regression: indexed open stops before late legacy Audio and access refuses it", async (t) => {
   const path = corpus("TenWindows-UseChunkIndex-UseCrc");
   if (path === null) return t.skip("corpus not generated");
   const original = bytesOf("TenWindows-UseChunkIndex-UseCrc");
@@ -1809,39 +1823,32 @@ test("regression: indexed opening discovers legal legacy Audio after a Chunk", a
     at += record.length;
   }
 
-  const report = await validateFile(indexless);
-  assert.equal(report.ok, true, report.findings.map((finding) => finding.message).join("\n"));
-  assert.ok(
-    report.findings.every((finding) => !finding.message.includes("a seeking reader cannot open")),
-  );
-
   const lateAudio = [...iterateRecords(indexless, MAGIC.length)].find(
     (record) => record.opcode === Opcode.Audio,
   )!;
+  const report = await validateFile(indexless);
+  assert.equal(report.ok, false);
+  assert.equal(report.refused?.code, "late-front-matter-record");
+  assert.equal(report.refused?.at, lateAudio.offset);
+
+  const indexlessFirstChunk = [...iterateRecords(indexless, MAGIC.length)].find(
+    (entry) => entry.opcode === Opcode.Chunk,
+  )!;
   const duplicateAudio = splice(
     indexless,
-    lateAudio.offset + lateAudio.raw.length,
+    indexlessFirstChunk.offset,
     framedRecord(Opcode.Audio, audio),
   );
   const duplicateReport = await validateFile(duplicateAudio);
-  assert.ok(
-    duplicateReport.findings.some(
-      (finding) =>
-        finding.message.includes("legacy Audio record 2") &&
-        finding.message.includes(`byte ${lateAudio.offset + lateAudio.raw.length}`),
-    ),
-    duplicateReport.findings.map((finding) => finding.message).join("\n"),
-  );
+  assert.equal(duplicateReport.refused?.code, "late-front-matter-record");
+  assert.equal(duplicateReport.refused?.at, lateAudio.offset + RECORD_HEADER_BYTES + audio.length);
 
   const metadata = framedRecord(Opcode.Metadata, new Uint8Array(8));
   const lateMetadata = new Uint8Array(metadata.length * 3);
   lateMetadata.set(metadata, 0);
   lateMetadata.set(metadata, metadata.length);
   lateMetadata.set(metadata, metadata.length * 2);
-  const footerAt = [...iterateRecords(indexless, MAGIC.length)].find(
-    (record) => record.opcode === Opcode.Footer,
-  )!.offset;
-  const rangeFlood = splice(indexless, footerAt, lateMetadata);
+  const rangeFlood = splice(indexless, indexlessFirstChunk.offset, lateMetadata);
   const bounded = await IndexedDecoder.open(new BytesReadable(rangeFlood), {
     headProbeBytes: 64,
     maxDeferredRecords: 2,
@@ -1866,7 +1873,13 @@ test("regression: indexed opening discovers legal legacy Audio after a Chunk", a
     reads.every((read) => read.offset !== lateAudio.offset),
     "opening range-read the late Audio record before an audio accessor asked for it",
   );
-  assert.equal((await opened.readAudio())?.codec, "wav");
+  await assert.rejects(
+    () => opened.readAudio(),
+    (error: unknown) =>
+      error instanceof FourdgsError &&
+      error.refusalCode === "late-front-matter-record" &&
+      error.message.includes(`Audio record (opcode 0x09) at byte ${lateAudio.offset}`),
+  );
   assert.ok(
     reads.some((read) => read.offset === lateAudio.offset),
     "the audio accessor did not discover the late Audio record",
@@ -1896,7 +1909,12 @@ test("regression: deferred indexed discovery rejects modern audio after state", 
   const opened = await IndexedDecoder.open(new BytesReadable(late), { headProbeBytes: 64 });
   await assert.rejects(
     () => opened.readAudioSources(),
-    /Audio Source id \d+ appears after the first Chunk/,
+    (error: unknown) =>
+      error instanceof FourdgsError &&
+      error.refusalCode === "late-front-matter-record" &&
+      /AudioSource record \(opcode 0x11\).*first state record, Chunk \(opcode 0x05\)/.test(
+        error.message,
+      ),
   );
 });
 

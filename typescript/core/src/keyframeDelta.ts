@@ -42,9 +42,16 @@ import {
 } from "./chunk.js";
 import { Crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
-import { MalformedFile, TruncatedFile } from "./errors.js";
+import { lateFrontMatterRecord, MalformedFile, TruncatedFile } from "./errors.js";
 import { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";
-import { ATTRIBUTE_CHANNELS, Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
+import {
+  ATTRIBUTE_CHANNELS,
+  Attribute,
+  GAUSSIAN_FLAG_NEVER_FADES,
+  isFrontMatterOpcode,
+  isStateOpcode,
+  Opcode,
+} from "./opcodes.js";
 import { checkQuantizationScheme } from "./registry.js";
 import {
   clamp,
@@ -84,7 +91,6 @@ import {
   readRecord,
 } from "./records.js";
 import { BytesReadable, type IReadable } from "./readable.js";
-import { Opcode } from "./opcodes.js";
 import { coefficientsInBand, mergeBands, type ShCoefficients } from "./sh.js";
 import { decodeStream, frameOneStream, frameStreams, type RawStream } from "./streams.js";
 
@@ -1239,6 +1245,7 @@ export async function decodeKeyframeDeltaStreamed(
   let currentChunk: KeyframeDeltaChunkInfo | null = null;
   let currentBands = new Set<number>();
   let sawFooter = false;
+  let firstState: { readonly opcode: number; readonly offset: number } | null = null;
 
   const finishCurrentBands = (): void => {
     if (currentChunk === null || header === null) return;
@@ -1263,6 +1270,17 @@ export async function decodeKeyframeDeltaStreamed(
     }
     if (next.done) break;
     const record = next.value;
+    if (firstState !== null && isFrontMatterOpcode(record.opcode)) {
+      throw lateFrontMatterRecord(
+        record.opcode,
+        record.offset,
+        firstState.opcode,
+        firstState.offset,
+      );
+    }
+    if (firstState === null && isStateOpcode(record.opcode)) {
+      firstState = { opcode: record.opcode, offset: record.offset };
+    }
     if (
       currentChunk !== null &&
       record.opcode !== Opcode.Chunk &&
@@ -1467,6 +1485,7 @@ export async function validateKeyframeDeltaStreamed(
   }
   let gopKeyframe: RetainedState | null = null;
   let previousState: RetainedState | null = null;
+  let firstState: { readonly opcode: number; readonly offset: number } | null = null;
 
   const remember = (state: KeyframeDeltaState, interval: Interval, offset: number): void => {
     for (const id of state.ids) {
@@ -1517,6 +1536,17 @@ export async function validateKeyframeDeltaStreamed(
 
   for await (const record of scanner.records(MAGIC.length)) {
     try {
+      if (firstState !== null && isFrontMatterOpcode(record.opcode)) {
+        throw lateFrontMatterRecord(
+          record.opcode,
+          record.offset,
+          firstState.opcode,
+          firstState.offset,
+        );
+      }
+      if (firstState === null && isStateOpcode(record.opcode)) {
+        firstState = { opcode: record.opcode, offset: record.offset };
+      }
       if (record.opcode === Opcode.Header) {
         header = parseHeader(await scanner.content(record));
         if (header.temporalModel !== "keyframe-delta") {

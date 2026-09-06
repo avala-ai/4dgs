@@ -36,6 +36,12 @@ The four packages version together.
 
 ### Changed
 
+- **Streamed readers refuse defined front matter after state by name.** Once a Chunk or Delta Chunk
+  has appeared, a later Header, Quantization, Window Table, audio, camera, metadata, attachment,
+  provenance, or object record returns `late-front-matter-record`. The diagnosis names the late
+  opcode byte and first state opcode byte, and placement is checked before duplicate or body
+  semantics. Validators apply the same full-file rule; indexed open retains its bounded stop at the
+  first state record. Unknown and private records remain position-independent.
 - **Readers refuse a finite `Quantization.step_time` at or below zero by name.** Both front-to-back
   and indexed opens return `non-positive-step-time`, including for either sign of zero, and the Node
   validator preserves the identifier and the Quantization record byte. A zero pitch makes birth-time
