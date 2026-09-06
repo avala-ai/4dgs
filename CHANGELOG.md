@@ -9,7 +9,7 @@ the release log.
 | Python — `fourdgs`                                                         | [python/CHANGELOG.md](python/CHANGELOG.md)                       | [PyPI](https://pypi.org/project/fourdgs/)             |
 | TypeScript — `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | [typescript/CHANGELOG.md](typescript/CHANGELOG.md)               | [npm](https://www.npmjs.com/package/@4dgs/core)       |
 | Rust — `fourdgs`                                                           | [rust/CHANGELOG.md](rust/CHANGELOG.md)                           | [crates.io](https://crates.io/crates/fourdgs)         |
-| Dart — `fourdgs`                                                           | [dart/fourdgs/CHANGELOG.md](dart/fourdgs/CHANGELOG.md)           | not yet published                                     |
+| Dart — `fourdgs`                                                           | [dart/fourdgs/CHANGELOG.md](dart/fourdgs/CHANGELOG.md)           | [pub.dev](https://pub.dev/packages/fourdgs)           |
 | Swift — `FourDGS`                                                          | [swift/CHANGELOG.md](swift/CHANGELOG.md)                         | no registry; resolved from this repository's URL      |
 | Conformance corpus                                                         | [tests/conformance/CHANGELOG.md](tests/conformance/CHANGELOG.md) | [releases](https://github.com/avala-ai/4dgs/releases) |
 
@@ -40,6 +40,10 @@ hand-kept index of the same thing, so that the log is readable without leaving t
 | 2026-08-13 | Rust `fourdgs`   | 0.5.0   | [releases/rust/v0.5.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.5.0)     |
 | 2026-08-15 | Python `fourdgs` | 0.6.0   | [releases/python/v0.6.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fpython%2Fv0.6.0) |
 | 2026-08-15 | Rust `fourdgs`   | 0.7.0   | [releases/rust/v0.7.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.7.0)     |
+| 2026-08-20 | Dart `fourdgs`   | 0.2.0   | [releases/dart/v0.2.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fdart%2Fv0.2.0)     |
+| 2026-09-05 | Rust `fourdgs`   | 0.7.1   | [releases/rust/v0.7.1](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.7.1)     |
+| 2026-09-05 | Swift `FourDGS`  | 0.3.0   | [v0.3.0](https://github.com/avala-ai/4dgs/releases/tag/v0.3.0)                                     |
+| 2026-09-05 | Corpus           | 0.1.0   | [releases/corpus/v0.1.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fcorpus%2Fv0.1.0) |
 
 `fourdgs 0.0.1` on PyPI, `fourdgs 0.0.1` on crates.io and `@4dgs/core`, `@4dgs/browser`,
 `@4dgs/nodejs` and `@4dgs/codecs` at `0.0.1` on npm are name reservations, published by hand before
@@ -52,13 +56,10 @@ reservation has been published: the release job's OIDC exchange has no trusted p
 with on npm. The tag will be pushed when it can publish, which is the only thing that puts a line
 here.
 
-Dart is at 0.1.0 and has the same shape of wait for a different reason: pub.dev will not accept an
-automated publish for a package that does not exist, so `fourdgs` has to be claimed once by hand
-before its tag can mean anything. The release workflow's `dart` job is disabled deliberately and
-says so, with the two manual steps written where whoever does them will be standing.
+Dart 0.2.0 is public on pub.dev, and tag-driven automated publishing is enabled now that the package
+has completed its required first manual publication.
 
-Swift 0.2.0 has a version constant and a changelog section on `main` and no tag yet. When it is cut
-it will be **`v0.2.0`, with no package name in it**, because SwiftPM reads versions only from plain
+Swift 0.3.0 is published from the bare `v0.3.0` tag because SwiftPM reads versions only from plain
 SemVer tags and there is no registry between it and this repository. That bare tag is the Swift
 package's version and not this repository's — the reasoning, and the rule that nothing else may ever
 use that tag shape, are in [RELEASING.md](RELEASING.md#swift-tags-look-repository-wide-and-are-not).
