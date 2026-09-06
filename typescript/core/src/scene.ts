@@ -343,7 +343,10 @@ export async function decodeScene(
           };
           const parsed = parseChunk(content);
           const streamBytes = await chunkStreamBytes(parsed, codecs);
-          const decoded = await decodeChunkStreams(streamBytes, parsed.header.count, chunkOptions);
+          const decoded = await decodeChunkStreams(streamBytes, parsed.header.count, {
+            ...chunkOptions,
+            recordOffset: record.offset,
+          });
           chunks.push(decoded);
           decodedChunkRows.set(record.offset, decoded.count);
           chunkBands.push(new Map());

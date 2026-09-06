@@ -52,6 +52,8 @@ import {
   lifeClass,
   motionStep,
   muStep,
+  reconstructLinear,
+  requireDecodedF32,
   rctInverse,
   supportK,
 } from "./quantization.js";
@@ -235,6 +237,235 @@ function keyframeState(ids: Int32Array, bins: Map<number, Column>): KeyframeDelt
   return new KeyframeDeltaState(ids, bins);
 }
 
+interface DecodedStateGrids {
+  readonly quantization: Quantization;
+  readonly windows: Float64Array;
+  readonly supportK: number;
+}
+
+interface StateRecordOrigin {
+  readonly recordName: "Chunk" | "Delta Chunk";
+  readonly recordOffset: number;
+  readonly operation: "keyframe" | "update" | "birth";
+}
+
+const FLOATING_STATE_ATTRIBUTES: ReadonlySet<number> = new Set([
+  Attribute.Position,
+  Attribute.Scale,
+  Attribute.RotationIndex,
+  Attribute.Rotation,
+  Attribute.Color,
+  Attribute.Opacity,
+  Attribute.Motion,
+  Attribute.MuT,
+  Attribute.SigmaT,
+]);
+
+/** Validate the absolute rows first produced by one physical state record. */
+function validateDecodedStateRows(
+  state: KeyframeDeltaState,
+  sourceIds: Int32Array,
+  destinationRows: readonly number[] | number,
+  attributes: ReadonlySet<number> | null,
+  grids: DecodedStateGrids,
+  origin: StateRecordOrigin,
+): void {
+  const columns = binsOf(state);
+  const steps = stepsFrom(grids.quantization);
+  const posOrigin = grids.quantization.posOrigin;
+  const windows = windowTableOrDefault(grids.windows);
+  const windowCount = windows.length >>> 1;
+  const components = ["x", "y", "z"] as const;
+  const wanted = (attribute: number): boolean => attributes === null || attributes.has(attribute);
+
+  for (let operationRow = 0; operationRow < sourceIds.length; operationRow++) {
+    const id = sourceIds[operationRow]!;
+    const stateRow =
+      typeof destinationRows === "number"
+        ? destinationRows + operationRow
+        : destinationRows[operationRow];
+    if (stateRow === undefined || state.ids[stateRow] !== id) {
+      throw new MalformedFile(
+        `${origin.recordName} opcode at byte ${origin.recordOffset}, ${origin.operation} row ` +
+          `${operationRow}, gaussian_id ${id} is absent from its composed state`,
+      );
+    }
+    const i3 = stateRow * 3;
+    const binKind = (attribute: number): "stored" | "composed" =>
+      origin.operation === "update" && !ABSOLUTE_IN_UPDATE.has(attribute) ? "composed" : "stored";
+    const lane = (
+      value: number,
+      attribute: string,
+      component: string,
+      bins: string,
+      step: number,
+      valueOrigin?: number,
+    ): void => {
+      requireDecodedF32(
+        value,
+        `${origin.recordName} opcode at byte ${origin.recordOffset}, ${origin.operation} row ` +
+          `${operationRow}, gaussian_id ${id}, ${attribute} component ${component}, ${bins}, ` +
+          `effective step ${step}${valueOrigin === undefined ? "" : `, origin ${valueOrigin}`}`,
+      );
+    };
+
+    const position = columns.get(Attribute.Position);
+    if (wanted(Attribute.Position) && position !== undefined) {
+      for (let c = 0; c < 3; c++) {
+        const bin = position.values[i3 + c]!;
+        lane(
+          reconstructLinear(bin, steps.pos, posOrigin[c]!),
+          "position",
+          components[c]!,
+          `${binKind(Attribute.Position)} bin ${bin}`,
+          steps.pos,
+          posOrigin[c]!,
+        );
+      }
+    }
+
+    const scale = columns.get(Attribute.Scale);
+    if (wanted(Attribute.Scale) && scale !== undefined) {
+      for (let c = 0; c < 3; c++) {
+        const bin = scale.values[i3 + c]!;
+        lane(
+          Math.exp(bin * steps.scaleLog),
+          "scale",
+          components[c]!,
+          `${binKind(Attribute.Scale)} bin ${bin}`,
+          steps.scaleLog,
+        );
+      }
+    }
+
+    const rotationIndex = columns.get(Attribute.RotationIndex);
+    const rotationBins = columns.get(Attribute.Rotation);
+    if (
+      (wanted(Attribute.RotationIndex) || wanted(Attribute.Rotation)) &&
+      rotationIndex !== undefined &&
+      rotationBins !== undefined
+    ) {
+      const reconstructed = new Float64Array(4);
+      dequantizeRotation(
+        rotationIndex.values[stateRow]!,
+        rotationBins.values[i3]!,
+        rotationBins.values[i3 + 1]!,
+        rotationBins.values[i3 + 2]!,
+        steps.rot,
+        reconstructed,
+        0,
+      );
+      for (let c = 0; c < 4; c++) {
+        lane(
+          reconstructed[c]!,
+          "rotation",
+          "xyzw"[c]!,
+          `${binKind(Attribute.Rotation)} bins (${rotationBins.values[i3]!}, ` +
+            `${rotationBins.values[i3 + 1]!}, ${rotationBins.values[i3 + 2]!}) and ` +
+            `rotation_index ${rotationIndex.values[stateRow]!}`,
+          steps.rot,
+        );
+      }
+    }
+
+    const color = columns.get(Attribute.Color);
+    if (wanted(Attribute.Color) && color !== undefined) {
+      const transformed = rctInverse(
+        color.values[i3]!,
+        color.values[i3 + 1]!,
+        color.values[i3 + 2]!,
+      );
+      for (let c = 0; c < 3; c++) {
+        lane(
+          clamp(reconstructLinear(transformed[c]!, steps.rgb), 0, 1),
+          "color",
+          "rgb"[c]!,
+          `${binKind(Attribute.Color)} RCT bins (${color.values[i3]!}, ` +
+            `${color.values[i3 + 1]!}, ${color.values[i3 + 2]!})`,
+          steps.rgb,
+        );
+      }
+    }
+
+    const opacity = columns.get(Attribute.Opacity);
+    if (wanted(Attribute.Opacity) && opacity !== undefined) {
+      const bin = opacity.values[stateRow]!;
+      lane(
+        clamp(reconstructLinear(bin, steps.alpha), 0, 1),
+        "color",
+        "opacity",
+        `${binKind(Attribute.Opacity)} bin ${bin}`,
+        steps.alpha,
+      );
+    }
+
+    const sigmaColumn = columns.get(Attribute.SigmaT);
+    const flags = columns.get(Attribute.Flags);
+    const sigmaBin = sigmaColumn?.values[stateRow];
+    const neverFades = ((flags?.values[stateRow] ?? 0) & GAUSSIAN_FLAG_NEVER_FADES) !== 0;
+    if (wanted(Attribute.SigmaT) && sigmaBin !== undefined && !neverFades) {
+      lane(
+        Math.exp(sigmaBin * steps.sigmaLog),
+        "sigma_t",
+        "scalar",
+        `${binKind(Attribute.SigmaT)} bin ${sigmaBin}`,
+        steps.sigmaLog,
+      );
+    }
+
+    const windowColumn = columns.get(Attribute.WindowIndex);
+    const windowBin = windowColumn?.values[stateRow];
+    const motion = columns.get(Attribute.Motion);
+    if (
+      wanted(Attribute.Motion) &&
+      motion !== undefined &&
+      sigmaBin !== undefined &&
+      windowBin !== undefined
+    ) {
+      const rowBins = [motion.values[i3]!, motion.values[i3 + 1]!, motion.values[i3 + 2]!];
+      // A zero motion bin reconstructs to zero for every effective pitch. Preserve the
+      // existing lazy window-index diagnosis for that case; no window lookup participates
+      // in proving the binary32 result.
+      if (!rowBins.every((bin) => bin === 0)) {
+        const windowIndex = checkWindowIndex(
+          windowBin,
+          windowCount,
+          `${origin.recordName} opcode at byte ${origin.recordOffset}, ${origin.operation} row ` +
+            `${operationRow}, gaussian_id ${id}`,
+        );
+        const windowLength = windows[windowIndex * 2 + 1]! - windows[windowIndex * 2]!;
+        const step = motionStep(
+          lifeClass(sigmaBin, steps.sigmaLog, neverFades, windowLength, grids.supportK),
+          steps.motion,
+        );
+        for (let c = 0; c < 3; c++) {
+          const bin = rowBins[c]!;
+          lane(
+            reconstructLinear(bin, step),
+            "motion",
+            components[c]!,
+            `${binKind(Attribute.Motion)} bin ${bin}`,
+            step,
+          );
+        }
+      }
+    }
+
+    const mu = columns.get(Attribute.MuT);
+    if (wanted(Attribute.MuT) && mu !== undefined && sigmaBin !== undefined) {
+      const bin = mu.values[stateRow]!;
+      const step = muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
+      lane(
+        reconstructLinear(bin, step),
+        "mu_t",
+        "scalar",
+        `${binKind(Attribute.MuT)} bin ${bin}`,
+        step,
+      );
+    }
+  }
+}
+
 /**
  * An attribute's interleaving width, against the one the registry gives it.
  *
@@ -271,7 +502,7 @@ function applyDelta(
   birthIds: Int32Array,
   birthBins: Map<number, Column>,
   deathIds: Int32Array,
-): KeyframeDeltaState {
+): readonly [KeyframeDeltaState, readonly number[], number] {
   checkGroupsDisjoint(updateIds, birthIds, deathIds);
   checkUnique(updateIds, "an update group");
   checkUnique(birthIds, "a birth group");
@@ -338,10 +569,10 @@ function applyDelta(
   }
 
   // --- updates ----------------------------------------------------------
+  const updateRows: number[] = [];
   if (updateIds.length > 0) {
     const rowOf = new Map<number, number>();
     for (let i = 0; i < ids.length; i++) rowOf.set(ids[i]!, i);
-    const rows: number[] = [];
     for (const id of updateIds) {
       const row = rowOf.get(id);
       if (row === undefined) {
@@ -349,7 +580,7 @@ function applyDelta(
           `a delta updates gaussian id ${id}, which is not live at its reference`,
         );
       }
-      rows.push(row);
+      updateRows.push(row);
     }
     for (const [attribute, delta] of updateBins) {
       if (columnRows(delta) !== updateIds.length) {
@@ -367,8 +598,8 @@ function applyDelta(
       }
       const ch = target.channels;
       const absolute = ABSOLUTE_IN_UPDATE.has(attribute);
-      for (let r = 0; r < rows.length; r++) {
-        const dst = rows[r]! * ch;
+      for (let r = 0; r < updateRows.length; r++) {
+        const dst = updateRows[r]! * ch;
         const src = r * ch;
         for (let c = 0; c < ch; c++) {
           if (absolute) {
@@ -389,6 +620,7 @@ function applyDelta(
   }
 
   // --- births -----------------------------------------------------------
+  const birthRowStart = ids.length;
   if (birthIds.length > 0) {
     const live = new Set<number>(ids);
     for (const id of birthIds) {
@@ -451,7 +683,7 @@ function applyDelta(
     bins = grown;
   }
 
-  return new KeyframeDeltaState(ids, bins, bands);
+  return [new KeyframeDeltaState(ids, bins, bands), updateRows, birthRowStart];
 }
 
 function gatherIds(ids: Int32Array, rows: readonly number[]): Int32Array {
@@ -803,6 +1035,8 @@ async function composeDelta(
   reference: KeyframeDeltaState,
   parsed: ParsedDeltaChunk,
   codecs: CodecRegistry,
+  grids: DecodedStateGrids,
+  recordOffset: number,
 ): Promise<KeyframeDeltaState> {
   // Undo any chunk-level compression over the whole records block, then frame its three
   // sub-blocks (§5.18) — the same handling a keyframe Chunk gets.
@@ -829,7 +1063,34 @@ async function composeDelta(
   checkGroup(where, "update", updates, parsed.header.updateCount);
   checkGroup(where, "birth", births, parsed.header.birthCount);
   checkGroup(where, "death", deaths, parsed.header.deathCount, true);
-  return applyDelta(reference, updates.ids, updates.bins, births.ids, births.bins, deaths.ids);
+  const [state, updateRows, birthRowStart] = applyDelta(
+    reference,
+    updates.ids,
+    updates.bins,
+    births.ids,
+    births.bins,
+    deaths.ids,
+  );
+  if (updates.ids.length > 0) {
+    validateDecodedStateRows(
+      state,
+      updates.ids,
+      updateRows,
+      new Set(
+        [...updates.bins.keys()].filter((attribute) => FLOATING_STATE_ATTRIBUTES.has(attribute)),
+      ),
+      grids,
+      { recordName: "Delta Chunk", recordOffset, operation: "update" },
+    );
+  }
+  if (births.ids.length > 0) {
+    validateDecodedStateRows(state, births.ids, birthRowStart, null, grids, {
+      recordName: "Delta Chunk",
+      recordOffset,
+      operation: "birth",
+    });
+  }
+  return state;
 }
 
 function checkGroup(
@@ -1030,9 +1291,24 @@ export async function decodeKeyframeDeltaStreamed(
       windows = parseWindowTable(record.content);
     } else if (record.opcode === Opcode.Chunk) {
       finishCurrentBands();
+      if (header === null || quantization === null) {
+        throw new MalformedFile(
+          `keyframe Chunk at byte ${record.offset} precedes the Header or Quantization record`,
+        );
+      }
       const parsed = parseChunk(record.content);
       const decoded = await keyframeFromChunk(record.content, codecs);
       const state = keyframeState(decoded.ids, decoded.bins);
+      const grids = {
+        quantization,
+        windows,
+        supportK: supportK(header.cutoff),
+      };
+      validateDecodedStateRows(state, decoded.ids, 0, null, grids, {
+        recordName: "Chunk",
+        recordOffset: record.offset,
+        operation: "keyframe",
+      });
       currentChunk = {
         t0: parsed.header.t0,
         t1: parsed.header.t1,
@@ -1051,6 +1327,11 @@ export async function decodeKeyframeDeltaStreamed(
       currentBands = new Set();
     } else if (record.opcode === Opcode.DeltaChunk) {
       finishCurrentBands();
+      if (header === null || quantization === null) {
+        throw new MalformedFile(
+          `Delta Chunk at byte ${record.offset} precedes the Header or Quantization record`,
+        );
+      }
       const parsed = parseDeltaChunk(record.content);
       const reference = byOffset.get(parsed.header.referenceOffset);
       if (reference === undefined) {
@@ -1071,7 +1352,13 @@ export async function decodeKeyframeDeltaStreamed(
         record.offset,
         parsed.header.referenceOffset,
       );
-      const state = await composeDelta(reference.chunk.state, parsed, codecs);
+      const state = await composeDelta(
+        reference.chunk.state,
+        parsed,
+        codecs,
+        { quantization, windows, supportK: supportK(header.cutoff) },
+        record.offset,
+      );
       currentChunk = {
         t0: parsed.header.t0,
         t1: parsed.header.t1,
@@ -1158,6 +1445,7 @@ export async function validateKeyframeDeltaStreamed(
   checkMagic(await scanner.head(MAGIC.length));
 
   let header: Header | null = null;
+  let quantization: Quantization | null = null;
   let windows = new Float64Array(0);
   const intervals: (Interval & { readonly offset: number })[] = [];
   const identities = new Map<
@@ -1237,11 +1525,16 @@ export async function validateKeyframeDeltaStreamed(
               `"${header.temporalModel}"`,
           );
         }
+      } else if (record.opcode === Opcode.Quantization) {
+        quantization = parseQuantization(await scanner.content(record), record.offset);
+        checkQuantizationScheme(quantization.scheme);
       } else if (record.opcode === Opcode.WindowTable) {
         windows = parseWindowTable(await scanner.content(record));
       } else if (record.opcode === Opcode.Chunk) {
-        if (header === null) {
-          throw new MalformedFile(`keyframe chunk at ${record.offset} precedes the Header record`);
+        if (header === null || quantization === null) {
+          throw new MalformedFile(
+            `keyframe Chunk at byte ${record.offset} precedes the Header or Quantization record`,
+          );
         }
         const content = await scanner.content(record);
         const parsed = parseChunk(content);
@@ -1253,6 +1546,14 @@ export async function validateKeyframeDeltaStreamed(
         }
         const decoded = await keyframeFromChunk(content, codecs);
         const state = keyframeState(decoded.ids, decoded.bins);
+        validateDecodedStateRows(
+          state,
+          decoded.ids,
+          0,
+          null,
+          { quantization, windows, supportK: supportK(header.cutoff) },
+          { recordName: "Chunk", recordOffset: record.offset, operation: "keyframe" },
+        );
         if (state.count !== parsed.header.count) {
           throw new MalformedFile(
             `keyframe chunk at ${record.offset} declares ${parsed.header.count} gaussians; ` +
@@ -1279,8 +1580,10 @@ export async function validateKeyframeDeltaStreamed(
           live: state.count,
         });
       } else if (record.opcode === Opcode.DeltaChunk) {
-        if (header === null) {
-          throw new MalformedFile(`delta chunk at ${record.offset} precedes the Header record`);
+        if (header === null || quantization === null) {
+          throw new MalformedFile(
+            `Delta Chunk at byte ${record.offset} precedes the Header or Quantization record`,
+          );
         }
         const parsed = parseDeltaChunk(await scanner.content(record));
         const groupCount =
@@ -1338,7 +1641,13 @@ export async function validateKeyframeDeltaStreamed(
           record.offset,
           parsed.header.referenceOffset,
         );
-        const state = await composeDelta(reference.state, parsed, codecs);
+        const state = await composeDelta(
+          reference.state,
+          parsed,
+          codecs,
+          { quantization, windows, supportK: supportK(header.cutoff) },
+          record.offset,
+        );
         previousState = {
           offset: record.offset,
           state,
@@ -1372,7 +1681,9 @@ export async function validateKeyframeDeltaStreamed(
     }
   }
 
-  if (header === null) throw new MalformedFile("keyframe-delta file has no Header record");
+  if (header === null || quantization === null) {
+    throw new MalformedFile("keyframe-delta file has no Header or Quantization record");
+  }
   checkTiling(intervals, header.durationSec, true);
   const intervalRank = new Map<number, number>();
   [...intervals]
@@ -1719,6 +2030,11 @@ export class KeyframeDeltaIndexedDecoder {
       entry,
       this.codecs,
       this.header.shDegree,
+      {
+        quantization: this.quantization,
+        windows: this.windows,
+        supportK: supportK(this.header.cutoff),
+      },
     );
     let updateCount: number | null = null;
     let birthCount: number | null = null;
@@ -1812,7 +2128,11 @@ export async function decodeKeyframeDeltaIndexed(
   const chunks: KeyframeDeltaChunkInfo[] = [];
   const read = wholeFileRecordReader(data);
   for (const entry of index) {
-    const state = await composeChain(data, index, entry, codecs, header.shDegree);
+    const state = await composeChain(data, index, entry, codecs, header.shDegree, {
+      quantization,
+      windows,
+      supportK: supportK(header.cutoff),
+    });
     let updateCount: number | null = null;
     let birthCount: number | null = null;
     let deathCount: number | null = null;
@@ -1926,8 +2246,9 @@ async function composeChain(
   entry: ChunkIndexEntry,
   codecs: CodecRegistry,
   shDegree: number,
+  grids: DecodedStateGrids,
 ): Promise<KeyframeDeltaState> {
-  return composeChainFromReader(wholeFileRecordReader(data), index, entry, codecs, shDegree);
+  return composeChainFromReader(wholeFileRecordReader(data), index, entry, codecs, shDegree, grids);
 }
 
 async function composeChainFromReader(
@@ -1936,6 +2257,7 @@ async function composeChainFromReader(
   entry: ChunkIndexEntry,
   codecs: CodecRegistry,
   shDegree: number,
+  grids: DecodedStateGrids,
 ): Promise<KeyframeDeltaState> {
   const chain = chainEndingAt(index, entry);
   let state: KeyframeDeltaState | null = null;
@@ -1956,6 +2278,11 @@ async function composeChainFromReader(
     if (link.kind === 0) {
       const decoded = await keyframeFromChunk(content, codecs);
       state = keyframeState(decoded.ids, decoded.bins);
+      validateDecodedStateRows(state, decoded.ids, 0, null, grids, {
+        recordName: "Chunk",
+        recordOffset: link.chunkOffset,
+        operation: "keyframe",
+      });
       const head = parseChunk(content).header;
       keyframeLevel = head.level;
       if (link.t0 !== head.t0 || link.t1 !== head.t1) {
@@ -1987,7 +2314,7 @@ async function composeChainFromReader(
         link.chunkOffset,
         parsed.header.referenceOffset,
       );
-      state = await composeDelta(state, parsed, codecs);
+      state = await composeDelta(state, parsed, codecs, grids, link.chunkOffset);
       checkDecodedIndexCounts(
         link,
         parsed.header.updateCount + parsed.header.birthCount + parsed.header.deathCount,
@@ -2377,7 +2704,10 @@ export function reconstructKeyframeDelta(
       const sigmaBin = sigmaBinsCol[i]!;
       const neverFades = (flags[i]! & GAUSSIAN_FLAG_NEVER_FADES) !== 0;
       const sigma = neverFades ? Infinity : Math.exp(sigmaBin * steps.sigmaLog);
-      const mu = muBins[i]! * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
+      const mu = reconstructLinear(
+        muBins[i]!,
+        muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time),
+      );
       const dt = t - mu;
       const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
       if (marginal >= sequence.header.cutoff) order.push(i);
@@ -2421,15 +2751,19 @@ export function reconstructKeyframeDelta(
       lifeClass(sigmaBin, steps.sigmaLog, neverFades, winHi - winLo, k),
       steps.motion,
     );
-    const mu = muBins[i]! * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
+    const mu = reconstructLinear(
+      muBins[i]!,
+      muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time),
+    );
     const dt = t - mu;
 
     ids[out] = state.ids[i]!;
     const o3 = out * 3;
     const i3 = i * 3;
     for (let c = 0; c < 3; c++) {
-      const pos = position[i3 + c]! * steps.pos + origin[c]!;
-      centers[o3 + c] = pos + motion[i3 + c]! * mStep * dt;
+      const pos = reconstructLinear(position[i3 + c]!, steps.pos, origin[c]!);
+      const velocity = reconstructLinear(motion[i3 + c]!, mStep);
+      centers[o3 + c] = pos + velocity * dt;
       scales[o3 + c] = Math.exp(scaleBins[i3 + c]! * steps.scaleLog);
     }
 
@@ -2444,11 +2778,11 @@ export function reconstructKeyframeDelta(
     );
 
     const [r, g, b] = rctInverse(colorBins[i3]!, colorBins[i3 + 1]!, colorBins[i3 + 2]!);
-    rgb[o3] = clamp(r * steps.rgb, 0, 1);
-    rgb[o3 + 1] = clamp(g * steps.rgb, 0, 1);
-    rgb[o3 + 2] = clamp(b * steps.rgb, 0, 1);
+    rgb[o3] = clamp(reconstructLinear(r, steps.rgb), 0, 1);
+    rgb[o3 + 1] = clamp(reconstructLinear(g, steps.rgb), 0, 1);
+    rgb[o3 + 2] = clamp(reconstructLinear(b, steps.rgb), 0, 1);
 
-    const alpha = clamp(opacityBins[i]! * steps.alpha, 0, 1);
+    const alpha = clamp(reconstructLinear(opacityBins[i]!, steps.alpha), 0, 1);
     const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
     opacity[out] = alpha * marginal;
     if (objectId !== null) objectId[out] = objectIdBins![i]!;

@@ -10,6 +10,11 @@ The four packages version together.
 
 ### Fixed
 
+- **Derived floating attributes are range-checked before binary32 narrowing.** Gaussian-birth and
+  keyframe-delta readers now refuse a non-finite or out-of-range reconstructed lane as
+  `decoded-f32-overflow`, attributed to the physical Chunk or Delta Chunk row that first produces it
+  on both streamed and indexed paths. The specified `never_fades` sigma infinity, ordinary f32
+  rounding and underflow, and a large finite quantization step paired with bin zero remain legal.
 - **Decoded Chunk Index counts are verified against the content they describe.** Gaussian-birth
   readers compare `gaussian_count` with validated Chunk rows on both streamed and indexed paths.
   Keyframe-delta readers compare `gaussian_count` with validated keyframe rows or Delta operations

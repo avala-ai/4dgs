@@ -35,6 +35,8 @@ export const Refusal = {
   UnknownStreamCodec: "unknown-stream-codec",
   /** A gaussian's window index names a row the Window Table does not have. */
   WindowIndexOutOfRange: "window-index-out-of-range",
+  /** A reconstructed floating attribute cannot be represented as a finite binary32 value. */
+  DecodedF32Overflow: "decoded-f32-overflow",
   /** A Chunk Index count disagrees with the decoded record or composed state it describes. */
   IndexRecordMismatch: "index-record-mismatch",
 } as const;

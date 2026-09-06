@@ -24,6 +24,8 @@ import {
   lifeClass,
   motionStep,
   muStep,
+  reconstructLinear,
+  requireDecodedF32,
   rctInverse,
   type Steps,
 } from "./quantization.js";
@@ -113,6 +115,8 @@ export interface DecodeChunkOptions {
   /** `sqrt(-2 ln cutoff)`, from the Header's cutoff. */
   readonly supportK: number;
   readonly codecs: CodecRegistry;
+  /** Byte of this Chunk's opcode, for row-level reconstruction diagnostics. */
+  readonly recordOffset?: number;
 }
 
 const EMPTY_CHUNK: ChunkGaussians = {
@@ -248,16 +252,51 @@ function assemble(
   const originX = posOrigin[0] ?? 0;
   const originY = posOrigin[1] ?? 0;
   const originZ = posOrigin[2] ?? 0;
+  const origins = [originX, originY, originZ] as const;
+  const components = ["x", "y", "z"] as const;
+  const record =
+    options.recordOffset === undefined
+      ? "Chunk opcode"
+      : `Chunk opcode at byte ${options.recordOffset}`;
+  const lane = (
+    value: number,
+    row: number,
+    attribute: string,
+    component: string,
+    bins: string,
+    step: number,
+    origin?: number,
+  ): number =>
+    requireDecodedF32(
+      value,
+      `${record}, row ${row}, ${attribute} component ${component}, ${bins}, effective step ` +
+        `${step}${origin === undefined ? "" : `, origin ${origin}`}`,
+    );
+  const rotation = new Float64Array(4);
 
   for (let i = 0; i < count; i++) {
     const i3 = i * 3;
-    positions[i3] = posBins[i3]! * steps.pos + originX;
-    positions[i3 + 1] = posBins[i3 + 1]! * steps.pos + originY;
-    positions[i3 + 2] = posBins[i3 + 2]! * steps.pos + originZ;
-
-    scales[i3] = Math.exp(scaleBins[i3]! * steps.scaleLog);
-    scales[i3 + 1] = Math.exp(scaleBins[i3 + 1]! * steps.scaleLog);
-    scales[i3 + 2] = Math.exp(scaleBins[i3 + 2]! * steps.scaleLog);
+    for (let c = 0; c < 3; c++) {
+      const posBin = posBins[i3 + c]!;
+      positions[i3 + c] = lane(
+        reconstructLinear(posBin, steps.pos, origins[c]),
+        i,
+        "position",
+        components[c]!,
+        `stored bin ${posBin}`,
+        steps.pos,
+        origins[c],
+      );
+      const scaleBin = scaleBins[i3 + c]!;
+      scales[i3 + c] = lane(
+        Math.exp(scaleBin * steps.scaleLog),
+        i,
+        "scale",
+        components[c]!,
+        `stored bin ${scaleBin}`,
+        steps.scaleLog,
+      );
+    }
 
     dequantizeRotation(
       rotIndex[i]!,
@@ -265,15 +304,42 @@ function assemble(
       rotBins[i3 + 1]!,
       rotBins[i3 + 2]!,
       steps.rot,
-      rotations,
-      i * 4,
+      rotation,
+      0,
     );
+    for (let c = 0; c < 4; c++) {
+      rotations[i * 4 + c] = lane(
+        rotation[c]!,
+        i,
+        "rotation",
+        "xyzw"[c]!,
+        `stored bins (${rotBins[i3]!}, ${rotBins[i3 + 1]!}, ${rotBins[i3 + 2]!}) and ` +
+          `rotation_index ${rotIndex[i]!}`,
+        steps.rot,
+      );
+    }
 
     const [r, g, b] = rctInverse(colorBins[i3]!, colorBins[i3 + 1]!, colorBins[i3 + 2]!);
-    colors[i * 4] = clamp(r * steps.rgb, 0, 1);
-    colors[i * 4 + 1] = clamp(g * steps.rgb, 0, 1);
-    colors[i * 4 + 2] = clamp(b * steps.rgb, 0, 1);
-    colors[i * 4 + 3] = clamp(alphaBins[i]! * steps.alpha, 0, 1);
+    const transformed = [r, g, b] as const;
+    for (let c = 0; c < 3; c++) {
+      colors[i * 4 + c] = lane(
+        clamp(reconstructLinear(transformed[c]!, steps.rgb), 0, 1),
+        i,
+        "color",
+        "rgb"[c]!,
+        `stored RCT bins (${colorBins[i3]!}, ${colorBins[i3 + 1]!}, ${colorBins[i3 + 2]!})`,
+        steps.rgb,
+      );
+    }
+    const alphaBin = alphaBins[i]!;
+    colors[i * 4 + 3] = lane(
+      clamp(reconstructLinear(alphaBin, steps.alpha), 0, 1),
+      i,
+      "color",
+      "opacity",
+      `stored bin ${alphaBin}`,
+      steps.alpha,
+    );
 
     // Per-gaussian precision: both pitches come from this gaussian's own sigma bin, which
     // the decoder has already read. There is no side channel and no lookup table.
@@ -283,16 +349,40 @@ function assemble(
     windowIndex[i] = index;
     const windowLength = windows[index * 2 + 1]! - windows[index * 2]!;
 
+    const sigma = neverFades ? Infinity : Math.exp(sigmaBin * steps.sigmaLog);
+    if (neverFades) {
+      // The flag makes this one specified non-finite attribute value legal.
+      sigmaT[i] = Infinity;
+    } else {
+      sigmaT[i] = lane(sigma, i, "sigma_t", "scalar", `stored bin ${sigmaBin}`, steps.sigmaLog);
+    }
+
     const step = motionStep(
       lifeClass(sigmaBin, steps.sigmaLog, neverFades, windowLength, options.supportK),
       steps.motion,
     );
-    motions[i3] = motionBins[i3]! * step;
-    motions[i3 + 1] = motionBins[i3 + 1]! * step;
-    motions[i3 + 2] = motionBins[i3 + 2]! * step;
+    for (let c = 0; c < 3; c++) {
+      const bin = motionBins[i3 + c]!;
+      motions[i3 + c] = lane(
+        reconstructLinear(bin, step),
+        i,
+        "motion",
+        components[c]!,
+        `stored bin ${bin}`,
+        step,
+      );
+    }
 
-    muT[i] = muBins[i]! * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
-    sigmaT[i] = neverFades ? Infinity : Math.exp(sigmaBin * steps.sigmaLog);
+    const muBin = muBins[i]!;
+    const effectiveMuStep = muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
+    muT[i] = lane(
+      reconstructLinear(muBin, effectiveMuStep),
+      i,
+      "mu_t",
+      "scalar",
+      `stored bin ${muBin}`,
+      effectiveMuStep,
+    );
   }
 
   return {
