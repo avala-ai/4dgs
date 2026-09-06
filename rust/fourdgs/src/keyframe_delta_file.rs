@@ -1202,6 +1202,22 @@ fn decode_group_with_limit(
 fn keyframe_from_chunk(
     content: &[u8],
 ) -> Result<(rec::ChunkHeader, Vec<i64>, BTreeMap<u8, BinArray>)> {
+    keyframe_from_chunk_with_decoded_budget(
+        content,
+        MAX_STREAM_BYTES as usize,
+        crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES,
+        "keyframe Chunk decoding",
+        false,
+    )
+}
+
+fn keyframe_from_chunk_with_decoded_budget(
+    content: &[u8],
+    decoded_budget: usize,
+    configured_limit: usize,
+    phase: &str,
+    classify_budget: bool,
+) -> Result<(rec::ChunkHeader, Vec<i64>, BTreeMap<u8, BinArray>)> {
     let (head, encoded_streams) = rec::parse_chunk(content)?;
     let unpacked_budget = (MAX_STREAM_BYTES as usize)
         .checked_sub(content.len())
@@ -1211,8 +1227,20 @@ fn keyframe_from_chunk(
                 head.t0
             ))
         })?;
-    let streams =
-        crate::chunk::chunk_stream_bytes_with_limit(&head, encoded_streams, unpacked_budget)?;
+    let user_budget_binds = decoded_budget <= unpacked_budget;
+    let streams = crate::chunk::chunk_stream_bytes_with_limit(
+        &head,
+        encoded_streams,
+        unpacked_budget.min(decoded_budget),
+    )
+    .map_err(|error| {
+        crate::stream_reader::decoded_state_operation_error(
+            error,
+            configured_limit,
+            phase,
+            classify_budget && user_budget_binds,
+        )
+    })?;
     let unpacked_bytes = match &streams {
         Cow::Borrowed(_) => 0,
         Cow::Owned(bytes) => bytes.capacity(),
@@ -1223,7 +1251,21 @@ fn keyframe_from_chunk(
             head.t0
         ))
     })?;
-    let (ids, bins, _) = decode_group_with_limit(&streams, head.count as usize, group_budget)?;
+    let decoded_group_budget = decoded_budget.checked_sub(unpacked_bytes).ok_or_else(|| {
+        Error::decoded_state_resource_limit(configured_limit, phase, Some(unpacked_bytes))
+    })?;
+    let effective_group_budget = group_budget.min(decoded_group_budget);
+    let (ids, bins, _) =
+        decode_group_with_limit(&streams, head.count as usize, effective_group_budget).map_err(
+            |error| {
+                crate::stream_reader::decoded_state_operation_error(
+                    error,
+                    configured_limit,
+                    phase,
+                    classify_budget && decoded_group_budget <= group_budget,
+                )
+            },
+        )?;
     if head.count > 0 {
         let missing: Vec<u8> = REQUIRED
             .iter()
@@ -1508,6 +1550,24 @@ fn check_composition_working_set_with_limit(
 }
 
 fn decode_delta_with_retained(content: &[u8], retained_elsewhere: usize) -> Result<DecodedDelta> {
+    decode_delta_with_budgets(
+        content,
+        retained_elsewhere,
+        MAX_STREAM_BYTES as usize,
+        crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES,
+        "Delta Chunk decoding",
+        false,
+    )
+}
+
+fn decode_delta_with_budgets(
+    content: &[u8],
+    retained_elsewhere: usize,
+    decoded_output_budget: usize,
+    configured_limit: usize,
+    phase: &str,
+    classify_budget: bool,
+) -> Result<DecodedDelta> {
     let (head, encoded_records) = rec::parse_delta_chunk_records(content)?;
     let max_output_bytes = (MAX_STREAM_BYTES as usize)
         .checked_sub(retained_elsewhere)
@@ -1518,7 +1578,16 @@ fn decode_delta_with_retained(content: &[u8], retained_elsewhere: usize) -> Resu
                 head.t0
             ))
         })?;
-    let records = delta_record_bytes(&head, encoded_records, max_output_bytes)?;
+    let effective_output_budget = max_output_bytes.min(decoded_output_budget);
+    let records =
+        delta_record_bytes(&head, encoded_records, effective_output_budget).map_err(|error| {
+            crate::stream_reader::decoded_state_operation_error(
+                error,
+                configured_limit,
+                phase,
+                classify_budget && decoded_output_budget <= max_output_bytes,
+            )
+        })?;
     let mut framed = Cursor::new(&records);
     let updates = framed.blob()?;
     let births = framed.blob()?;
@@ -1532,24 +1601,54 @@ fn decode_delta_with_retained(content: &[u8], retained_elsewhere: usize) -> Resu
         Cow::Borrowed(_) => 0,
         Cow::Owned(bytes) => bytes.capacity(),
     };
-    let mut remaining = max_output_bytes.checked_sub(record_bytes).ok_or_else(|| {
+    let mut remaining = effective_output_budget.checked_sub(record_bytes).ok_or_else(|| {
+        if classify_budget && decoded_output_budget <= max_output_bytes {
+            return Error::decoded_state_resource_limit(
+                configured_limit,
+                phase,
+                Some(record_bytes),
+            );
+        }
         Error::UnsupportedOperation(format!(
-            "the Delta Chunk at t0={} retains {record_bytes} decompressed record bytes, past the {max_output_bytes} bytes available beside its reference and encoded content",
+            "the Delta Chunk at t0={} retains {record_bytes} decompressed record bytes, past the {effective_output_budget} bytes available beside its reference and encoded content",
             head.t0
         ))
     })?;
     let (update_ids, update_bins, update_bytes) =
-        decode_group_with_limit(updates, head.update_count as usize, remaining)?;
+        decode_group_with_limit(updates, head.update_count as usize, remaining).map_err(
+            |error| {
+                crate::stream_reader::decoded_state_operation_error(
+                    error,
+                    configured_limit,
+                    phase,
+                    classify_budget && decoded_output_budget <= max_output_bytes,
+                )
+            },
+        )?;
     remaining = remaining.checked_sub(update_bytes).ok_or_else(|| {
         Error::UnsupportedOperation("decoded Delta update-group bytes exceed its budget".into())
     })?;
     let (birth_ids, birth_bins, birth_bytes) =
-        decode_group_with_limit(births, head.birth_count as usize, remaining)?;
+        decode_group_with_limit(births, head.birth_count as usize, remaining).map_err(|error| {
+            crate::stream_reader::decoded_state_operation_error(
+                error,
+                configured_limit,
+                phase,
+                classify_budget && decoded_output_budget <= max_output_bytes,
+            )
+        })?;
     remaining = remaining.checked_sub(birth_bytes).ok_or_else(|| {
         Error::UnsupportedOperation("decoded Delta birth-group bytes exceed its budget".into())
     })?;
     let (death_ids, death_bins, _) =
-        decode_group_with_limit(deaths, head.death_count as usize, remaining)?;
+        decode_group_with_limit(deaths, head.death_count as usize, remaining).map_err(|error| {
+            crate::stream_reader::decoded_state_operation_error(
+                error,
+                configured_limit,
+                phase,
+                classify_budget && decoded_output_budget <= max_output_bytes,
+            )
+        })?;
     if !birth_ids.is_empty() {
         let missing: Vec<u8> = REQUIRED
             .iter()
@@ -1592,6 +1691,52 @@ struct ComposedDelta {
 fn compose_delta(reference: &State, content: &[u8]) -> Result<ComposedDelta> {
     let decoded = decode_delta_with_retained(content, state_resident_bytes(reference)?)?;
     check_composition_working_set(reference, &decoded, content.len())?;
+    let (state, update_rows, birth_start) = apply_delta_with_rows(
+        reference,
+        &decoded.update_ids,
+        &decoded.update_bins,
+        &decoded.birth_ids,
+        &decoded.birth_bins,
+        &decoded.death_ids,
+    )?;
+    Ok(ComposedDelta {
+        state,
+        decoded,
+        update_rows,
+        birth_start,
+    })
+}
+
+fn compose_delta_with_decoded_budget(
+    reference: &State,
+    content: &[u8],
+    working_budget: usize,
+    configured_limit: usize,
+    phase: &str,
+) -> Result<ComposedDelta> {
+    let reference_bytes = state_resident_bytes(reference)?;
+    let decoded_output_budget = working_budget.checked_sub(reference_bytes).ok_or_else(|| {
+        Error::decoded_state_resource_limit(configured_limit, phase, Some(reference_bytes))
+    })?;
+    let decoded = decode_delta_with_budgets(
+        content,
+        reference_bytes,
+        decoded_output_budget,
+        configured_limit,
+        phase,
+        true,
+    )?;
+    check_composition_working_set(reference, &decoded, content.len())?;
+    check_composition_working_set_with_limit(reference, &decoded, 0, working_budget).map_err(
+        |error| {
+            crate::stream_reader::decoded_state_operation_error(
+                error,
+                configured_limit,
+                phase,
+                true,
+            )
+        },
+    )?;
     let (state, update_rows, birth_start) = apply_delta_with_rows(
         reference,
         &decoded.update_ids,
@@ -1722,15 +1867,101 @@ pub(crate) fn compose_delta_chunk_checked(
     ))
 }
 
+fn keyframe_delta_map_node_bytes(len: usize, limit: usize, phase: &str) -> Result<usize> {
+    let per_node = std::mem::size_of::<(u64, usize)>()
+        .checked_add(4 * std::mem::size_of::<usize>())
+        .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?;
+    len.checked_mul(per_node)
+        .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))
+}
+
+fn decoded_sequence_resident_bytes(
+    chunks: &Vec<ChunkInfo>,
+    offset_count: usize,
+    limit: usize,
+    phase: &str,
+) -> Result<usize> {
+    let mut total = chunks
+        .capacity()
+        .checked_mul(std::mem::size_of::<ChunkInfo>())
+        .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?;
+    total = total
+        .checked_add(keyframe_delta_map_node_bytes(offset_count, limit, phase)?)
+        .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?;
+    for chunk in chunks {
+        total = total
+            .checked_add(state_resident_bytes(&chunk.state)?)
+            .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?;
+    }
+    Ok(total)
+}
+
+/// Reserve the outer result slot and pre-charge the offset lookup node before decoding
+/// the state that will occupy them. The state allocation then receives only the budget
+/// left beside every earlier retained state.
+fn prepare_decoded_chunk_slot(
+    chunks: &mut Vec<ChunkInfo>,
+    offset_count: usize,
+    limit: usize,
+    phase: &str,
+) -> Result<usize> {
+    if chunks.len() == chunks.capacity() {
+        let target = if chunks.capacity() == 0 {
+            4
+        } else {
+            chunks
+                .capacity()
+                .checked_mul(2)
+                .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?
+        };
+        let outer_bytes = target
+            .checked_mul(std::mem::size_of::<ChunkInfo>())
+            .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?;
+        let old_outer_bytes = chunks
+            .capacity()
+            .checked_mul(std::mem::size_of::<ChunkInfo>())
+            .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?;
+        let state_bytes = chunks.iter().try_fold(0usize, |total, chunk| {
+            total
+                .checked_add(state_resident_bytes(&chunk.state)?)
+                .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))
+        })?;
+        let map_bytes = keyframe_delta_map_node_bytes(offset_count + 1, limit, phase)?;
+        let required = old_outer_bytes
+            .checked_add(outer_bytes)
+            .and_then(|bytes| bytes.checked_add(state_bytes))
+            .and_then(|bytes| bytes.checked_add(map_bytes))
+            .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?;
+        crate::stream_reader::check_decoded_state_limit(required, limit, phase)?;
+        chunks.try_reserve_exact(target - chunks.len()).map_err(|error| {
+            Error::ResourceLimit(format!(
+                "decoded-state resource limit during {phase}: could not reserve the validated {target}-entry result collection under the configured limit of {limit} bytes: {error}"
+            ))
+        })?;
+    }
+    let retained = decoded_sequence_resident_bytes(chunks, offset_count + 1, limit, phase)?;
+    crate::stream_reader::check_decoded_state_limit(retained, limit, phase)?;
+    Ok(retained)
+}
+
 /// Front to back: decode each chunk and compose it onto the state it references.
 pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
+    decode_streamed_with_options(data, &crate::stream_reader::ReadOptions::default())
+}
+
+/// Front-to-back collection with a caller-selected aggregate decoded-state budget.
+pub fn decode_streamed_with_options(
+    data: &[u8],
+    options: &crate::stream_reader::ReadOptions,
+) -> Result<DecodedSequence> {
+    crate::stream_reader::validate_decoded_state_limit(options.max_decoded_state_bytes)?;
     check_magic(data)?;
     check_streamed_front_matter_placement(data)?;
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
     let mut windows: Vec<(f64, f64)> = Vec::new();
     let mut chunks: Vec<ChunkInfo> = Vec::new();
-    let mut by_offset: BTreeMap<u64, State> = BTreeMap::new();
+    let mut by_offset: BTreeMap<u64, usize> = BTreeMap::new();
     let mut state_seen = false;
 
     for record in Records::new(data, MAGIC.len()) {
@@ -1760,8 +1991,45 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
             }
             op::CHUNK => {
                 state_seen = true;
-                let (head, ids, bins) = keyframe_from_chunk(record.content)?;
+                let phase = "streamed keyframe-delta keyframe collection";
+                let collection_bytes = prepare_decoded_chunk_slot(
+                    &mut chunks,
+                    by_offset.len(),
+                    options.max_decoded_state_bytes,
+                    phase,
+                )?;
+                let decoded_budget = options
+                    .max_decoded_state_bytes
+                    .checked_sub(collection_bytes)
+                    .ok_or_else(|| {
+                        Error::decoded_state_resource_limit(
+                            options.max_decoded_state_bytes,
+                            phase,
+                            Some(collection_bytes),
+                        )
+                    })?;
+                let (head, ids, bins) = keyframe_from_chunk_with_decoded_budget(
+                    record.content,
+                    decoded_budget,
+                    options.max_decoded_state_bytes,
+                    phase,
+                    true,
+                )?;
                 let state = keyframe_state(ids, bins)?;
+                let required = collection_bytes
+                    .checked_add(state_resident_bytes(&state)?)
+                    .ok_or_else(|| {
+                        Error::decoded_state_resource_limit(
+                            options.max_decoded_state_bytes,
+                            phase,
+                            None,
+                        )
+                    })?;
+                crate::stream_reader::check_decoded_state_limit(
+                    required,
+                    options.max_decoded_state_bytes,
+                    phase,
+                )?;
                 let quantization = quant.as_ref().ok_or_else(|| {
                     Error::Malformed("a keyframe appears before Quantization".into())
                 })?;
@@ -1778,7 +2046,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 )
                 .map_err(|error| error.at_record("Chunk record", record.offset as u64))?;
                 check_streamed_population(record.offset as u64, head.t0, head.t1, &state)?;
-                by_offset.insert(record.offset as u64, state.clone());
+                let chunk_index = chunks.len();
                 chunks.push(ChunkInfo {
                     t0: head.t0,
                     t1: head.t1,
@@ -1792,6 +2060,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                     death_count: None,
                     state,
                 });
+                by_offset.insert(record.offset as u64, chunk_index);
             }
             op::DELTA_CHUNK => {
                 state_seen = true;
@@ -1802,13 +2071,43 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                         record.offset, head.reference_offset
                     )));
                 }
-                let Some(reference) = by_offset.get(&head.reference_offset) else {
+                let Some(&reference_index) = by_offset.get(&head.reference_offset) else {
                     return Err(Error::Malformed(format!(
                         "delta chunk at {} references {}, which has not been decoded",
                         record.offset, head.reference_offset
                     )));
                 };
-                let composed = compose_delta(reference, record.content)?;
+                let phase = "streamed keyframe-delta Delta composition";
+                let collection_bytes = prepare_decoded_chunk_slot(
+                    &mut chunks,
+                    by_offset.len(),
+                    options.max_decoded_state_bytes,
+                    phase,
+                )?;
+                let reference = &chunks[reference_index].state;
+                let reference_bytes = state_resident_bytes(reference)?;
+                let retained_beside_reference = collection_bytes
+                    .checked_sub(reference_bytes)
+                    .ok_or_else(|| {
+                        Error::Malformed("keyframe-delta reference accounting underflows".into())
+                    })?;
+                let working_budget = options
+                    .max_decoded_state_bytes
+                    .checked_sub(retained_beside_reference)
+                    .ok_or_else(|| {
+                        Error::decoded_state_resource_limit(
+                            options.max_decoded_state_bytes,
+                            phase,
+                            Some(collection_bytes),
+                        )
+                    })?;
+                let composed = compose_delta_with_decoded_budget(
+                    reference,
+                    record.content,
+                    working_budget,
+                    options.max_decoded_state_bytes,
+                    phase,
+                )?;
                 // Births in a delta group carry their own `window_index`, so the check
                 // belongs on this branch too — not only where a keyframe is read. The
                 // indexed path validates the composed state for every chunk, so leaving
@@ -1830,7 +2129,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 let ComposedDelta { state, decoded, .. } = composed;
                 let head = decoded.head;
                 check_streamed_population(record.offset as u64, head.t0, head.t1, &state)?;
-                by_offset.insert(record.offset as u64, state.clone());
+                let chunk_index = chunks.len();
                 chunks.push(ChunkInfo {
                     t0: head.t0,
                     t1: head.t1,
@@ -1844,6 +2143,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                     death_count: Some(head.death_count),
                     state,
                 });
+                by_offset.insert(record.offset as u64, chunk_index);
             }
             op::CHUNK_INDEX => {
                 let entry = rec::ChunkIndexEntry::parse(record.content)
@@ -2427,6 +2727,16 @@ pub fn read_keyframe_entry<R: crate::Readable + ?Sized>(
     quantization: &rec::Quantization,
     windows: &[(f64, f64)],
 ) -> Result<(State, rec::ChunkHeader)> {
+    read_keyframe_entry_inner(source, entry, quantization, windows, None)
+}
+
+fn read_keyframe_entry_inner<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    entry: &rec::ChunkIndexEntry,
+    quantization: &rec::Quantization,
+    windows: &[(f64, f64)],
+    decoded_budget: Option<(usize, usize, &str)>,
+) -> Result<(State, rec::ChunkHeader)> {
     let (opcode, content) = ranged_record(source, entry.chunk_offset, Some(entry.chunk_length))?;
     if opcode != op::CHUNK {
         return Err(Error::Malformed(format!(
@@ -2435,7 +2745,13 @@ pub fn read_keyframe_entry<R: crate::Readable + ?Sized>(
             op::name(opcode)
         )));
     }
-    let (state, head) = decode_keyframe_chunk(&content, windows)?;
+    let (head, ids, bins) = if let Some((budget, configured_limit, phase)) = decoded_budget {
+        keyframe_from_chunk_with_decoded_budget(&content, budget, configured_limit, phase, true)?
+    } else {
+        keyframe_from_chunk(&content)?
+    };
+    let state = keyframe_state(ids, bins)?;
+    check_window_indices(&state, windows)?;
     check_keyframe_mu_t(&state, head.t0, quantization)?;
     check_index_count(
         entry,
@@ -2484,6 +2800,17 @@ fn read_delta_entry_inner<R: crate::Readable + ?Sized>(
     windows: &[(f64, f64)],
     decoded_guard: Option<(&rec::Quantization, f64)>,
 ) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    read_delta_entry_with_budget(source, entry, reference, windows, decoded_guard, None)
+}
+
+fn read_delta_entry_with_budget<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    entry: &rec::ChunkIndexEntry,
+    reference: &State,
+    windows: &[(f64, f64)],
+    decoded_guard: Option<(&rec::Quantization, f64)>,
+    decoded_budget: Option<(usize, usize, &str)>,
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
     let (opcode, content) = ranged_record(source, entry.chunk_offset, Some(entry.chunk_length))?;
     if opcode != op::DELTA_CHUNK {
         return Err(Error::Malformed(format!(
@@ -2492,7 +2819,25 @@ fn read_delta_entry_inner<R: crate::Readable + ?Sized>(
             op::name(opcode)
         )));
     }
-    let decoded = if let Some((quantization, cutoff)) = decoded_guard {
+    let decoded = if let Some((working_budget, configured_limit, phase)) = decoded_budget {
+        let composed = compose_delta_with_decoded_budget(
+            reference,
+            &content,
+            working_budget,
+            configured_limit,
+            phase,
+        )?;
+        check_window_indices(&composed.state, windows)?;
+        if let Some((quantization, cutoff)) = decoded_guard {
+            check_decoded_f32_delta(&composed, quantization, windows, cutoff)
+                .map_err(|error| error.at_record("Delta Chunk record", entry.chunk_offset))?;
+        }
+        (
+            composed.state,
+            composed.decoded.head,
+            composed.decoded.birth_ids,
+        )
+    } else if let Some((quantization, cutoff)) = decoded_guard {
         compose_delta_chunk_checked(
             reference,
             &content,
@@ -2649,7 +2994,30 @@ pub fn compose_chain<R: crate::Readable + ?Sized>(
     quantization: &rec::Quantization,
     windows: &[(f64, f64)],
 ) -> Result<State> {
-    compose_chain_inner(source, index, entry, quantization, windows, None)
+    compose_chain_inner(
+        source,
+        index,
+        entry,
+        quantization,
+        windows,
+        None,
+        DecodedStateBudget::default(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct DecodedStateBudget {
+    working: usize,
+    configured: usize,
+}
+
+impl Default for DecodedStateBudget {
+    fn default() -> Self {
+        Self {
+            working: crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES,
+            configured: crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES,
+        }
+    }
 }
 
 fn compose_chain_inner<R: crate::Readable + ?Sized>(
@@ -2659,14 +3027,54 @@ fn compose_chain_inner<R: crate::Readable + ?Sized>(
     quantization: &rec::Quantization,
     windows: &[(f64, f64)],
     decoded_guard: Option<f64>,
+    budget: DecodedStateBudget,
 ) -> Result<State> {
     // Compose the entry the caller named. Recovering it via a midpoint is equivalent for
     // ordinary half-open intervals, but impossible for a valid empty `[t, t)` entry.
     let chain = chain_ending_at(index, entry)?;
+    let chain_bytes = chain
+        .capacity()
+        .checked_mul(std::mem::size_of::<&rec::ChunkIndexEntry>())
+        .ok_or_else(|| {
+            Error::decoded_state_resource_limit(
+                budget.configured,
+                "indexed keyframe-delta chain composition",
+                None,
+            )
+        })?;
+    crate::stream_reader::check_decoded_state_limit(
+        chain_bytes,
+        budget.working,
+        "indexed keyframe-delta chain composition",
+    )
+    .map_err(|_| {
+        Error::decoded_state_resource_limit(
+            budget.configured,
+            "indexed keyframe-delta chain composition",
+            Some(chain_bytes),
+        )
+    })?;
     let mut state: Option<State> = None;
     for link in &chain {
+        let working_budget = budget.working.checked_sub(chain_bytes).ok_or_else(|| {
+            Error::decoded_state_resource_limit(
+                budget.configured,
+                "indexed keyframe-delta chain composition",
+                Some(chain_bytes),
+            )
+        })?;
         let (next, record_t0, record_t1) = if link.kind == 0 {
-            let (next, head) = read_keyframe_entry(source, link, quantization, windows)?;
+            let (next, head) = read_keyframe_entry_inner(
+                source,
+                link,
+                quantization,
+                windows,
+                Some((
+                    working_budget,
+                    budget.configured,
+                    "indexed keyframe-delta keyframe composition",
+                )),
+            )?;
             if let Some(cutoff) = decoded_guard {
                 check_decoded_f32_state(&next, quantization, windows, cutoff)
                     .map_err(|error| error.at_record("Chunk record", link.chunk_offset))?;
@@ -2676,13 +3084,41 @@ fn compose_chain_inner<R: crate::Readable + ?Sized>(
             let reference = state
                 .take()
                 .ok_or_else(|| Error::Malformed("a chain begins with a delta chunk".into()))?;
-            let (next, head, _) = if let Some(cutoff) = decoded_guard {
-                read_delta_entry_checked(source, link, &reference, windows, quantization, cutoff)?
-            } else {
-                read_delta_entry(source, link, &reference, windows)?
-            };
+            let (next, head, _) = read_delta_entry_with_budget(
+                source,
+                link,
+                &reference,
+                windows,
+                decoded_guard.map(|cutoff| (quantization, cutoff)),
+                Some((
+                    working_budget,
+                    budget.configured,
+                    "indexed keyframe-delta Delta composition",
+                )),
+            )?;
             (next, head.t0, head.t1)
         };
+        let required = chain_bytes
+            .checked_add(state_resident_bytes(&next)?)
+            .ok_or_else(|| {
+                Error::decoded_state_resource_limit(
+                    budget.configured,
+                    "indexed keyframe-delta chain composition",
+                    None,
+                )
+            })?;
+        crate::stream_reader::check_decoded_state_limit(
+            required,
+            budget.working,
+            "indexed keyframe-delta chain composition",
+        )
+        .map_err(|_| {
+            Error::decoded_state_resource_limit(
+                budget.configured,
+                "indexed keyframe-delta chain composition",
+                Some(required),
+            )
+        })?;
         check_indexed_record_interval(link, record_t0, record_t1)?;
         check_composed_population(link, &next)?;
         state = Some(next);
@@ -2867,6 +3303,15 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
 
 /// Read the Footer, then the index, then compose each chunk by walking its chain.
 pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkIndexEntry>)> {
+    decode_indexed_with_options(data, &crate::stream_reader::ReadOptions::default())
+}
+
+/// Indexed whole-sequence collection with a caller-selected decoded-state budget.
+pub fn decode_indexed_with_options(
+    data: &[u8],
+    options: &crate::stream_reader::ReadOptions,
+) -> Result<(DecodedSequence, Vec<rec::ChunkIndexEntry>)> {
+    crate::stream_reader::validate_decoded_state_limit(options.max_decoded_state_bytes)?;
     let mut source = crate::BytesReadable::new(data);
     let IndexedSequence {
         header,
@@ -2875,8 +3320,38 @@ pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkInd
         index,
     } = open_indexed(&mut source)?;
 
-    let mut chunks: Vec<ChunkInfo> = Vec::with_capacity(index.len());
+    let phase = "indexed keyframe-delta whole-sequence collection";
+    let planned_outer_bytes = index
+        .len()
+        .checked_mul(std::mem::size_of::<ChunkInfo>())
+        .ok_or_else(|| {
+            Error::decoded_state_resource_limit(options.max_decoded_state_bytes, phase, None)
+        })?;
+    crate::stream_reader::check_decoded_state_limit(
+        planned_outer_bytes,
+        options.max_decoded_state_bytes,
+        phase,
+    )?;
+    let mut chunks: Vec<ChunkInfo> = Vec::new();
+    chunks.try_reserve_exact(index.len()).map_err(|error| {
+        Error::ResourceLimit(format!(
+            "decoded-state resource limit during {phase}: could not reserve the validated {}-entry result collection under the configured limit of {} bytes: {error}",
+            index.len(), options.max_decoded_state_bytes
+        ))
+    })?;
     for entry in &index {
+        let retained =
+            decoded_sequence_resident_bytes(&chunks, 0, options.max_decoded_state_bytes, phase)?;
+        let working_limit = options
+            .max_decoded_state_bytes
+            .checked_sub(retained)
+            .ok_or_else(|| {
+                Error::decoded_state_resource_limit(
+                    options.max_decoded_state_bytes,
+                    phase,
+                    Some(retained),
+                )
+            })?;
         let state = compose_chain_inner(
             &mut source,
             &index,
@@ -2884,6 +3359,20 @@ pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkInd
             &quantization,
             &windows,
             Some(header.cutoff),
+            DecodedStateBudget {
+                working: working_limit,
+                configured: options.max_decoded_state_bytes,
+            },
+        )?;
+        let required = retained
+            .checked_add(state_resident_bytes(&state)?)
+            .ok_or_else(|| {
+                Error::decoded_state_resource_limit(options.max_decoded_state_bytes, phase, None)
+            })?;
+        crate::stream_reader::check_decoded_state_limit(
+            required,
+            options.max_decoded_state_bytes,
+            phase,
         )?;
         let (update_count, birth_count, death_count) = if entry.kind != 0 {
             let (_, content) =

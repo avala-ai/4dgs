@@ -100,6 +100,10 @@ fn status_of(error: &Error) -> c_int {
         Error::UnsupportedModel(_) => FOURDGS_STATUS_UNSUPPORTED_CODEC,
         Error::BoundViolation(_) => FOURDGS_STATUS_MALFORMED,
         Error::UnsupportedOperation(_) => FOURDGS_STATUS_UNSUPPORTED_MODE,
+        // The dedicated C status is an additive ABI layer of its own. Until that lands,
+        // preserve the existing public status surface while Rust callers receive the new
+        // ResourceLimit category directly.
+        Error::ResourceLimit(_) => FOURDGS_STATUS_UNSUPPORTED_MODE,
         // Reachable through the encoders: an empty sample sequence, samples that do not
         // tile the timeline, or a GOP-invariant attribute changing inside an update group
         // all arrive here. It is the caller's input that is wrong, not a file.

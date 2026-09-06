@@ -74,5 +74,8 @@ pub use crate::records::{
     Statistics, SummaryOffset, WindowTable,
 };
 pub use crate::serialization::{MAGIC, VERSION};
-pub use crate::stream_reader::{read_bytes, read_from, read_path, ReadOptions, Scene};
+pub use crate::stream_reader::{
+    read_bytes, read_bytes_with_options, read_from, read_path, read_path_with_options, ReadOptions,
+    Scene, DEFAULT_MAX_DECODED_STATE_BYTES,
+};
 pub use crate::writer::{write_path, write_to_vec, SceneExtras, WriteOptions};

@@ -8,6 +8,13 @@ All notable changes to the Rust crate are documented here, following
 
 ### Changed
 
+- **Collecting readers expose a configurable aggregate decoded-state budget.** `ReadOptions` now
+  defaults `max_decoded_state_bytes` to 512 MiB, with options-bearing byte/path reads, `SceneReader`
+  opens, and streamed/indexed keyframe-delta decoders preserving the existing convenience wrappers.
+  Gaussian-birth assembly and every retained or composed keyframe-delta state charge simultaneous
+  decoded state and working storage before allocation or retention. Exhaustion returns
+  `Error::ResourceLimit` with the configured limit and phase; a zero limit is a caller
+  `InvalidInput`, not a file refusal.
 - **Streamed readers and validators refuse defined front matter after state begins.** The
   `late-front-matter-record` diagnostic identifies both the late record's opcode and physical byte
   and the first Chunk or Delta Chunk's opcode and byte, before duplicate or body parsing can mask

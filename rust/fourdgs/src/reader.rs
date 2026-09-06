@@ -74,6 +74,8 @@ pub struct SceneReader<R: Readable> {
     /// per framed track, never samples; this keeps later seeks logarithmic without making
     /// the one-instant pose cache unbounded.
     validated_object_tracks: HashSet<u64>,
+    /// Caller-selected aggregate ceiling for decoded state and load working storage.
+    max_decoded_state_bytes: usize,
 }
 
 /// The front-matter records a caller asked for, once they have been fetched.
@@ -221,11 +223,33 @@ fn indexed_load_base_bytes(
 impl<R: Readable> SceneReader<R> {
     /// Open a scene, using the index when the file has one.
     pub fn open(source: R) -> Result<SceneReader<R>> {
-        SceneReader::open_with(source, OpenMode::Auto)
+        SceneReader::open_with_options(source, &stream_reader::ReadOptions::default())
+    }
+
+    /// Open a scene in automatic mode with caller-selected collection limits.
+    pub fn open_with_options(
+        source: R,
+        options: &stream_reader::ReadOptions,
+    ) -> Result<SceneReader<R>> {
+        SceneReader::open_with_mode_and_options(source, OpenMode::Auto, options)
     }
 
     /// Open a scene on a chosen read path.
-    pub fn open_with(mut source: R, mode: OpenMode) -> Result<SceneReader<R>> {
+    pub fn open_with(source: R, mode: OpenMode) -> Result<SceneReader<R>> {
+        SceneReader::open_with_mode_and_options(
+            source,
+            mode,
+            &stream_reader::ReadOptions::default(),
+        )
+    }
+
+    /// Open a scene on a chosen read path with caller-selected collection limits.
+    pub fn open_with_mode_and_options(
+        mut source: R,
+        mode: OpenMode,
+        options: &stream_reader::ReadOptions,
+    ) -> Result<SceneReader<R>> {
+        stream_reader::validate_decoded_state_limit(options.max_decoded_state_bytes)?;
         let indexed = match mode {
             OpenMode::Sequential => None,
             OpenMode::Indexed => Some(indexed_reader::open_indexed(&mut source)?),
@@ -261,12 +285,10 @@ impl<R: Readable> SceneReader<R> {
                 objects: None,
                 sampled_object_poses: None,
                 validated_object_tracks: HashSet::new(),
+                max_decoded_state_bytes: options.max_decoded_state_bytes,
             });
         }
-        let mut scene = stream_reader::read_from(
-            SequentialSource::new(&mut source),
-            &stream_reader::ReadOptions::default(),
-        )?;
+        let mut scene = stream_reader::read_from(SequentialSource::new(&mut source), options)?;
         // `SceneReader` keeps the streamed front matter beside its resident gaussian
         // state. Move the assembled columns into that one resident slot: cloning them
         // here would silently double every decoded vector after `read_from` had already
@@ -278,13 +300,14 @@ impl<R: Readable> SceneReader<R> {
             indexed: None,
             streamed: Some(scene),
             loaded,
-            loaded_band: 3,
+            loaded_band: options.max_sh_band,
             loaded_key: Some(LoadKey::All),
             records: None,
             provenance_only: None,
             objects: None,
             sampled_object_poses: None,
             validated_object_tracks: HashSet::new(),
+            max_decoded_state_bytes: options.max_decoded_state_bytes,
         })
     }
 
@@ -954,6 +977,12 @@ impl<R: Readable> SceneReader<R> {
             cache_bytes,
             stream_reader::MAX_DECODED_SCENE_BYTES,
         )?;
+        let previous_state_bytes = stream_reader::gaussian_set_resident_bytes(&self.loaded)?;
+        stream_reader::check_decoded_state_limit(
+            previous_state_bytes,
+            self.max_decoded_state_bytes,
+            "indexed gaussian-birth load with the previous state resident",
+        )?;
         let planned_collection_bytes = wanted_count
             .checked_mul(std::mem::size_of::<&rec::ChunkIndexEntry>())
             .and_then(|bytes| {
@@ -965,6 +994,12 @@ impl<R: Readable> SceneReader<R> {
                 Error::UnsupportedOperation("indexed load collection bytes overflow".into())
             })?;
         stream_reader::add_decoded_scene_bytes(base_bytes, planned_collection_bytes)?;
+        stream_reader::checked_decoded_state_add(
+            previous_state_bytes,
+            planned_collection_bytes,
+            self.max_decoded_state_bytes,
+            "indexed gaussian-birth load collection preflight",
+        )?;
 
         let mut wanted = Vec::new();
         wanted.try_reserve_exact(wanted_count).map_err(|error| {
@@ -994,19 +1029,50 @@ impl<R: Readable> SceneReader<R> {
         let load_retained_bytes =
             stream_reader::add_decoded_scene_bytes(base_bytes, collection_bytes)?;
         let mut decoded_bytes = load_retained_bytes;
+        let user_load_base = stream_reader::checked_decoded_state_add(
+            previous_state_bytes,
+            collection_bytes,
+            self.max_decoded_state_bytes,
+            "indexed gaussian-birth load collections",
+        )?;
+        let mut user_decoded_bytes = user_load_base;
         for entry in &wanted {
-            let remaining = stream_reader::MAX_DECODED_SCENE_BYTES
+            let global_remaining = stream_reader::MAX_DECODED_SCENE_BYTES
                 .checked_sub(decoded_bytes)
                 .expect("the retained total was checked after every Chunk");
+            let user_remaining = self
+                .max_decoded_state_bytes
+                .checked_sub(user_decoded_bytes)
+                .ok_or_else(|| {
+                    Error::decoded_state_resource_limit(
+                        self.max_decoded_state_bytes,
+                        "indexed gaussian-birth Chunk decoding",
+                        Some(user_decoded_bytes),
+                    )
+                })?;
             let chunk = indexed_reader::read_chunk_with_limit(
                 &mut self.source,
                 scene,
                 entry,
                 max_sh_band,
-                remaining,
-            )?;
+                global_remaining.min(user_remaining),
+            )
+            .map_err(|error| {
+                stream_reader::decoded_state_operation_error(
+                    error,
+                    self.max_decoded_state_bytes,
+                    "indexed gaussian-birth Chunk decoding",
+                    user_remaining <= global_remaining,
+                )
+            })?;
             let added = stream_reader::decoded_chunk_resident_bytes(&chunk, &chunk.bands)?;
             decoded_bytes = stream_reader::add_decoded_scene_bytes(decoded_bytes, added)?;
+            user_decoded_bytes = stream_reader::checked_decoded_state_add(
+                user_decoded_bytes,
+                added,
+                self.max_decoded_state_bytes,
+                "indexed gaussian-birth Chunk retention",
+            )?;
             chunks.push(chunk);
         }
         let planned_band_collection = wanted_count
@@ -1017,6 +1083,12 @@ impl<R: Readable> SceneReader<R> {
                 Error::UnsupportedOperation("decoded SH-map collection bytes overflow".into())
             })?;
         stream_reader::add_decoded_scene_bytes(decoded_bytes, planned_band_collection)?;
+        stream_reader::checked_decoded_state_add(
+            user_decoded_bytes,
+            planned_band_collection,
+            self.max_decoded_state_bytes,
+            "indexed gaussian-birth SH-map collection preflight",
+        )?;
         let mut bands = Vec::new();
         bands.try_reserve_exact(wanted_count).map_err(|error| {
             Error::UnsupportedOperation(format!(
@@ -1033,12 +1105,23 @@ impl<R: Readable> SceneReader<R> {
             .ok_or_else(|| {
                 Error::UnsupportedOperation("indexed assembly retained bytes overflow".into())
             })?;
-        let replacement = stream_reader::assemble_with_retained(
+        let decoded_assembly_elsewhere = user_load_base
+            .checked_add(reader_vector_bytes(&bands, "decoded SH-map collection")?)
+            .ok_or_else(|| {
+                Error::decoded_state_resource_limit(
+                    self.max_decoded_state_bytes,
+                    "indexed gaussian-birth scene assembly",
+                    None,
+                )
+            })?;
+        let replacement = stream_reader::assemble_with_budgets(
             &chunks,
             &bands,
             &scene.windows,
             &scene.header,
             assembly_elsewhere,
+            decoded_assembly_elsewhere,
+            self.max_decoded_state_bytes,
         )?;
         self.loaded = replacement;
         self.loaded_band = max_sh_band;

@@ -192,6 +192,7 @@ fn bare_message(error: &fourdgs::Error) -> String {
         | Error::UnsupportedModel(m)
         | Error::BoundViolation(m)
         | Error::UnsupportedOperation(m)
+        | Error::ResourceLimit(m)
         | Error::InvalidInput(m) => m.clone(),
         Error::Refused { message, .. } => message.clone(),
         Error::Io(e) => e.to_string(),

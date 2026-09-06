@@ -8,7 +8,7 @@
 
 use std::process::ExitCode;
 
-use fourdgs::keyframe_delta_file::decode_streamed as decode_keyframe_delta_streamed;
+use fourdgs::keyframe_delta_file::decode_streamed_with_options as decode_keyframe_delta_streamed;
 use fourdgs::opcode;
 use fourdgs::records::Header;
 use fourdgs::serialization::{check_magic, Records, MAGIC};
@@ -16,11 +16,14 @@ use fourdgs_conformance::{keyframe_delta_states_json, refusal_json, summarize, E
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("usage: decode_streamed <file.4dgs>");
-        return ExitCode::from(2);
-    }
-    match run(&args[1]) {
+    let (path, options) = match parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    match run(path, &options) {
         Ok(json) => {
             println!("{json}");
             ExitCode::SUCCESS
@@ -31,10 +34,33 @@ fn main() -> ExitCode {
             println!("{}", refusal_json(code));
             ExitCode::SUCCESS
         }
+        Err(Failure::ResourceLimit) => {
+            println!(r#"{{"unsupported":"resource-limit"}}"#);
+            ExitCode::SUCCESS
+        }
         Err(Failure::Message(message)) => {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn parse_args(args: &[String]) -> Result<(&str, fourdgs::ReadOptions), String> {
+    match args {
+        [_, path] => Ok((path, fourdgs::ReadOptions::default())),
+        [_, flag, limit, path] if flag == "--max-decoded-state-bytes" => {
+            let limit = limit.parse::<usize>().map_err(|_| {
+                format!("{flag} expects a positive integer byte count; got {limit:?}")
+            })?;
+            Ok((
+                path,
+                fourdgs::ReadOptions {
+                    max_decoded_state_bytes: limit,
+                    ..Default::default()
+                },
+            ))
+        }
+        _ => Err("usage: decode_streamed [--max-decoded-state-bytes N] <file.4dgs>".into()),
     }
 }
 
@@ -56,7 +82,7 @@ fn temporal_model(path: &str, data: &[u8]) -> Result<Option<String>, Failure> {
     Ok(None)
 }
 
-fn run(path: &str) -> Result<String, Failure> {
+fn run(path: &str, options: &fourdgs::ReadOptions) -> Result<String, Failure> {
     let data = std::fs::read(path).map_err(|e| Failure::Message(format!("{path}: {e}")))?;
 
     if temporal_model(path, &data)?.as_deref() == Some("keyframe-delta") {
@@ -64,13 +90,14 @@ fn run(path: &str) -> Result<String, Failure> {
         // reconstruction — not a whole-population summary — is what the SDKs are diffed on.
         // Truncation recovery is a gaussian-birth check: the states canonical is a
         // different statement and a cut file is a different file.
-        let seq =
-            decode_keyframe_delta_streamed(&data).map_err(|e| Failure::from_error(path, &e))?;
+        let seq = decode_keyframe_delta_streamed(&data, options)
+            .map_err(|e| Failure::from_error(path, &e))?;
         return Ok(keyframe_delta_states_json(&seq));
     }
 
-    let scene = fourdgs::read_bytes(&data).map_err(|e| Failure::from_error(path, &e))?;
-    check_truncation_recovery(&data, &scene)?;
+    let scene = fourdgs::read_bytes_with_options(&data, options)
+        .map_err(|e| Failure::from_error(path, &e))?;
+    check_truncation_recovery(&data, &scene, options)?;
 
     let intervals: Vec<(f64, f64)> = scene.chunk_index.iter().map(|e| (e.t0, e.t1)).collect();
     summarize(
@@ -97,8 +124,12 @@ fn run(path: &str) -> Result<String, Failure> {
 /// Nothing in the corpus is truncated, so this makes one. The canonical JSON cannot express
 /// truncation recovery — a cut file is a different file — so the check lives here, where a
 /// failure exits non-zero and the harness reports it like any other.
-fn check_truncation_recovery(data: &[u8], full: &fourdgs::Scene) -> Result<(), String> {
-    let cut = fourdgs::read_bytes(&data[..data.len() - 1])
+fn check_truncation_recovery(
+    data: &[u8],
+    full: &fourdgs::Scene,
+    options: &fourdgs::ReadOptions,
+) -> Result<(), String> {
+    let cut = fourdgs::read_bytes_with_options(&data[..data.len() - 1], options)
         .map_err(|e| format!("a file cut before its trailing magic did not decode: {e}"))?;
     if !cut.truncated {
         return Err("a file cut before its trailing magic was not reported truncated".into());
@@ -114,7 +145,7 @@ fn check_truncation_recovery(data: &[u8], full: &fourdgs::Scene) -> Result<(), S
     if full.chunk_index.len() >= 2 {
         let last = full.chunk_index.last().expect("at least two entries");
         let at = last.chunk_offset as usize + 5;
-        let mid = fourdgs::read_bytes(&data[..at])
+        let mid = fourdgs::read_bytes_with_options(&data[..at], options)
             .map_err(|e| format!("a file cut inside a chunk record did not decode: {e}"))?;
         if !mid.truncated {
             return Err("a file cut inside a chunk record was not reported truncated".into());

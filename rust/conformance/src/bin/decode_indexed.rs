@@ -8,14 +8,13 @@
 //! with itself across two very different read paths is most of what makes an indexed
 //! implementation trustworthy.
 
-use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use fourdgs::indexed_reader::{
-    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, read_chunk_within,
-    read_objects, IndexedScene, ResidentBudget,
+    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, read_objects,
+    IndexedScene,
 };
-use fourdgs::keyframe_delta_file::decode_indexed as decode_keyframe_delta_indexed;
+use fourdgs::keyframe_delta_file::decode_indexed_with_options as decode_keyframe_delta_indexed;
 use fourdgs::opcode;
 use fourdgs::readable::{FileReadable, Readable};
 use fourdgs::records::{ChunkIndexEntry, Header};
@@ -24,11 +23,14 @@ use fourdgs_conformance::{keyframe_delta_states_json, refusal_json, summarize, E
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("usage: decode_indexed <file.4dgs>");
-        return ExitCode::from(2);
-    }
-    match run(&args[1]) {
+    let (path, options) = match parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    match run(path, &options) {
         Ok(json) => {
             println!("{json}");
             ExitCode::SUCCESS
@@ -39,10 +41,33 @@ fn main() -> ExitCode {
             println!("{}", refusal_json(code));
             ExitCode::SUCCESS
         }
+        Err(Failure::ResourceLimit) => {
+            println!(r#"{{"unsupported":"resource-limit"}}"#);
+            ExitCode::SUCCESS
+        }
         Err(Failure::Message(message)) => {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn parse_args(args: &[String]) -> Result<(&str, fourdgs::ReadOptions), String> {
+    match args {
+        [_, path] => Ok((path, fourdgs::ReadOptions::default())),
+        [_, flag, limit, path] if flag == "--max-decoded-state-bytes" => {
+            let limit = limit.parse::<usize>().map_err(|_| {
+                format!("{flag} expects a positive integer byte count; got {limit:?}")
+            })?;
+            Ok((
+                path,
+                fourdgs::ReadOptions {
+                    max_decoded_state_bytes: limit,
+                    ..Default::default()
+                },
+            ))
+        }
+        _ => Err("usage: decode_indexed [--max-decoded-state-bytes N] <file.4dgs>".into()),
     }
 }
 
@@ -89,14 +114,14 @@ fn temporal_model(path: &str, data: &[u8]) -> Result<Option<String>, Failure> {
     Ok(None)
 }
 
-fn run(path: &str) -> Result<String, Failure> {
+fn run(path: &str, options: &fourdgs::ReadOptions) -> Result<String, Failure> {
     let data = std::fs::read(path).map_err(|e| Failure::Message(format!("{path}: {e}")))?;
     if temporal_model(path, &data)?.as_deref() == Some("keyframe-delta") {
         // The indexed path composes each instant by walking its chain (spec §11.8); its
         // canonical states must match the streamed path's, and the harness diffs it
         // against the same committed expectation the streamed runner is held to.
-        let (seq, _) =
-            decode_keyframe_delta_indexed(&data).map_err(|e| Failure::from_error(path, &e))?;
+        let (seq, _) = decode_keyframe_delta_indexed(&data, options)
+            .map_err(|e| Failure::from_error(path, &e))?;
         return Ok(keyframe_delta_states_json(&seq));
     }
 
@@ -106,17 +131,18 @@ fn run(path: &str) -> Result<String, Failure> {
     };
     let scene = open_indexed(&mut source).map_err(|e| Failure::from_error(path, &e))?;
 
-    // Every chunk stays resident until the scene is assembled, so the ceiling is carried
-    // between the reads rather than reset by each one.
-    let mut budget =
-        ResidentBudget::for_scene(&scene).map_err(|e| Failure::from_error(path, &e))?;
-    let mut chunks = Vec::with_capacity(scene.index.len());
-    for entry in &scene.index {
-        chunks.push(
-            read_chunk_within(&mut source, &scene, entry, 3, &mut budget)
-                .map_err(|e| Failure::from_error(path, &e))?,
-        );
-    }
+    // Exercise the public indexed collector under the injected aggregate budget. The
+    // low-level scene below remains useful for independently checking range reads and
+    // fetching the non-state records excluded from that budget.
+    let mut collecting = fourdgs::SceneReader::open_with_mode_and_options(
+        FileReadable::open(path).map_err(|e| Failure::from_error(path, &e))?,
+        fourdgs::reader::OpenMode::Indexed,
+        options,
+    )
+    .map_err(|e| Failure::from_error(path, &e))?;
+    collecting
+        .load_all(3)
+        .map_err(|e| Failure::from_error(path, &e))?;
     let audio_sources =
         read_audio_sources(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;
     let camera = read_camera(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;
@@ -131,16 +157,10 @@ fn run(path: &str) -> Result<String, Failure> {
     let objects = read_objects(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;
     check_band_skipping(&mut source, &scene)?;
 
-    let bands: Vec<BTreeMap<u8, fourdgs::stream::DecodedStream>> =
-        chunks.iter().map(|c| c.bands.clone()).collect();
-    let gaussians =
-        fourdgs::stream_reader::assemble(&chunks, &bands, &scene.windows, &scene.header)
-            .map_err(|e| Failure::from_error(path, &e))?;
-
     let intervals: Vec<(f64, f64)> = scene.index.iter().map(|e| (e.t0, e.t1)).collect();
     summarize(
         &scene.header,
-        &gaussians,
+        collecting.loaded(),
         &audio_sources,
         &intervals,
         &Extras {
