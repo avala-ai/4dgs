@@ -44,6 +44,7 @@
 library;
 
 export 'src/chunk_decoder.dart';
+export 'src/decoded_state_budget.dart';
 export 'src/exceptions.dart';
 export 'src/indexed_reader.dart';
 export 'src/inspect.dart';

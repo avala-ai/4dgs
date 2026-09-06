@@ -45,6 +45,11 @@ void main() {
 }
 ```
 
+Collecting APIs accept `maxDecodedStateBytes`, a positive integer byte ceiling that defaults to 512
+MiB. It covers decoded gaussian state retained for the result plus simultaneous decode and assembly
+working storage. Exceeding it throws `FourdgsReaderLimit`; increase the option or use the
+incremental indexed APIs when retaining a whole decoded history is not required.
+
 A truncated download is not an error. Records are length-prefixed, so everything complete before the
 cut decodes — and `scene.truncated` says it was cut, which is the part that matters: a decoder that
 quietly returned fewer gaussians would be indistinguishable from one reading a smaller file.

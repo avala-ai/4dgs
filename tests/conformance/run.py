@@ -169,7 +169,7 @@ CANONICAL_STATE_ORDER_FAMILIES = frozenset({"dart", "python", "rust", "typescrip
 # family enters this set only after both of its runners can inject the tiny budget below
 # into the collecting API and report the registered resource result. The shared-contract
 # layer intentionally claims no implementation.
-AGGREGATE_DECODED_BUDGET_FAMILIES: frozenset[str] = frozenset({"python", "rust"})
+AGGREGATE_DECODED_BUDGET_FAMILIES: frozenset[str] = frozenset({"dart", "python", "rust"})
 
 # Optional identity zero-defaults are introduced as a stacked conformance change.  A
 # family enters only after both maintained read paths return the exact logical rows for

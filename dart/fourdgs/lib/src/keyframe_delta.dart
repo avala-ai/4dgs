@@ -34,6 +34,7 @@ import 'dart:typed_data';
 
 import 'chunk_decoder.dart' show maxChunkDecodedBytes;
 import 'decoded_f32.dart';
+import 'decoded_state_budget.dart';
 import 'exceptions.dart';
 import 'opcode.dart';
 import 'quantization.dart';
@@ -168,6 +169,62 @@ class KeyframeDeltaState {
       }
     }
   }
+}
+
+int _decodedStateBytes(KeyframeDeltaState state) {
+  int bytes = state.ids.lengthInBytes;
+  for (final column in state._bins.values) {
+    bytes += column.values.lengthInBytes;
+  }
+  return bytes;
+}
+
+BigInt _streamDecodeWorkingBytes(Uint8List blob) {
+  final cursor = FourdgsCursor(blob);
+  var bytes = BigInt.zero;
+  while (cursor.remaining > 0) {
+    final header = readStreamHeader(cursor);
+    cursor.skip(header.payloadLength);
+    final rows = BigInt.from(header.count);
+    bytes +=
+        rows *
+        BigInt.from(header.channels) *
+        BigInt.from(Int32List.bytesPerElement);
+    if (header.attributeId == attrGaussianId) {
+      // `_idsOf` creates the aligned id lane while the decoded id stream still
+      // exists, so both capacities belong to the pre-allocation peak.
+      bytes += rows * BigInt.from(Int32List.bytesPerElement);
+    }
+  }
+  return bytes;
+}
+
+BigInt _deltaCompositionWorkingBytes(
+  KeyframeDeltaState reference,
+  FourdgsDeltaChunkBody body,
+) {
+  final updateBytes = _streamDecodeWorkingBytes(body.updates);
+  final birthBytes = _streamDecodeWorkingBytes(body.births);
+  final deathBytes = _streamDecodeWorkingBytes(body.deaths);
+  final referenceBytes = BigInt.from(_decodedStateBytes(reference));
+  final referenceBytesPerRow =
+      reference.count == 0
+          ? BigInt.zero
+          : referenceBytes ~/ BigInt.from(reference.count);
+
+  // Composition can hold a filtered/copied state and a grown state at once.
+  // Attribute extensions in update or birth groups are included wholesale so
+  // private/future streams cannot escape a fixed known-lane row estimate.
+  final outputUpperBound =
+      referenceBytes +
+      updateBytes +
+      birthBytes +
+      BigInt.from(body.header.birthCount) * referenceBytesPerRow;
+  return referenceBytes +
+      updateBytes +
+      birthBytes +
+      deathBytes +
+      BigInt.two * outputUpperBound;
 }
 
 /// The state a keyframe chunk states outright, with its identities checked.
@@ -982,7 +1039,16 @@ void _checkDecodedChunkIndexCounts(
 }
 
 /// Front to back: decode each chunk and compose it onto the state it references.
-KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
+///
+/// [maxDecodedStateBytes] bounds all composed states retained for the returned
+/// sequence plus the next decode/composition working set. Exceeding it is a
+/// [FourdgsReaderLimit], because the same legal file can be consumed with a
+/// larger ceiling or through an incremental chain API.
+KeyframeDeltaSequence decodeKeyframeDeltaStreamed(
+  Uint8List data, {
+  int maxDecodedStateBytes = defaultMaxDecodedStateBytes,
+}) {
+  final decodedStateBudget = FourdgsDecodedStateBudget(maxDecodedStateBytes);
   checkMagic(data);
   FourdgsHeader? header;
   FourdgsQuantization? quantization;
@@ -1031,12 +1097,21 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
           );
         }
         final chunk = parseChunk(record.content);
+        decodedStateBudget.checkBigInt(
+          _streamDecodeWorkingBytes(chunk.streams),
+          'streamed keyframe composition at byte ${record.offset}',
+        );
         final state = keyframeDeltaStateFromChunk(
           record.content,
           chunkOffset: record.offset,
           quantization: quantization,
           windows: windows,
           cutoff: header.cutoff,
+        );
+        decodedStateBudget.retain(
+          _decodedStateBytes(state),
+          'streamed keyframe-delta state collection after byte '
+          '${record.offset}',
         );
         final decodedChunk = KeyframeDeltaChunk(
           t0: chunk.header.t0,
@@ -1074,6 +1149,10 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
             '${body.header.referenceOffset}, which is not behind it',
           );
         }
+        decodedStateBudget.checkBigInt(
+          _deltaCompositionWorkingBytes(reference.state, body),
+          'streamed delta composition at byte ${record.offset}',
+        );
         final state = _composeDelta(
           reference.state,
           body,
@@ -1084,6 +1163,11 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
             windows,
             header.cutoff,
           ),
+        );
+        decodedStateBudget.retain(
+          _decodedStateBytes(state),
+          'streamed keyframe-delta state collection after byte '
+          '${record.offset}',
         );
         final decodedChunk = KeyframeDeltaChunk(
           t0: body.header.t0,
@@ -1336,8 +1420,16 @@ KeyframeDeltaState applyKeyframeDeltaBody(
 /// The composed state per chunk is produced by walking that chunk's chain (spec
 /// §11.8) — the seeking client's path — and must reach the same population the
 /// streamed path reaches front to back.
+///
+/// [maxDecodedStateBytes] has the same collecting-result semantics as
+/// [decodeKeyframeDeltaStreamed]; intermediate chain states are released and do
+/// not accrue after each selected state has been composed.
 ({KeyframeDeltaSequence sequence, List<FourdgsChunkIndexEntry> index})
-decodeKeyframeDeltaIndexed(Uint8List data) {
+decodeKeyframeDeltaIndexed(
+  Uint8List data, {
+  int maxDecodedStateBytes = defaultMaxDecodedStateBytes,
+}) {
+  final decodedStateBudget = FourdgsDecodedStateBudget(maxDecodedStateBytes);
   checkMagic(data);
   FourdgsHeader? header;
   FourdgsQuantization? quantization;
@@ -1428,6 +1520,7 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
       entry,
       grids,
       byOffset: byOffset,
+      decodedStateBudget: decodedStateBudget,
     );
     int? updateCount;
     int? birthCount;
@@ -1464,6 +1557,11 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
         deathCount: deathCount,
         state: state,
       ),
+    );
+    decodedStateBudget.retain(
+      _decodedStateBytes(state),
+      'indexed keyframe-delta state collection after byte '
+      '${entry.chunkOffset}',
     );
   }
 
@@ -1605,6 +1703,7 @@ KeyframeDeltaState _composeKeyframeDeltaChain(
   FourdgsChunkIndexEntry entry,
   _Grids grids, {
   Map<int, FourdgsChunkIndexEntry>? byOffset,
+  FourdgsDecodedStateBudget? decodedStateBudget,
 }) {
   final chain = chainFrom(index, entry, byOffset: byOffset);
   KeyframeDeltaState? state;
@@ -1622,11 +1721,18 @@ KeyframeDeltaState _composeKeyframeDeltaChain(
       link,
       referenceLevel: referenceLevel,
       grids: grids,
+      decodedStateBudget: decodedStateBudget,
     );
     state = composed.state;
     referenceLevel = composed.level;
   }
-  return _composed(state);
+  final result = _composed(state);
+  decodedStateBudget?.check(
+    _decodedStateBytes(result),
+    'indexed keyframe-delta state retention after byte '
+    '${entry.chunkOffset}',
+  );
+  return result;
 }
 
 /// The same chain, fetched by byte range instead of from a resident file.
@@ -1724,10 +1830,15 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
   FourdgsChunkIndexEntry link, {
   required int? referenceLevel,
   required _Grids? grids,
+  FourdgsDecodedStateBudget? decodedStateBudget,
 }) {
   if (link.kind == 0) {
     final FourdgsChunkBody body = parseChunk(content);
     _checkKeyframeIndexAgreement(link, body.header);
+    decodedStateBudget?.checkBigInt(
+      _streamDecodeWorkingBytes(body.streams),
+      'indexed keyframe composition at byte ${link.chunkOffset}',
+    );
     final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
     final composed = _keyframeState(decoded.ids, decoded.bins);
     if (grids != null) {
@@ -1764,6 +1875,10 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
       '$referenceLevel; a delta preserves its reference level',
     );
   }
+  decodedStateBudget?.checkBigInt(
+    _deltaCompositionWorkingBytes(state, body),
+    'indexed delta composition at byte ${link.chunkOffset}',
+  );
   final composed = _composeDelta(
     state,
     body,

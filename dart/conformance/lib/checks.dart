@@ -302,12 +302,17 @@ class CountingReadable implements FourdgsReadable {
 /// complete one. Silence is the failure mode that matters — a decoder that
 /// returns fewer gaussians without comment is one a consumer cannot distinguish
 /// from a small file.
-void checkTruncationRecovery(Uint8List data, FourdgsScene whole) {
+void checkTruncationRecovery(
+  Uint8List data,
+  FourdgsScene whole, {
+  int maxDecodedStateBytes = defaultMaxDecodedStateBytes,
+}) {
   // Cut before the trailing magic. Everything the file said is still in it, so
   // nothing may be lost: a reader that needs the trailing magic to finish is a
   // reader that cannot read a file that is still being written.
   final tail = readFourdgsBytes(
     Uint8List.sublistView(data, 0, data.length - 1),
+    maxDecodedStateBytes: maxDecodedStateBytes,
   );
   if (!tail.truncated) {
     throw ConformanceFailure(
@@ -326,6 +331,7 @@ void checkTruncationRecovery(Uint8List data, FourdgsScene whole) {
     final last = whole.chunkIndex.last;
     final mid = readFourdgsBytes(
       Uint8List.sublistView(data, 0, last.chunkOffset + 5),
+      maxDecodedStateBytes: maxDecodedStateBytes,
     );
     if (!mid.truncated) {
       throw ConformanceFailure(
@@ -355,8 +361,9 @@ void checkTruncationRecovery(Uint8List data, FourdgsScene whole) {
 /// is here to catch.
 Future<void> checkBandRangeSkipping(
   CountingReadable source,
-  FourdgsIndexedScene scene,
-) async {
+  FourdgsIndexedScene scene, {
+  FourdgsDecodedStateBudget? decodedStateBudget,
+}) async {
   for (final entry in scene.index) {
     if (entry.bands.isEmpty) continue;
     for (final cap in <int>[
@@ -364,7 +371,13 @@ Future<void> checkBandRangeSkipping(
       ...entry.bands.map((FourdgsBandRange b) => b.band),
     ]) {
       final before = source.bytesRead;
-      await readFourdgsChunk(source, scene, entry, maxShBand: cap);
+      await readFourdgsChunk(
+        source,
+        scene,
+        entry,
+        maxShBand: cap,
+        decodedStateBudget: decodedStateBudget,
+      );
       final moved = source.bytesRead - before;
       int wanted = entry.chunkLength;
       for (final band in entry.bands) {

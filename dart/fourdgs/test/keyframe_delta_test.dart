@@ -53,6 +53,83 @@ Map<String, Object?> _statesIndexed(String b64) =>
     keyframeDeltaStatesJson(decodeKeyframeDeltaIndexed(_bytes(b64)).sequence);
 
 void main() {
+  group('aggregate decoded-state budget', () {
+    final data = _bytes(_movingChained);
+
+    test('collectors expose the one-byte resource result', () {
+      for (final decode in <Object? Function()>[
+        () => decodeKeyframeDeltaStreamed(data, maxDecodedStateBytes: 1),
+        () => decodeKeyframeDeltaIndexed(data, maxDecodedStateBytes: 1),
+      ]) {
+        expect(
+          decode,
+          throwsA(
+            isA<FourdgsReaderLimit>()
+                .having((error) => error.refusalCode, 'refusal', isNull)
+                .having(
+                  (error) => error.message,
+                  'resource',
+                  contains('decoded-state'),
+                )
+                .having((error) => error.message, 'limit', contains('1 byte'))
+                .having(
+                  (error) => error.message,
+                  'phase',
+                  contains('keyframe composition'),
+                ),
+          ),
+        );
+      }
+    });
+
+    test('retained states count against later work', () {
+      for (final entry
+          in <String, Object? Function()>{
+            'delta composition':
+                () => decodeKeyframeDeltaStreamed(
+                  data,
+                  maxDecodedStateBytes: 500,
+                ),
+            'indexed keyframe composition':
+                () =>
+                    decodeKeyframeDeltaIndexed(data, maxDecodedStateBytes: 500),
+          }.entries) {
+        expect(
+          entry.value,
+          throwsA(
+            isA<FourdgsReaderLimit>().having(
+              (error) => error.message,
+              'phase',
+              contains(entry.key),
+            ),
+          ),
+        );
+      }
+    });
+
+    test('limits require positive integers', () {
+      for (final dynamic decode in <dynamic>[
+        decodeKeyframeDeltaStreamed,
+        decodeKeyframeDeltaIndexed,
+      ]) {
+        for (final value in <int>[0, -1]) {
+          expect(
+            // ignore: avoid_dynamic_calls
+            () => decode(data, maxDecodedStateBytes: value),
+            throwsArgumentError,
+          );
+        }
+        for (final value in <Object>[true, 1.5, double.infinity]) {
+          expect(
+            // ignore: avoid_dynamic_calls
+            () => decode(data, maxDecodedStateBytes: value),
+            throwsA(isA<TypeError>()),
+          );
+        }
+      }
+    });
+  });
+
   group('streamed and indexed agree', () {
     for (final entry
         in <String, String>{

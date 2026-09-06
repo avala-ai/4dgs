@@ -28,7 +28,10 @@ String? temporalModel(Uint8List data) {
   return null;
 }
 
-String run(String path) {
+String run(
+  String path, {
+  int maxDecodedStateBytes = defaultMaxDecodedStateBytes,
+}) {
   final data = File(path).readAsBytesSync();
 
   if (temporalModel(data) == 'keyframe-delta') {
@@ -37,13 +40,25 @@ String run(String path) {
     // are diffed on. Truncation recovery is a gaussian-birth check: the states
     // canonical is a different statement and a cut file is a different file.
     return canonical(
-      keyframeDeltaStatesJson(decodeKeyframeDeltaStreamed(data)),
+      keyframeDeltaStatesJson(
+        decodeKeyframeDeltaStreamed(
+          data,
+          maxDecodedStateBytes: maxDecodedStateBytes,
+        ),
+      ),
     );
   }
 
-  final scene = readFourdgsBytes(data);
+  final scene = readFourdgsBytes(
+    data,
+    maxDecodedStateBytes: maxDecodedStateBytes,
+  );
 
-  checkTruncationRecovery(data, scene);
+  checkTruncationRecovery(
+    data,
+    scene,
+    maxDecodedStateBytes: maxDecodedStateBytes,
+  );
 
   return canonical(
     summarize(
@@ -66,12 +81,19 @@ String run(String path) {
 }
 
 void main(List<String> args) {
-  if (args.length != 1) {
-    stderr.writeln('usage: decode_streamed <file.4dgs>');
+  final parsed = _parseArguments(args);
+  if (parsed == null) {
+    stderr.writeln(
+      'usage: decode_streamed [--max-decoded-state-bytes N] <file.4dgs>',
+    );
     exit(2);
   }
   try {
-    stdout.writeln(run(args.single));
+    stdout.writeln(
+      run(parsed.path, maxDecodedStateBytes: parsed.maxDecodedStateBytes),
+    );
+  } on FourdgsReaderLimit {
+    stdout.writeln('{"unsupported":"resource-limit"}');
   } on FourdgsException catch (error) {
     // A refusal is an answer, printed on stdout and exiting 0. Only this
     // library's own exceptions qualify: anything else — a bug in the runner, a
@@ -83,7 +105,7 @@ void main(List<String> args) {
     // check. See [refusalAnswer].
     final String? answer = refusalAnswer(error);
     if (answer == null) {
-      stderr.writeln('${args.single}: $error');
+      stderr.writeln('${parsed.path}: $error');
       exit(1);
     }
     stdout.writeln(answer);
@@ -91,4 +113,20 @@ void main(List<String> args) {
     stderr.writeln(error);
     exit(1);
   }
+}
+
+({String path, int maxDecodedStateBytes})? _parseArguments(List<String> args) {
+  if (args.length == 1) {
+    return (
+      path: args.single,
+      maxDecodedStateBytes: defaultMaxDecodedStateBytes,
+    );
+  }
+  if (args.length != 3 || args.first != '--max-decoded-state-bytes') {
+    return null;
+  }
+  if (!RegExp(r'^[0-9]+$').hasMatch(args[1])) return null;
+  final value = int.tryParse(args[1]);
+  if (value == null || value <= 0) return null;
+  return (path: args[2], maxDecodedStateBytes: value);
 }

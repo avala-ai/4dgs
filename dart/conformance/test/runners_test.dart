@@ -68,6 +68,20 @@ ProcessResult decode(String runner, List<int> bytes) {
   ]);
 }
 
+ProcessResult invoke(String runner, List<String> arguments) {
+  final String script = 'bin/$runner';
+  expect(
+    File(script).existsSync(),
+    isTrue,
+    reason: 'run this from the package root, where $script lives',
+  );
+  return Process.runSync(Platform.resolvedExecutable, <String>[
+    'run',
+    script,
+    ...arguments,
+  ]);
+}
+
 void main() {
   for (final String runner in runners) {
     test('$runner: an error the refusal table cannot name is a failure', () {
@@ -102,6 +116,39 @@ void main() {
         'refused': 'magic-mismatch',
       });
       expect(done.stderr as String, isEmpty);
+    });
+
+    test('$runner: the caller-selected decoded-state limit is exact', () {
+      final input = File(
+        '../../tests/conformance/data/'
+        'OneGaussian-UseChunkIndex-UseCrc.4dgs',
+      );
+      expect(
+        input.existsSync(),
+        isTrue,
+        reason: 'generate the conformance corpus before running this suite',
+      );
+      final done = invoke(runner, <String>[
+        '--max-decoded-state-bytes',
+        '1',
+        input.absolute.path,
+      ]);
+      expect(done.exitCode, 0, reason: done.stderr);
+      expect(done.stdout as String, '{"unsupported":"resource-limit"}\n');
+      expect(done.stderr as String, isEmpty);
+    });
+
+    test('$runner: invalid decoded-state limits are usage errors', () {
+      for (final value in <String>['0', '-1', '1.5', 'inf']) {
+        final done = invoke(runner, <String>[
+          '--max-decoded-state-bytes',
+          value,
+          'unused.4dgs',
+        ]);
+        expect(done.exitCode, 2, reason: '$value: ${done.stderr}');
+        expect(done.stdout as String, isEmpty);
+        expect(done.stderr as String, isNotEmpty);
+      }
     });
   }
 
