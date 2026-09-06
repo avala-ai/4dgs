@@ -16,6 +16,7 @@ committed one. The mutations are the ones that actually happened: the signed zer
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import struct
@@ -40,8 +41,11 @@ import run as conformance_run
 
 # `generate` puts `python/fourdgs` on the path as it imports, which is why this follows it.
 from fourdgs import keyframe_delta_file as kdf
+from fourdgs import opcode as op
+from fourdgs import records as rec
 from fourdgs.model import GaussianSet
 from fourdgs.records import Header
+from fourdgs.serialization import MAGIC, Cursor, crc32, decode_stream, iter_records
 from generator import invalid
 
 #: The expectation the signed zero was found in (#153): two composed values at the noise
@@ -275,6 +279,180 @@ def test_external_late_front_matter_capability_is_explicit_and_requires_refusals
         conformance_run.declared_capabilities(["runner"], 1)
 
 
+def _attribute_streams(blob) -> dict[int, np.ndarray]:
+    cursor = Cursor(blob)
+    streams = {}
+    while cursor.remaining():
+        attribute, values = decode_stream(cursor)
+        streams[attribute] = values
+    return streams
+
+
+def test_optional_identity_witnesses_pin_physical_omission_and_every_transition():
+    generated = {
+        model: (name, data, json.loads(expectation))
+        for model, name, data, expectation in generate.build_optional_identity_corpus()
+    }
+    assert set(generated) == {"gaussian-birth", "keyframe-delta"}
+
+    gaussian_name, gaussian, gaussian_expectation = generated["gaussian-birth"]
+    assert "UseChunkIndex" in gaussian_name
+    gaussian_records = list(iter_records(gaussian, len(MAGIC)))
+    assert not {op.OBJECT_TABLE, op.OBJECT_TRACK} & {record.opcode for record in gaussian_records}
+    chunks = [record for record in gaussian_records if record.opcode == op.CHUNK]
+    assert len(chunks) == 2
+    physical = []
+    physical_maps = []
+    for record in chunks:
+        _head, body = rec.parse_chunk(record.content)
+        streams = _attribute_streams(body)
+        physical_maps.append(streams)
+        physical.append(set(streams) & set(generate.OPTIONAL_IDENTITY_ATTRIBUTES))
+    assert physical == [set(generate.OPTIONAL_IDENTITY_ATTRIBUTES), set()]
+    assert physical_maps[0][op.A_SOURCE_GROUP][:, 0].tolist() == [-(2**31), 2**31 - 1, 0]
+    assert physical_maps[0][op.A_SOURCE_INDEX][:, 0].tolist() == [2**31 - 1, -(2**31), 0]
+    assert physical_maps[0][op.A_OBJECT_ID][:, 0].tolist() == [-(2**31), -1, 0]
+    assert [row["sourceGroup"] for row in gaussian_expectation["identityRows"]] == [
+        str(-(2**31)),
+        str(2**31 - 1),
+        "0",
+        "0",
+        "0",
+    ]
+    assert [row["sourceIndex"] for row in gaussian_expectation["identityRows"]][-3:] == ["0", "0", "0"]
+    assert [row["objectId"] for row in gaussian_expectation["identityRows"]] == [
+        str(2**31),
+        str(2**32 - 1),
+        "0",
+        "0",
+        "0",
+    ]
+    gaussian_indexes = [
+        rec.ChunkIndexEntry.parse(record.content) for record in gaussian_records if record.opcode == op.CHUNK_INDEX
+    ]
+    assert [entry.chunk_offset for entry in gaussian_indexes] == [record.offset for record in chunks]
+    assert [entry.chunk_length for entry in gaussian_indexes] == [9 + len(record.content) for record in chunks]
+
+    kd_name, keyframe_delta, kd_expectation = generated["keyframe-delta"]
+    assert "UseChunkIndex" in kd_name
+    kd_records = list(iter_records(keyframe_delta, len(MAGIC)))
+    assert not {op.OBJECT_TABLE, op.OBJECT_TRACK} & {record.opcode for record in kd_records}
+    state_records = [record for record in kd_records if record.opcode in (op.CHUNK, op.DELTA_CHUNK)]
+    assert [record.opcode for record in state_records] == [
+        op.CHUNK,
+        op.DELTA_CHUNK,
+        op.DELTA_CHUNK,
+        op.DELTA_CHUNK,
+        op.DELTA_CHUNK,
+        op.CHUNK,
+        op.DELTA_CHUNK,
+    ]
+
+    group_presence = []
+    group_maps = []
+    for record in state_records:
+        if record.opcode == op.CHUNK:
+            _head, body = rec.parse_chunk(record.content)
+            keyframe_streams = _attribute_streams(body)
+            group_maps.append((keyframe_streams, {}))
+            group_presence.append((set(keyframe_streams) & set(generate.OPTIONAL_IDENTITY_ATTRIBUTES), set()))
+        else:
+            _head, updates, births, _deaths = rec.parse_delta_chunk(record.content)
+            update_streams = _attribute_streams(updates)
+            birth_streams = _attribute_streams(births)
+            group_maps.append((update_streams, birth_streams))
+            group_presence.append(
+                (
+                    set(update_streams) & set(generate.OPTIONAL_IDENTITY_ATTRIBUTES),
+                    set(birth_streams) & set(generate.OPTIONAL_IDENTITY_ATTRIBUTES),
+                )
+            )
+    identity = set(generate.OPTIONAL_IDENTITY_ATTRIBUTES)
+    assert group_presence == [
+        (set(), set()),  # omitted complete keyframe
+        (identity, set()),  # absent -> present update
+        (set(), set()),  # omitted birth beside present survivor columns
+        (set(), set()),  # omitted update carries reference
+        (identity, set()),  # explicit absolute zero reset
+        (set(), set()),  # new keyframe resets to logical zero
+        (set(), identity),  # absent -> present birth materializes survivor zeros
+    ]
+    assert group_maps[1][0][op.A_SOURCE_GROUP][:, 0].tolist() == [-17]
+    assert group_maps[1][0][op.A_SOURCE_INDEX][:, 0].tolist() == [23]
+    assert group_maps[1][0][op.A_OBJECT_ID][:, 0].tolist() == [-1]
+    assert all(group_maps[4][0][attribute][:, 0].tolist() == [0] for attribute in identity)
+    assert group_maps[6][1][op.A_SOURCE_GROUP][:, 0].tolist() == [2**31 - 1]
+    assert group_maps[6][1][op.A_SOURCE_INDEX][:, 0].tolist() == [-(2**31)]
+    assert group_maps[6][1][op.A_OBJECT_ID][:, 0].tolist() == [-(2**31)]
+
+    states = kd_expectation["identityStates"]
+    assert [row["objectId"] for row in states[1]["rows"]] == [str(2**32 - 1), "0"]
+    assert states[2]["rows"][-1] == {
+        "gaussianId": "30",
+        "objectId": "0",
+        "sourceGroup": "0",
+        "sourceIndex": "0",
+    }
+    assert states[3]["rows"] == states[2]["rows"], "an identity-omitting update must carry every label"
+    assert all(row["sourceGroup"] == row["sourceIndex"] == row["objectId"] == "0" for row in states[4]["rows"])
+    assert states[6]["rows"][-1] == {
+        "gaussianId": "40",
+        "objectId": str(2**31),
+        "sourceGroup": str(2**31 - 1),
+        "sourceIndex": str(-(2**31)),
+    }
+
+    # Every index names the exact physical record and a valid backwards chain. This is
+    # what makes both the streamed and indexed runner paths applicable to the same bytes.
+    indexes = [rec.ChunkIndexEntry.parse(record.content) for record in kd_records if record.opcode == op.CHUNK_INDEX]
+    assert [entry.chunk_offset for entry in indexes] == [record.offset for record in state_records]
+    assert [entry.chunk_length for entry in indexes] == [9 + len(record.content) for record in state_records]
+    for index, entry in enumerate(indexes):
+        if entry.kind == 0:
+            assert entry.depth == 0 and entry.keyframe_offset == entry.chunk_offset
+        else:
+            assert entry.reference_offset == indexes[index - 1].chunk_offset
+            assert entry.reference_offset < entry.chunk_offset
+    footer = rec.Footer.parse(next(record.content for record in kd_records if record.opcode == op.FOOTER))
+    footer_record = next(record for record in kd_records if record.opcode == op.FOOTER)
+    assert crc32(keyframe_delta[footer.summary_start : footer_record.offset]) == footer.summary_crc
+
+
+def test_optional_identity_capability_is_explicit_all_or_none_and_runs_both_read_paths():
+    gaussian = "identity/gaussian-birth/OptionalIdentityGaussianBirth-UseChunkIndex-UseCrc"
+    keyframe = "identity/keyframe-delta/OptionalIdentityKeyframeDelta-UseChunkIndex-UseCrc-UseStatistics"
+    for indexed in (False, True):
+        claimed = dataclasses.replace(_caps(indexed=indexed), optional_identity_defaults=True)
+        unclaimed = _caps(indexed=indexed)
+        declining = dataclasses.replace(claimed, declines=("GaussianBirth", "KeyframeDelta"))
+        assert conformance_run.supports(claimed, gaussian)
+        assert conformance_run.supports(claimed, keyframe)
+        assert not conformance_run.supports(unclaimed, gaussian)
+        assert not conformance_run.supports(unclaimed, keyframe)
+        assert conformance_run.supports(declining, gaussian)
+        assert conformance_run.supports(declining, keyframe)
+
+
+def test_external_optional_identity_capability_is_a_boolean(monkeypatch):
+    declaration = {
+        "protocol": 1,
+        "name": "outside/decode_streamed",
+        "family": "outside",
+        "readPath": "streamed",
+        "optionalIdentityDefaults": True,
+    }
+    monkeypatch.setattr(
+        conformance_run,
+        "invoke",
+        lambda _command, _args, _timeout: conformance_run.Outcome(0, json.dumps(declaration), ""),
+    )
+    assert conformance_run.declared_capabilities(["runner"], 1).optional_identity_defaults
+
+    declaration["optionalIdentityDefaults"] = "yes"
+    with pytest.raises(conformance_run.ProtocolError, match=r"optionalIdentityDefaults.*expected true or false"):
+        conformance_run.declared_capabilities(["runner"], 1)
+
+
 def test_release_manifest_uses_the_same_indexed_exemption_and_temporal_model_registry(tmp_path):
     file_path = tmp_path / "fixture.4dgs"
     expectation_path = tmp_path / "fixture.json"
@@ -293,6 +471,23 @@ def test_release_manifest_uses_the_same_indexed_exemption_and_temporal_model_reg
     assert ordinary["indexed"]
     indexed_delta = pack_corpus.describe("WrongIndexLiveCount", "invalid", str(file_path), str(expectation_path))
     assert indexed_delta["indexed"] and indexed_delta["temporalModel"] == "keyframe-delta"
+
+    identity_gaussian = pack_corpus.describe(
+        "OptionalIdentityGaussianBirth-UseChunkIndex-UseCrc",
+        "identity/gaussian-birth",
+        str(file_path),
+        str(expectation_path),
+    )
+    identity_delta = pack_corpus.describe(
+        "OptionalIdentityKeyframeDelta-UseChunkIndex-UseCrc-UseStatistics",
+        "identity/keyframe-delta",
+        str(file_path),
+        str(expectation_path),
+    )
+    assert identity_gaussian["temporalModel"] == "gaussian-birth"
+    assert identity_delta["temporalModel"] == "keyframe-delta"
+    assert identity_gaussian["requiredCapability"] == "optionalIdentityDefaults"
+    assert identity_delta["requiredCapability"] == "optionalIdentityDefaults"
 
 
 class TestExactAggregateTransition:
@@ -607,6 +802,7 @@ def corpus(tmp_path, monkeypatch):
     monkeypatch.setattr(generate, "INVALID", str(data / "invalid"))
     monkeypatch.setattr(generate, "KEYFRAME", str(data / "keyframe"))
     monkeypatch.setattr(generate, "OBJECT", str(data / "object"))
+    monkeypatch.setattr(generate, "IDENTITY", str(data / "identity"))
     monkeypatch.setattr(generate, "CHECKSUMS", str(data / "CHECKSUMS.txt"))
     assert generate.main([]) == 0
     assert (data / f"{COMPOSED}.json").is_file(), "the fixture the signed-zero tests plant into"

@@ -114,6 +114,35 @@ still decodes in the ordinary invocation under the 512 MiB default. This proves 
 finite aggregate budget and its public result category without a huge fixture; it does not add a
 file to `data/invalid/`, because resource exhaustion says nothing is wrong with the file.
 
+### Optional identity defaults are one capability-gated valid family
+
+`data/identity/` contains two valid, indexed witnesses for spec §§5.18, 6.1, 6.6 and 11.3:
+
+| Witness                                          | Physical fact                                                                                           | Logical result proved                                                                                                                            |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `gaussian-birth/OptionalIdentityGaussianBirth-…` | one Chunk carries ids 11, 12 and 14, including explicit zeros; the next Chunk omits all three           | omitted rows are zero-padded beside exact signed producer labels and same-bit `u32` object ids                                                   |
+| `keyframe-delta/OptionalIdentityKeyframeDelta-…` | seven state records alternate omitted and present identity streams across keyframes, updates and births | complete omission is zero, omitted updates carry, omitted births append zero, present updates replace absolutely, and introduction zero-prefixes |
+
+Both carry `UseChunkIndex`, so a claimed streamed runner and a claimed indexed runner are each
+scored on both temporal models. Their Header attributes include
+`"conformance": "optional-identity-zero-defaults-v1"`; that byte-level marker selects the narrow
+canonical result without asking a runner to infer semantics from a filename. Gaussian-birth emits
+`identityRows`, ordered by position. Keyframe-delta emits `identityStates` at every state-record
+`t0`, with rows ordered by `gaussianId`. Every identity is a decimal string; object ids are the
+logical `u32` values after the signed same-bit stream bridge.
+
+The generator states the expectations directly rather than reading them back through whichever SDK
+happens to be ahead in the stack. Its tests independently parse the Attribute Streams and index, pin
+the present/absent groups and exact values, verify every reference points backward, and verify the
+summary CRC. `generate.py --verify` still runs the builder twice and requires byte-identical
+results.
+
+The capability is `optionalIdentityDefaults`. It is all-or-none: when true, `declines` cannot remove
+one witness or one temporal model. False skips only these valid files. The shared layer leaves
+`OPTIONAL_IDENTITY_DEFAULTS_FAMILIES` empty; one language enters only after both of its maintained
+read paths produce the two exact results. This is the prerequisite for #79's SDK work, not a claim
+that any SDK or Object Track composition already passes.
+
 ### Every rule belongs to version 1
 
 The refusal harness itself was introduced against rules that predated it, rather than being
@@ -275,22 +304,24 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
   "declines": ["Object", "SHDegree3"],
   "exactAggregates": true,
   "canonicalStateOrder": true,
-  "aggregateDecodedBudget": true
+  "aggregateDecodedBudget": true,
+  "optionalIdentityDefaults": true
 }
 ```
 
-| Key                      | Required | Meaning                                                                                                 |
-| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------- |
-| `protocol`               | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
-| `name`                   | yes      | exactly `<family>/decode_<readPath>`; it must agree with `family` and `readPath`                        |
-| `family`                 | no       | defaults to `name` up to the first `/`                                                                  |
-| `readPath`               | yes      | `streamed` or `indexed`. Indexed runners skip path-inapplicable variants                                |
-| `refusals`               | no       | `true` to be scored on the baseline eleven invalid variants; absent means they are skipped              |
-| `lateFrontMatterRecords` | no       | with `refusals: true`, answer all 18 structured late-placement cases; indexed paths stay exempt         |
-| `declines`               | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
-| `exactAggregates`        | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent omits them during the transition  |
-| `canonicalStateOrder`    | no       | `true` makes `states[*].sample` strict; absent omits it during the transition                           |
-| `aggregateDecodedBudget` | no       | `true` opts into the one-byte collecting-API resource gate; absent makes no memory claim                |
+| Key                        | Required | Meaning                                                                                                      |
+| -------------------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `protocol`                 | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                     |
+| `name`                     | yes      | exactly `<family>/decode_<readPath>`; it must agree with `family` and `readPath`                             |
+| `family`                   | no       | defaults to `name` up to the first `/`                                                                       |
+| `readPath`                 | yes      | `streamed` or `indexed`. Indexed runners skip path-inapplicable variants                                     |
+| `refusals`                 | no       | `true` to be scored on the baseline eleven invalid variants; absent means they are skipped                   |
+| `lateFrontMatterRecords`   | no       | with `refusals: true`, answer all 18 structured late-placement cases; indexed paths stay exempt              |
+| `declines`                 | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed      |
+| `exactAggregates`          | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent omits them during the transition       |
+| `canonicalStateOrder`      | no       | `true` makes `states[*].sample` strict; absent omits it during the transition                                |
+| `aggregateDecodedBudget`   | no       | `true` opts into the one-byte collecting-API resource gate; absent makes no memory claim                     |
+| `optionalIdentityDefaults` | no       | `true` answers both temporal models' optional-identity witnesses; absent skips that all-or-none valid family |
 
 Two consequences worth stating, because they are what the built-in tables get wrong for an outsider.
 The runner opts into the invalid corpus itself, so it does not need its family added to
@@ -307,6 +338,10 @@ above it still read `refusals answered`. Nobody would have lied; a feature name 
 collided with a filename, and the score would have overstated what was proved. `REFUSAL_FAMILIES`
 works the same way for the families in this repository, so an outside runner is held to neither more
 nor less than a built-in one.
+
+`optionalIdentityDefaults` is independently all-or-none. It is a valid-family semantic claim rather
+than a refusal, but a `declines` fragment still cannot turn a true declaration into a partial pass.
+Both indexed witnesses are run for either read path, and false skips both.
 
 `lateFrontMatterRecords` is a dependent refinement: declaring it true while `refusals` is false is a
 protocol error. It applies all 18 cases to a streamed runner and none to an indexed runner. The

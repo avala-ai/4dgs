@@ -1,0 +1,148 @@
+{
+  "identityStates": [
+    {
+      "rows": [
+        {
+          "gaussianId": "10",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        },
+        {
+          "gaussianId": "20",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        }
+      ],
+      "t": 0.0
+    },
+    {
+      "rows": [
+        {
+          "gaussianId": "10",
+          "objectId": "4294967295",
+          "sourceGroup": "-17",
+          "sourceIndex": "23"
+        },
+        {
+          "gaussianId": "20",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        }
+      ],
+      "t": 1.0
+    },
+    {
+      "rows": [
+        {
+          "gaussianId": "10",
+          "objectId": "4294967295",
+          "sourceGroup": "-17",
+          "sourceIndex": "23"
+        },
+        {
+          "gaussianId": "20",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        },
+        {
+          "gaussianId": "30",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        }
+      ],
+      "t": 2.0
+    },
+    {
+      "rows": [
+        {
+          "gaussianId": "10",
+          "objectId": "4294967295",
+          "sourceGroup": "-17",
+          "sourceIndex": "23"
+        },
+        {
+          "gaussianId": "20",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        },
+        {
+          "gaussianId": "30",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        }
+      ],
+      "t": 3.0
+    },
+    {
+      "rows": [
+        {
+          "gaussianId": "10",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        },
+        {
+          "gaussianId": "20",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        },
+        {
+          "gaussianId": "30",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        }
+      ],
+      "t": 4.0
+    },
+    {
+      "rows": [
+        {
+          "gaussianId": "10",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        },
+        {
+          "gaussianId": "20",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        }
+      ],
+      "t": 5.0
+    },
+    {
+      "rows": [
+        {
+          "gaussianId": "10",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        },
+        {
+          "gaussianId": "20",
+          "objectId": "0",
+          "sourceGroup": "0",
+          "sourceIndex": "0"
+        },
+        {
+          "gaussianId": "40",
+          "objectId": "2147483648",
+          "sourceGroup": "2147483647",
+          "sourceIndex": "-2147483648"
+        }
+      ],
+      "t": 6.0
+    }
+  ],
+  "temporalModel": "keyframe-delta"
+}
