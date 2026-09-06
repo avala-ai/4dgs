@@ -6,6 +6,14 @@ All notable changes to the Dart package are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **Decoded Chunk Index counts are verified by name.** Streamed and indexed readers now refuse
+  `gaussian_count` or `live_count` values that disagree with a decoded Chunk or composed state as
+  `index-record-mismatch`, including intermediate links in a selected keyframe-delta chain. Range
+  reads remain limited to that chain, and whole-scene streaming uses a finite Chunk ceiling reported
+  as a reader resource limit rather than malformed input.
+
 ### Changed
 
 - **Readers refuse a finite `Quantization.step_time` at or below zero by name.** Both front-to-back

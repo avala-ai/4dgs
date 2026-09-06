@@ -23,12 +23,15 @@ const String refusalUnknownStreamCodec = 'unknown-stream-codec';
 /// A gaussian's window index names a row the Window Table does not have.
 const String refusalWindowIndexOutOfRange = 'window-index-out-of-range';
 
+/// A Chunk Index count disagrees with decoded content it describes.
+const String refusalIndexRecordMismatch = 'index-record-mismatch';
+
 /// Every refusal this reader can name (spec: the refusal table).
 ///
 /// Named constants rather than string literals at the raise sites, because these
 /// are compared across six implementations: a typo in one is a conformance
 /// failure that reads like a decoder bug. This set exists so a test can assert
-/// that a code it saw is one of the seven rather than something invented locally.
+/// that a code it saw is one of the eight rather than something invented locally.
 const Set<String> fourdgsRefusalCodes = <String>{
   refusalMagicMismatch,
   refusalUnsupportedMajorVersion,
@@ -37,6 +40,7 @@ const Set<String> fourdgsRefusalCodes = <String>{
   refusalNonPositiveStepTime,
   refusalUnknownStreamCodec,
   refusalWindowIndexOutOfRange,
+  refusalIndexRecordMismatch,
 };
 
 /// Everything this decoder throws, so a caller can catch the whole family.
@@ -100,6 +104,13 @@ class FourdgsUnsupportedCodec extends FourdgsException {
 /// the file, is what makes the operation possible.
 class FourdgsUnsupportedFeature extends FourdgsException {
   const FourdgsUnsupportedFeature(super.message);
+}
+
+/// A legal file whose scale exceeds a bounded reader operation's stated limit.
+///
+/// This is not malformed input: a reader with a larger limit can consume it.
+class FourdgsReaderLimit extends FourdgsException {
+  const FourdgsReaderLimit(super.message);
 }
 
 /// The framing held but the content did not make sense — a required record

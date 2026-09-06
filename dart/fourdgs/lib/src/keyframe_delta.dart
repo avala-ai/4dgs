@@ -671,6 +671,44 @@ class KeyframeDeltaSequence {
   final List<KeyframeDeltaChunk> chunks;
 }
 
+void _checkDecodedIndexCounts(
+  FourdgsChunkIndexEntry entry,
+  int operations,
+  String operationObservation,
+  int livePopulation,
+) {
+  checkIndexCount(entry, 'gaussian_count', operations, operationObservation);
+  if (entry.extended) {
+    checkIndexCount(
+      entry,
+      'live_count',
+      livePopulation,
+      "the composed state's live population",
+    );
+  }
+}
+
+void _checkDecodedChunkIndexCounts(
+  FourdgsChunkIndexEntry entry,
+  KeyframeDeltaChunk chunk,
+) {
+  if (chunk.kind == 0) {
+    _checkDecodedIndexCounts(
+      entry,
+      chunk.state.count,
+      "the decoded keyframe's validated gaussian row count",
+      chunk.state.count,
+    );
+    return;
+  }
+  _checkDecodedIndexCounts(
+    entry,
+    chunk.updateCount! + chunk.birthCount! + chunk.deathCount!,
+    "the decoded Delta Chunk's validated operation count",
+    chunk.state.count,
+  );
+}
+
 /// Front to back: decode each chunk and compose it onto the state it references.
 KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
   checkMagic(data);
@@ -678,7 +716,7 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
   FourdgsQuantization? quantization;
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
   final chunks = <KeyframeDeltaChunk>[];
-  final byOffset = <int, KeyframeDeltaState>{};
+  final byOffset = <int, KeyframeDeltaChunk>{};
 
   for (final record in iterRecords(data, fourdgsMagic.length)) {
     switch (record.opcode) {
@@ -704,22 +742,21 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
         final chunk = parseChunk(record.content);
         final decoded = _keyframeFromChunk(record.content, at: record.offset);
         final state = _keyframeState(decoded.ids, decoded.bins);
-        byOffset[record.offset] = state;
-        chunks.add(
-          KeyframeDeltaChunk(
-            t0: chunk.header.t0,
-            t1: chunk.header.t1,
-            kind: 0,
-            deltaMode: null,
-            depth: 0,
-            offset: record.offset,
-            referenceOffset: 0,
-            updateCount: null,
-            birthCount: null,
-            deathCount: null,
-            state: state,
-          ),
+        final decodedChunk = KeyframeDeltaChunk(
+          t0: chunk.header.t0,
+          t1: chunk.header.t1,
+          kind: 0,
+          deltaMode: null,
+          depth: 0,
+          offset: record.offset,
+          referenceOffset: 0,
+          updateCount: null,
+          birthCount: null,
+          deathCount: null,
+          state: state,
         );
+        byOffset[record.offset] = decodedChunk;
+        chunks.add(decodedChunk);
       case opDeltaChunk:
         final body = parseDeltaChunk(record.content);
         final reference = byOffset[body.header.referenceOffset];
@@ -736,23 +773,31 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
             '${body.header.referenceOffset}, which is not behind it',
           );
         }
-        final state = _composeDelta(reference, body, at: record.offset);
-        byOffset[record.offset] = state;
-        chunks.add(
-          KeyframeDeltaChunk(
-            t0: body.header.t0,
-            t1: body.header.t1,
-            kind: 1,
-            deltaMode: body.header.deltaMode,
-            depth: body.header.depth,
-            offset: record.offset,
-            referenceOffset: body.header.referenceOffset,
-            updateCount: body.header.updateCount,
-            birthCount: body.header.birthCount,
-            deathCount: body.header.deathCount,
-            state: state,
-          ),
+        final state = _composeDelta(reference.state, body, at: record.offset);
+        final decodedChunk = KeyframeDeltaChunk(
+          t0: body.header.t0,
+          t1: body.header.t1,
+          kind: 1,
+          deltaMode: body.header.deltaMode,
+          depth: body.header.depth,
+          offset: record.offset,
+          referenceOffset: body.header.referenceOffset,
+          updateCount: body.header.updateCount,
+          birthCount: body.header.birthCount,
+          deathCount: body.header.deathCount,
+          state: state,
         );
+        byOffset[record.offset] = decodedChunk;
+        chunks.add(decodedChunk);
+      case opChunkIndex:
+        final entry = FourdgsChunkIndexEntry.parse(
+          record.content,
+          fileOffset: record.offset + recordHeaderBytes,
+        );
+        final decodedChunk = byOffset[entry.chunkOffset];
+        if (decodedChunk != null) {
+          _checkDecodedChunkIndexCounts(entry, decodedChunk);
+        }
     }
   }
 
@@ -989,32 +1034,6 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
       entry,
       byOffset: byOffset,
     );
-    // The index says how many gaussians are live over this interval and the
-    // chunks say what they are, and §5.8 calls that duplication a cheap
-    // corruption check. It is also the only thing standing between a zero-width
-    // entry declaring nothing and a payload composing to something: the index
-    // rule above reads the entry, and the entry is not the file.
-    // Both counts, for a keyframe. §5.8 defines `live_count` for every extended
-    // entry as the population after composition, and the reference writers set
-    // it on keyframes as well — so checking only the field the population rule
-    // happens to select would let a corrupt `liveCount` through on exactly the
-    // entries where the other field agrees.
-    if (entry.kind == 0 && entry.liveCount != state.count) {
-      throw FourdgsMalformedFile(
-        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
-        '${index.length}) declares live_count ${entry.liveCount} for a keyframe '
-        'whose chunk holds ${state.count} gaussians; expected the two to agree',
-      );
-    }
-    final int declared = indexEntryPopulation(entry, isKeyframeDelta: true);
-    if (state.count != declared) {
-      throw FourdgsMalformedFile(
-        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
-        '${index.length}) declares $declared live gaussians over '
-        '[${entry.t0}, ${entry.t1}), but its chain composes to ${state.count}; '
-        'expected the index and the chunks to agree',
-      );
-    }
     int? updateCount;
     int? birthCount;
     int? deathCount;
@@ -1252,10 +1271,14 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
     final FourdgsChunkBody body = parseChunk(content);
     _checkKeyframeIndexAgreement(link, body.header);
     final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
-    return (
-      state: _keyframeState(decoded.ids, decoded.bins),
-      level: body.header.level,
+    final composed = _keyframeState(decoded.ids, decoded.bins);
+    _checkDecodedIndexCounts(
+      link,
+      composed.count,
+      "the decoded keyframe's validated gaussian row count",
+      composed.count,
     );
+    return (state: composed, level: body.header.level);
   }
   if (state == null || referenceLevel == null) {
     throw const FourdgsMalformedFile(
@@ -1271,24 +1294,25 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
       '$referenceLevel; a delta preserves its reference level',
     );
   }
-  return (
-    state: _composeDelta(state, body, at: link.chunkOffset),
-    level: body.header.level,
+  final composed = _composeDelta(state, body, at: link.chunkOffset);
+  _checkDecodedIndexCounts(
+    link,
+    body.header.updateCount + body.header.birthCount + body.header.deathCount,
+    "the decoded Delta Chunk's validated operation count",
+    composed.count,
   );
+  return (state: composed, level: body.header.level);
 }
 
 void _checkKeyframeIndexAgreement(
   FourdgsChunkIndexEntry entry,
   FourdgsChunkHeader chunk,
 ) {
-  if (entry.t0 != chunk.t0 ||
-      entry.t1 != chunk.t1 ||
-      entry.gaussianCount != chunk.count) {
+  if (entry.t0 != chunk.t0 || entry.t1 != chunk.t1) {
     throw FourdgsMalformedFile(
       'the index entry for the keyframe at ${entry.chunkOffset} declares '
-      '[${entry.t0}, ${entry.t1}) and ${entry.gaussianCount} gaussians, but '
-      'the Chunk declares [${chunk.t0}, ${chunk.t1}) and ${chunk.count}; '
-      'duplicated fields must agree',
+      '[${entry.t0}, ${entry.t1}), but the Chunk declares '
+      '[${chunk.t0}, ${chunk.t1}); duplicated fields must agree',
     );
   }
 }
@@ -1305,22 +1329,18 @@ void _checkDeltaIndexAgreement(
       '$deltaModeChained (chained)',
     );
   }
-  final int operations =
-      chunk.updateCount + chunk.birthCount + chunk.deathCount;
   if (entry.t0 != chunk.t0 ||
       entry.t1 != chunk.t1 ||
       entry.deltaMode != chunk.deltaMode ||
       entry.referenceOffset != chunk.referenceOffset ||
       entry.keyframeOffset != chunk.keyframeOffset ||
-      entry.depth != chunk.depth ||
-      entry.gaussianCount != operations) {
+      entry.depth != chunk.depth) {
     throw FourdgsMalformedFile(
       'the index entry for the delta at ${entry.chunkOffset} disagrees with '
       'its Delta Chunk: expected interval [${chunk.t0}, ${chunk.t1}), '
       'delta_mode ${chunk.deltaMode}, reference_offset '
       '${chunk.referenceOffset}, keyframe_offset ${chunk.keyframeOffset}, '
-      'depth ${chunk.depth}, and gaussian_count $operations; duplicated fields '
-      'must agree',
+      'and depth ${chunk.depth}; duplicated fields must agree',
     );
   }
 }

@@ -112,6 +112,13 @@ class FourdgsScene {
   double get durationSec => header.durationSec;
 }
 
+/// Most state Chunks a whole-scene streamed decode retains.
+///
+/// This is a reader resource limit, not a format limit. It bounds both the
+/// decoded populations the returned scene owns and the one-integer-per-Chunk
+/// observations kept until the trailing Chunk Index arrives.
+const int maxStreamedSceneChunks = 262144;
+
 /// Decodes a whole file already in memory.
 ///
 /// [recoverTruncated] keeps whatever was complete before a cut instead of
@@ -133,6 +140,7 @@ FourdgsScene readFourdgsBytes(
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
   final chunks = <FourdgsDecodedChunk>[];
   final chunkCounts = <int>[];
+  final decodedChunkRows = <int, int>{};
   final chunkBands = <Map<int, Uint8List>>[];
   final chunkIndex = <FourdgsChunkIndexEntry>[];
   // Where each entry above came from, kept for the same reason the indexed
@@ -190,22 +198,29 @@ FourdgsScene readFourdgsBytes(
               'a Chunk arrived before the Quantization record',
             );
           }
+          if (chunks.length == maxStreamedSceneChunks) {
+            throw FourdgsReaderLimit(
+              'streamed scene decode stopped after $maxStreamedSceneChunks '
+              "retained Chunks; this is the reader's bounded-memory limit, "
+              'not a malformed-file verdict',
+            );
+          }
           final body = parseChunk(record.content);
-          chunks.add(
-            decodeChunkStreams(
-              body.streams,
-              body.header.count,
-              FourdgsSteps.of(quantization),
-              quantization.posOrigin,
-              windows,
-              cutoff: header?.cutoff ?? fourdgsDefaultCutoff,
-              compression: body.header.compression,
-              chunkOffset: record.offset,
-              streamsOffset:
-                  record.offset + recordHeaderBytes + body.streamsOffset,
-            ),
+          final decoded = decodeChunkStreams(
+            body.streams,
+            body.header.count,
+            FourdgsSteps.of(quantization),
+            quantization.posOrigin,
+            windows,
+            cutoff: header?.cutoff ?? fourdgsDefaultCutoff,
+            compression: body.header.compression,
+            chunkOffset: record.offset,
+            streamsOffset:
+                record.offset + recordHeaderBytes + body.streamsOffset,
           );
+          chunks.add(decoded);
           chunkCounts.add(body.header.count);
+          decodedChunkRows[record.offset] = decoded.count;
           chunkBands.add(<int, Uint8List>{});
         case opShBandStream:
           // Bands belong to the chunk that precedes them — that adjacency is the
@@ -338,12 +353,20 @@ FourdgsScene readFourdgsBytes(
         case opStatistics:
           statistics = FourdgsStatistics.parse(record.content);
         case opChunkIndex:
-          chunkIndex.add(
-            FourdgsChunkIndexEntry.parse(
-              record.content,
-              fileOffset: record.offset + recordHeaderBytes,
-            ),
+          final entry = FourdgsChunkIndexEntry.parse(
+            record.content,
+            fileOffset: record.offset + recordHeaderBytes,
           );
+          final int? observed = decodedChunkRows[entry.chunkOffset];
+          if (observed != null) {
+            checkIndexCount(
+              entry,
+              'gaussian_count',
+              observed,
+              "the decoded Chunk's validated gaussian row count",
+            );
+          }
+          chunkIndex.add(entry);
           chunkIndexRecordOffsets.add(record.offset);
         case opSummaryOffset:
           summaryOffsets.add(FourdgsSummaryOffset.parse(record.content));

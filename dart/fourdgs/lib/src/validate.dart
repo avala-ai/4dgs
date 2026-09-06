@@ -2197,14 +2197,27 @@ Future<void> _checkKeyframeDelta(
           if (entry.kind != 0 ||
               entry.t0 != body.header.t0 ||
               entry.t1 != body.header.t1 ||
-              entry.gaussianCount != body.header.count ||
               entry.deltaMode != 0 ||
               entry.referenceOffset != 0 ||
               entry.keyframeOffset != frame.offset ||
               entry.depth != 0) {
             report.error(
               '$where disagrees with its keyframe Chunk; duplicated interval, '
-              'count, kind, keyframe_offset and depth fields must agree',
+              'kind, keyframe_offset and depth fields must agree',
+            );
+          }
+          checkIndexCount(
+            entry,
+            'gaussian_count',
+            state.count,
+            "the decoded keyframe's validated gaussian row count",
+          );
+          if (entry.extended) {
+            checkIndexCount(
+              entry,
+              'live_count',
+              state.count,
+              "the composed state's live population",
             );
           }
         }
@@ -2279,13 +2292,25 @@ Future<void> _checkKeyframeDelta(
               entry.deltaMode != head.deltaMode ||
               entry.referenceOffset != head.referenceOffset ||
               entry.keyframeOffset != head.keyframeOffset ||
-              entry.depth != head.depth ||
-              entry.gaussianCount != operations) {
+              entry.depth != head.depth) {
             report.error(
               '$where disagrees with its Delta Chunk; duplicated interval, '
-              'kind, delta_mode, reference_offset, keyframe_offset, depth and '
-              'gaussian_count fields must agree (the chunk carries '
-              '$operations update, birth, and death operations)',
+              'kind, delta_mode, reference_offset, keyframe_offset and depth '
+              'fields must agree',
+            );
+          }
+          checkIndexCount(
+            entry,
+            'gaussian_count',
+            operations,
+            "the decoded Delta Chunk's validated operation count",
+          );
+          if (entry.extended) {
+            checkIndexCount(
+              entry,
+              'live_count',
+              state.count,
+              "the composed state's live population",
             );
           }
         }
@@ -2296,23 +2321,6 @@ Future<void> _checkKeyframeDelta(
           'the ${opcodeName(frame.opcode)} record at byte ${frame.offset} is a '
           'state chunk the Chunk Index does not name',
         );
-      }
-      if (entry != null) {
-        if (entry.kind == 0 && entry.liveCount != state.count) {
-          report.error(
-            '$where declares live_count ${entry.liveCount} for a keyframe '
-            'whose chunk holds ${state.count} gaussians; expected the two to '
-            'agree',
-          );
-        }
-        final int declared = indexEntryPopulation(entry, isKeyframeDelta: true);
-        if (state.count != declared) {
-          report.error(
-            '$where declares $declared live gaussians over [${entry.t0}, '
-            '${entry.t1}), but its chain composes to ${state.count}; expected '
-            'the index and the chunks to agree',
-          );
-        }
       }
       state.checkWindows(windows);
       bandOwnerOffset = frame.offset;

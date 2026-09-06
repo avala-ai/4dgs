@@ -849,6 +849,27 @@ void checkIndexEntry(
   );
 }
 
+/// Refuse one decoded Chunk Index count with the cross-SDK diagnostic shape.
+void checkIndexCount(
+  FourdgsChunkIndexEntry entry,
+  String field,
+  int observed,
+  String observation,
+) {
+  final int declared = switch (field) {
+    'gaussian_count' => entry.gaussianCount,
+    'live_count' => entry.liveCount,
+    _ => throw ArgumentError.value(field, 'field', 'not a Chunk Index count'),
+  };
+  if (declared != observed) {
+    throw FourdgsMalformedFile(
+      'the chunk index entry at ${entry.chunkOffset} declares $field '
+      '$declared; $observation is $observed',
+      refusalCode: refusalIndexRecordMismatch,
+    );
+  }
+}
+
 /// Refuses gaussians nothing can ever reach, over an interval of no width.
 ///
 /// The seek rule is half-open, so `t0 == t1` selects nothing at any instant,

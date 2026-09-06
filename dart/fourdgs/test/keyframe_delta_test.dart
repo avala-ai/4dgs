@@ -342,12 +342,19 @@ void main() {
             .having(
               (FourdgsMalformedFile e) => e.message,
               'message',
-              contains('composes to ${last.liveCount}'),
+              contains(
+                "the composed state's live population is ${last.liveCount}",
+              ),
             )
             .having(
               (FourdgsMalformedFile e) => e.message,
               'names what was declared',
-              contains('declares $wrong live gaussians'),
+              contains('declares live_count $wrong'),
+            )
+            .having(
+              (FourdgsMalformedFile e) => e.refusalCode,
+              'refusal',
+              refusalIndexRecordMismatch,
             ),
       ),
     );
@@ -376,11 +383,17 @@ void main() {
     expect(
       () => decodeKeyframeDeltaIndexed(patched),
       throwsA(
-        isA<FourdgsMalformedFile>().having(
-          (FourdgsMalformedFile e) => e.message,
-          'message',
-          contains('live_count ${last.liveCount + 1} for a keyframe'),
-        ),
+        isA<FourdgsMalformedFile>()
+            .having(
+              (FourdgsMalformedFile e) => e.message,
+              'message',
+              contains('declares live_count ${last.liveCount + 1}'),
+            )
+            .having(
+              (FourdgsMalformedFile e) => e.refusalCode,
+              'refusal',
+              refusalIndexRecordMismatch,
+            ),
       ),
     );
   });
