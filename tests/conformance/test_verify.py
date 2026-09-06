@@ -33,6 +33,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "scripts"))
 
 import canonical
+import chunk_window
 import encode_roundtrip
 import generate
 import json_compare
@@ -453,6 +454,136 @@ def test_external_optional_identity_capability_is_a_boolean(monkeypatch):
         conformance_run.declared_capabilities(["runner"], 1)
 
 
+def test_chunk_window_witnesses_pin_both_half_open_gates_and_index_shapes():
+    from fourdgs import opcode as op
+    from fourdgs.records import ChunkIndexEntry, Header, WindowTable, parse_chunk
+    from fourdgs.serialization import MAGIC, iter_records
+
+    witnesses = {
+        name: (data, json.loads(expectation)) for name, data, expectation in generate.build_chunk_window_corpus()
+    }
+    assert set(witnesses) == {
+        "WindowOverhang-NoChunkIndex",
+        "WindowOverhang-UseChunkIndex-UseCrc",
+    }
+
+    for name, (data, expectation) in witnesses.items():
+        records = list(iter_records(data, len(MAGIC)))
+        header = Header.parse(next(record.content for record in records if record.opcode == op.HEADER))
+        windows = WindowTable.parse(next(record.content for record in records if record.opcode == op.WINDOW_TABLE))
+        chunks = [record for record in records if record.opcode == op.CHUNK]
+        indexes = [ChunkIndexEntry.parse(record.content) for record in records if record.opcode == op.CHUNK_INDEX]
+        head, _streams = parse_chunk(chunks[0].content)
+
+        assert header.temporal_model == "gaussian-birth"
+        assert header.attributes == {"conformance": chunk_window.MARKER}
+        assert windows.windows == [(0.0, 3.0)]
+        assert len(chunks) == 1
+        assert (head.t0, head.t1, head.count) == (1.0, 2.0, 1)
+        assert bool(indexes) == ("UseChunkIndex" in name)
+        if indexes:
+            assert len(indexes) == 1
+            assert (indexes[0].t0, indexes[0].t1, indexes[0].gaussian_count) == (1.0, 2.0, 1)
+            assert indexes[0].chunk_offset == chunks[0].offset
+
+        scene = generate.fourdgs.read(data)
+        assert scene.gaussians.win_lo.tolist() == [0.0]
+        assert scene.gaussians.win_hi.tolist() == [3.0]
+        assert np.isposinf(scene.gaussians.sigma_t).tolist() == [True]
+        # Window-only reconstruction returns the row at all four probes. The committed
+        # verdict differs at three of them, so the witness cannot pass without the Chunk gate.
+        assert [scene.gaussians.state_at(t, header.cutoff)["indices"].size for t in chunk_window.PROBE_TIMES] == [
+            1,
+            1,
+            1,
+            1,
+        ]
+        assert expectation["sample"]["winLo"] == [0.0]
+        assert expectation["sample"]["winHi"] == [3.0]
+        assert expectation["states"] == [
+            {"liveCount": "0", "t": 0.5},
+            {"liveCount": "1", "t": 1.5},
+            {"liveCount": "0", "t": 2.0},
+            {"liveCount": "0", "t": 2.5},
+        ]
+
+
+def _chunk_window_caps(*, indexed: bool, claimed: bool, declines=()) -> conformance_run.Capabilities:
+    path = "indexed" if indexed else "streamed"
+    return conformance_run.Capabilities(
+        family="test",
+        name=f"test/decode_{path}",
+        indexed=indexed,
+        refusals=False,
+        declines=declines,
+        gaussian_birth_chunk_window_intersection=claimed,
+    )
+
+
+def test_chunk_window_capability_is_all_or_none_and_preserves_index_applicability():
+    indexed = f"{chunk_window.PREFIX}WindowOverhang-UseChunkIndex-UseCrc"
+    no_index = f"{chunk_window.PREFIX}WindowOverhang-NoChunkIndex"
+
+    assert conformance_run.supports(_chunk_window_caps(indexed=False, claimed=True), indexed)
+    assert conformance_run.supports(_chunk_window_caps(indexed=False, claimed=True), no_index)
+    assert conformance_run.supports(
+        _chunk_window_caps(indexed=False, claimed=True, declines=("WindowOverhang",)), indexed
+    )
+    assert conformance_run.supports(_chunk_window_caps(indexed=True, claimed=True), indexed)
+    assert not conformance_run.supports(_chunk_window_caps(indexed=True, claimed=True), no_index)
+    assert not conformance_run.supports(_chunk_window_caps(indexed=False, claimed=False), indexed)
+    assert not conformance_run.supports(_chunk_window_caps(indexed=False, claimed=False), no_index)
+    assert {indexed, no_index} <= set(conformance_run.variants())
+    assert not conformance_run.GAUSSIAN_BIRTH_CHUNK_WINDOW_INTERSECTION_FAMILIES
+
+
+def test_external_chunk_window_capability_is_boolean_and_defaults_false(monkeypatch):
+    declaration = {
+        "protocol": 1,
+        "name": "outside/decode_streamed",
+        "family": "outside",
+        "readPath": "streamed",
+    }
+
+    def declared():
+        monkeypatch.setattr(
+            conformance_run,
+            "invoke",
+            lambda _command, _args, _timeout: conformance_run.Outcome(0, json.dumps(declaration), ""),
+        )
+        return conformance_run.declared_capabilities(["runner"], 1)
+
+    assert not declared().gaussian_birth_chunk_window_intersection
+    declaration[chunk_window.CAPABILITY] = True
+    assert declared().gaussian_birth_chunk_window_intersection
+    declaration[chunk_window.CAPABILITY] = 1
+    with pytest.raises(conformance_run.ProtocolError, match=rf"{chunk_window.CAPABILITY}.*expected true or false"):
+        declared()
+
+
+def test_chunk_window_query_invocation_and_direct_path_verdict_pairing():
+    variant = f"{chunk_window.PREFIX}WindowOverhang-UseChunkIndex-UseCrc"
+    assert conformance_run.variant_arguments(variant, "/tmp/witness.4dgs") == [
+        "--gaussian-birth-state-times",
+        "[0.5,1.5,2.0,2.5]",
+        "/tmp/witness.4dgs",
+    ]
+    assert conformance_run.variant_arguments("OneGaussian-UseChunkIndex-UseCrc", "/tmp/base.4dgs") == ["/tmp/base.4dgs"]
+
+    streamed = {"states": [{"t": 0.5, "liveCount": "0"}, {"t": 1.5, "liveCount": "1"}]}
+    indexed = {"states": [{"t": 0.5, "liveCount": "0"}, {"t": 1.5, "liveCount": "0"}]}
+    streamed_verdict = conformance_run.chunk_window_verdict(streamed)
+    indexed_verdict = conformance_run.chunk_window_verdict(indexed)
+    results = {
+        ("test", variant, False): streamed_verdict,
+        ("test", variant, True): indexed_verdict,
+    }
+    assert list(conformance_run.chunk_window_path_pairs(results)) == [
+        ("test", variant, streamed_verdict, indexed_verdict)
+    ]
+    assert streamed_verdict != indexed_verdict
+
+
 def test_release_manifest_uses_the_same_indexed_exemption_and_temporal_model_registry(tmp_path):
     file_path = tmp_path / "fixture.4dgs"
     expectation_path = tmp_path / "fixture.json"
@@ -469,6 +600,8 @@ def test_release_manifest_uses_the_same_indexed_exemption_and_temporal_model_reg
 
     ordinary = pack_corpus.describe("BadMagic", "invalid", str(file_path), str(expectation_path))
     assert ordinary["indexed"]
+    assert ordinary["requiredCapability"] is None
+    assert ordinary["runnerArguments"] == []
     indexed_delta = pack_corpus.describe("WrongIndexLiveCount", "invalid", str(file_path), str(expectation_path))
     assert indexed_delta["indexed"] and indexed_delta["temporalModel"] == "keyframe-delta"
 
@@ -488,6 +621,18 @@ def test_release_manifest_uses_the_same_indexed_exemption_and_temporal_model_reg
     assert identity_delta["temporalModel"] == "keyframe-delta"
     assert identity_gaussian["requiredCapability"] == "optionalIdentityDefaults"
     assert identity_delta["requiredCapability"] == "optionalIdentityDefaults"
+
+    chunk_window_entry = pack_corpus.describe(
+        "WindowOverhang-UseChunkIndex-UseCrc",
+        chunk_window.FAMILY,
+        str(file_path),
+        str(expectation_path),
+    )
+    assert chunk_window_entry["family"] == chunk_window.FAMILY
+    assert chunk_window_entry["temporalModel"] == "gaussian-birth"
+    assert chunk_window_entry["indexed"]
+    assert chunk_window_entry["requiredCapability"] == chunk_window.CAPABILITY
+    assert chunk_window_entry["runnerArguments"] == list(chunk_window.runner_arguments())
 
 
 class TestExactAggregateTransition:
@@ -803,6 +948,7 @@ def corpus(tmp_path, monkeypatch):
     monkeypatch.setattr(generate, "KEYFRAME", str(data / "keyframe"))
     monkeypatch.setattr(generate, "OBJECT", str(data / "object"))
     monkeypatch.setattr(generate, "IDENTITY", str(data / "identity"))
+    monkeypatch.setattr(generate, "CHUNK_WINDOW", str(data / chunk_window.FAMILY))
     monkeypatch.setattr(generate, "CHECKSUMS", str(data / "CHECKSUMS.txt"))
     assert generate.main([]) == 0
     assert (data / f"{COMPOSED}.json").is_file(), "the fixture the signed-zero tests plant into"

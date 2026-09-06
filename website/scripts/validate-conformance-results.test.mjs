@@ -27,6 +27,7 @@ function runner(readPath, counts) {
     aggregateDecodedBudget: true,
     lateFrontMatterRecords: true,
     optionalIdentityDefaults: false,
+    gaussianBirthChunkWindowIntersection: true,
     command: `./decode_${readPath}`,
     ...counts,
   };
@@ -84,6 +85,7 @@ test("an honest partial, one-path result is valid", () => {
       aggregateDecodedBudget: false,
       lateFrontMatterRecords: false,
       optionalIdentityDefaults: false,
+      gaussianBirthChunkWindowIntersection: false,
     },
   ];
   assert.equal(validateCatalog(withResults(partial)).results[0].runners[0].passed, 51);
@@ -152,6 +154,11 @@ const invalidCases = [
     "non-boolean optional identity capabilities",
     (value) => (value.results[0].runners[0].optionalIdentityDefaults = 1),
     /optionalIdentityDefaults: expected true or false/,
+  ],
+  [
+    "non-boolean gaussian-birth Chunk/window capabilities",
+    (value) => (value.results[0].runners[0].gaussianBirthChunkWindowIntersection = 1),
+    /gaussianBirthChunkWindowIntersection: expected true or false/,
   ],
   [
     "late front matter without refusal diagnosis",

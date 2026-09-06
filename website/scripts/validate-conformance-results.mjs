@@ -37,6 +37,7 @@ const RUNNER_KEYS = [
   "aggregateDecodedBudget",
   "lateFrontMatterRecords",
   "optionalIdentityDefaults",
+  "gaussianBirthChunkWindowIntersection",
   "command",
   "passed",
   "skipped",
@@ -187,6 +188,10 @@ function validateRunner(runner, path, corpus) {
   assertBoolean(runner.aggregateDecodedBudget, `${path}.aggregateDecodedBudget`);
   assertBoolean(runner.lateFrontMatterRecords, `${path}.lateFrontMatterRecords`);
   assertBoolean(runner.optionalIdentityDefaults, `${path}.optionalIdentityDefaults`);
+  assertBoolean(
+    runner.gaussianBirthChunkWindowIntersection,
+    `${path}.gaussianBirthChunkWindowIntersection`,
+  );
   if (runner.lateFrontMatterRecords && !runner.refusals) {
     fail(`${path}.lateFrontMatterRecords`, "cannot be true when refusals is false");
   }

@@ -143,6 +143,38 @@ one witness or one temporal model. False skips only these valid files. The share
 read paths produce the two exact results. This is the prerequisite for #79's SDK work, not a claim
 that any SDK or Object Track composition already passes.
 
+### Gaussian-birth Chunk/window intersection is an instant-query capability
+
+`data/chunk-window-intersection/` contains one synthetic scene in two transport shapes: an indexed
+file and an otherwise equivalent file without a Chunk Index. Both carry one never-fading gaussian
+whose decoded Window is `[0, 3)` and whose owning Chunk is `[1, 2)`. Four probes isolate the two
+half-open gates:
+
+| Probe | Relation to Chunk and Window    | Expected `liveCount` |
+| ----- | ------------------------------- | -------------------- |
+| `0.5` | inside Window, before Chunk     | `"0"`                |
+| `1.5` | inside both                     | `"1"`                |
+| `2.0` | exactly at exclusive Chunk `t1` | `"0"`                |
+| `2.5` | inside Window, after Chunk      | `"0"`                |
+
+The gaussian has `sigma_t = +inf`, so its marginal is one and cannot explain an absent result. The
+ordinary resident sample keeps `winLo: [0.0]` and `winHi: [3.0]`; only the additive `states` rows
+apply the owning-Chunk gate. This distinguishes correct contribution clipping from rewriting the
+decoded Window fields.
+
+A runner claims `"gaussianBirthChunkWindowIntersection": true`. The harness then invokes it as
+`--gaussian-birth-state-times '[0.5,1.5,2.0,2.5]' <path>` for the complete family. The runner emits
+the ordinary canonical gaussian-birth summary plus the four `states` entries committed beside the
+file. A streamed runner receives both witnesses; an indexed runner receives only the indexed one.
+`declines` cannot remove one witness from a claimed family. When both read paths for one family are
+present, the harness also compares their `(t, liveCount)` verdicts directly. This is the
+within-implementation disagreement #171 exposed and which comparison to a resident-only summary
+could not see.
+
+The Header attribute `conformance=gaussian-birth-chunk-window-intersection-v1` makes the generated
+purpose recoverable from the bytes. It is test metadata, not a format feature or visibility profile.
+Neither witness is invalid, and the shared layer names no SDK family in the capability set.
+
 ### Every rule belongs to version 1
 
 The refusal harness itself was introduced against rules that predated it, rather than being
@@ -248,11 +280,11 @@ is the harness's — `FAMILY_DECLINES`, `REFUSAL_FAMILIES` and the `decode_index
 `run.py`. For a runner outside it, the runner declares it; see the next section.
 
 Ordinary variants invoke every runner the same way: as a subprocess, with a path, printing canonical
-JSON to stdout. The aggregate-budget capability has the one options-bearing probe described above. A
-new language needs one stdout CLI and one line in `RUNNERS`. A language with a build step adds its
-built entry point there; the harness skips a family whose entry point is missing, so a contributor
-who has not built it still gets a clean run, and fails if a family was asked for by name and never
-ran.
+JSON to stdout. The aggregate-budget and gaussian-birth Chunk/window capabilities have the two
+options-bearing invocations described above. A new language needs one stdout CLI and one line in
+`RUNNERS`. A language with a build step adds its built entry point there; the harness skips a family
+whose entry point is missing, so a contributor who has not built it still gets a clean run, and
+fails if a family was asked for by name and never ran.
 
 **A new entry in `RUNNERS` needs the `EXE` suffix if it is compiled.** Windows names an executable
 `decode_streamed.exe`, and the harness finds a runner by testing its path for existence — so a
@@ -282,11 +314,11 @@ The command is split with the quoting rules of the platform the suite is running
 elsewhere, and on Windows the rules `CommandLineToArgvW` applies, which is what every program there
 is actually started under — and, for ordinary corpus comparisons, the variant's file path is
 appended to it. So a runner sees whatever arguments you wrote, then one path, which is the same
-invocation the built-in runners get. The claimed aggregate-budget gate inserts its documented option
-and value before that path. Both `python C:\work\decode.py` and `runner.exe --label="two words"`
-arrive as the two arguments a Windows user means by them, rather than as a mangled path or a
-split-apart option. An unmatched quote or another command-line parse error is a protocol failure
-naming the original `--runner-cmd`, not a traceback from the harness.
+invocation the built-in runners get. The claimed aggregate-budget and Chunk/window gates insert
+their documented options before that path. Both `python C:\work\decode.py` and
+`runner.exe --label="two words"` arrive as the two arguments a Windows user means by them, rather
+than as a mangled path or a split-apart option. An unmatched quote or another command-line parse
+error is a protocol failure naming the original `--runner-cmd`, not a traceback from the harness.
 
 ### The capabilities handshake
 
@@ -305,23 +337,25 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
   "exactAggregates": true,
   "canonicalStateOrder": true,
   "aggregateDecodedBudget": true,
-  "optionalIdentityDefaults": true
+  "optionalIdentityDefaults": true,
+  "gaussianBirthChunkWindowIntersection": true
 }
 ```
 
-| Key                        | Required | Meaning                                                                                                      |
-| -------------------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
-| `protocol`                 | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                     |
-| `name`                     | yes      | exactly `<family>/decode_<readPath>`; it must agree with `family` and `readPath`                             |
-| `family`                   | no       | defaults to `name` up to the first `/`                                                                       |
-| `readPath`                 | yes      | `streamed` or `indexed`. Indexed runners skip path-inapplicable variants                                     |
-| `refusals`                 | no       | `true` to be scored on the baseline eleven invalid variants; absent means they are skipped                   |
-| `lateFrontMatterRecords`   | no       | with `refusals: true`, answer all 18 structured late-placement cases; indexed paths stay exempt              |
-| `declines`                 | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed      |
-| `exactAggregates`          | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent omits them during the transition       |
-| `canonicalStateOrder`      | no       | `true` makes `states[*].sample` strict; absent omits it during the transition                                |
-| `aggregateDecodedBudget`   | no       | `true` opts into the one-byte collecting-API resource gate; absent makes no memory claim                     |
-| `optionalIdentityDefaults` | no       | `true` answers both temporal models' optional-identity witnesses; absent skips that all-or-none valid family |
+| Key                                    | Required | Meaning                                                                                                 |
+| -------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
+| `protocol`                             | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
+| `name`                                 | yes      | exactly `<family>/decode_<readPath>`; it must agree with `family` and `readPath`                        |
+| `family`                               | no       | defaults to `name` up to the first `/`                                                                  |
+| `readPath`                             | yes      | `streamed` or `indexed`. Indexed runners skip path-inapplicable variants                                |
+| `refusals`                             | no       | `true` to be scored on the baseline eleven invalid variants; absent means they are skipped              |
+| `lateFrontMatterRecords`               | no       | with `refusals: true`, answer all 18 structured late-placement cases; indexed paths stay exempt         |
+| `declines`                             | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
+| `exactAggregates`                      | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent omits them during the transition  |
+| `canonicalStateOrder`                  | no       | `true` makes `states[*].sample` strict; absent omits it during the transition                           |
+| `aggregateDecodedBudget`               | no       | `true` opts into the one-byte collecting-API resource gate; absent makes no memory claim                |
+| `optionalIdentityDefaults`             | no       | `true` answers both temporal models' optional-identity witnesses; absent skips that all-or-none family  |
+| `gaussianBirthChunkWindowIntersection` | no       | `true` answers both legal overhang witnesses through the explicit instant-query invocation              |
 
 Two consequences worth stating, because they are what the built-in tables get wrong for an outsider.
 The runner opts into the invalid corpus itself, so it does not need its family added to
@@ -350,7 +384,7 @@ first state record; skipping those indexed invocations records that exemption ra
 missing work.
 
 **A runner that answers nothing fails.** If every valid variant matches a `declines` fragment and
-`refusals` is absent, the run ends `0 passed, 92 skipped, 0 failed` — and exits non-zero, naming the
+`refusals` is absent, the run ends `0 passed, 96 skipped, 0 failed` — and exits non-zero, naming the
 runner:
 
 ```
@@ -500,6 +534,10 @@ cases and the single valid variant that declares no chunk index. A language laye
 landed exact canonical-unit sums and emitted-state ordering still runs those same 147 checks: the
 shared transition omits only `positionSum`/`opacitySum` and `states[*].sample`, while every other
 field remains strict.
+
+The two Chunk/window-intersection witnesses are additional capability-gated skips in this shared
+layer. A claiming streamed runner adds two comparisons; a claiming indexed runner adds one and keeps
+the no-index skip. No built-in family claims them until its own SDK layer lands.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this
