@@ -952,10 +952,11 @@ test("regression: keyframe-delta index metadata is checked without and with deco
     liveReport.findings.some(
       (finding) =>
         finding.message.includes(`declares live_count ${entry.liveCount + 1}`) &&
-        finding.message.includes("composing the state"),
+        finding.message.includes("composed state's live population"),
     ),
     liveReport.findings.map((finding) => finding.message).join("\n"),
   );
+  assert.equal(liveReport.refused?.code, "index-record-mismatch");
 
   const timeline = original.slice();
   new DataView(timeline.buffer, timeline.byteOffset, timeline.byteLength).setFloat64(

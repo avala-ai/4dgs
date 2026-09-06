@@ -67,6 +67,7 @@ import {
   type ParsedDeltaChunk,
   type Quantization,
   bytesEqual,
+  checkIndexCount,
   checkMagic,
   frameDeltaGroups,
   iterateRecords,
@@ -898,13 +899,37 @@ function checkIndexAgreesWithHeader(entry: ChunkIndexEntry, head: DeltaChunkHead
       );
     }
   }
-  const changed = head.updateCount + head.birthCount + head.deathCount;
-  if (entry.gaussianCount !== changed) {
-    throw new MalformedFile(
-      `the Chunk Index entry at offset ${entry.chunkOffset} says gaussian_count=` +
-        `${entry.gaussianCount}, but the Delta Chunk declares ${changed} rows across its groups`,
-    );
+}
+
+/** Verify both count claims after their corresponding content has been decoded. */
+function checkDecodedIndexCounts(
+  entry: ChunkIndexEntry,
+  operations: number,
+  operationObservation: string,
+  livePopulation: number,
+): void {
+  checkIndexCount(entry, "gaussian_count", operations, operationObservation);
+  if (entry.extended) {
+    checkIndexCount(entry, "live_count", livePopulation, "the composed state's live population");
   }
+}
+
+function checkDecodedChunkIndexCounts(entry: ChunkIndexEntry, chunk: KeyframeDeltaChunkInfo): void {
+  if (chunk.kind === 0) {
+    checkDecodedIndexCounts(
+      entry,
+      chunk.state.count,
+      "the decoded keyframe's validated gaussian row count",
+      chunk.state.count,
+    );
+    return;
+  }
+  checkDecodedIndexCounts(
+    entry,
+    chunk.updateCount! + chunk.birthCount! + chunk.deathCount!,
+    "the decoded Delta Chunk's validated operation count",
+    chunk.state.count,
+  );
 }
 
 // --------------------------------------------------------------------------
@@ -949,7 +974,7 @@ export async function decodeKeyframeDeltaStreamed(
   const chunks: KeyframeDeltaChunkInfo[] = [];
   // A chunk's composed state and its `level`; the level is kept so a delta can be refused
   // against a reference at a different level (spec §11.6).
-  const byOffset = new Map<number, { state: KeyframeDeltaState; level: number }>();
+  const byOffset = new Map<number, { chunk: KeyframeDeltaChunkInfo; level: number }>();
   let currentChunk: KeyframeDeltaChunkInfo | null = null;
   let currentBands = new Set<number>();
   let sawFooter = false;
@@ -1008,7 +1033,6 @@ export async function decodeKeyframeDeltaStreamed(
       const parsed = parseChunk(record.content);
       const decoded = await keyframeFromChunk(record.content, codecs);
       const state = keyframeState(decoded.ids, decoded.bins);
-      byOffset.set(record.offset, { state, level: parsed.header.level });
       currentChunk = {
         t0: parsed.header.t0,
         t1: parsed.header.t1,
@@ -1022,6 +1046,7 @@ export async function decodeKeyframeDeltaStreamed(
         deathCount: null,
         state,
       };
+      byOffset.set(record.offset, { chunk: currentChunk, level: parsed.header.level });
       chunks.push(currentChunk);
       currentBands = new Set();
     } else if (record.opcode === Opcode.DeltaChunk) {
@@ -1046,8 +1071,7 @@ export async function decodeKeyframeDeltaStreamed(
         record.offset,
         parsed.header.referenceOffset,
       );
-      const state = await composeDelta(reference.state, parsed, codecs);
-      byOffset.set(record.offset, { state, level: parsed.header.level });
+      const state = await composeDelta(reference.chunk.state, parsed, codecs);
       currentChunk = {
         t0: parsed.header.t0,
         t1: parsed.header.t1,
@@ -1061,6 +1085,7 @@ export async function decodeKeyframeDeltaStreamed(
         deathCount: parsed.header.deathCount,
         state,
       };
+      byOffset.set(record.offset, { chunk: currentChunk, level: parsed.header.level });
       chunks.push(currentChunk);
       currentBands = new Set();
     } else if (record.opcode === Opcode.ShBandStream) {
@@ -1085,6 +1110,10 @@ export async function decodeKeyframeDeltaStreamed(
     } else if (record.opcode === Opcode.Footer) {
       sawFooter = true;
       finishCurrentBands();
+    } else if (record.opcode === Opcode.ChunkIndex) {
+      const entry = parseChunkIndexEntry(record.content);
+      const retained = byOffset.get(entry.chunkOffset);
+      if (retained !== undefined) checkDecodedChunkIndexCounts(entry, retained.chunk);
     }
   }
 
@@ -1134,6 +1163,12 @@ export async function validateKeyframeDeltaStreamed(
   const identities = new Map<
     number,
     { firstT0: number; lastT0: number; count: number; lastOffset: number }
+  >();
+  // Chunk Index records arrive after the state records they describe. Retain only the
+  // two integer observations per bounded interval, never another composed population.
+  const decodedIndexCounts = new Map<
+    number,
+    { readonly operations: number; readonly operationObservation: string; readonly live: number }
   >();
   let largestWindowIndex: { value: number; offset: number } | null = null;
   interface RetainedState {
@@ -1238,6 +1273,11 @@ export async function validateKeyframeDeltaStreamed(
         remember(state, parsed.header, record.offset);
         rememberWindowIndices(state, record.offset);
         rememberInterval(parsed.header, record.offset);
+        decodedIndexCounts.set(record.offset, {
+          operations: state.count,
+          operationObservation: "the decoded keyframe's validated gaussian row count",
+          live: state.count,
+        });
       } else if (record.opcode === Opcode.DeltaChunk) {
         if (header === null) {
           throw new MalformedFile(`delta chunk at ${record.offset} precedes the Header record`);
@@ -1309,6 +1349,22 @@ export async function validateKeyframeDeltaStreamed(
         remember(state, parsed.header, record.offset);
         rememberWindowIndices(state, record.offset);
         rememberInterval(parsed.header, record.offset);
+        decodedIndexCounts.set(record.offset, {
+          operations: groupCount,
+          operationObservation: "the decoded Delta Chunk's validated operation count",
+          live: state.count,
+        });
+      } else if (record.opcode === Opcode.ChunkIndex) {
+        const entry = parseChunkIndexEntry(await scanner.content(record));
+        const observed = decodedIndexCounts.get(entry.chunkOffset);
+        if (observed !== undefined) {
+          checkDecodedIndexCounts(
+            entry,
+            observed.operations,
+            observed.operationObservation,
+            observed.live,
+          );
+        }
       }
     } catch (error) {
       attachValidationRecordOffset(error, record.offset);
@@ -1902,13 +1958,19 @@ async function composeChainFromReader(
       state = keyframeState(decoded.ids, decoded.bins);
       const head = parseChunk(content).header;
       keyframeLevel = head.level;
-      if (link.t0 !== head.t0 || link.t1 !== head.t1 || link.gaussianCount !== state.count) {
+      if (link.t0 !== head.t0 || link.t1 !== head.t1) {
         throw new MalformedFile(
           `the Chunk Index entry at ${link.chunkOffset} declares interval ` +
-            `[${link.t0}, ${link.t1}) and gaussian_count ${link.gaussianCount}; the keyframe ` +
-            `Chunk there declares [${head.t0}, ${head.t1}) and ${state.count}`,
+            `[${link.t0}, ${link.t1}); the keyframe Chunk there declares ` +
+            `[${head.t0}, ${head.t1})`,
         );
       }
+      checkDecodedIndexCounts(
+        link,
+        state.count,
+        "the decoded keyframe's validated gaussian row count",
+        state.count,
+      );
       await attachIndexedShBands(read, link, state, shDegree, state.count, codecs);
     } else {
       if (state === null) {
@@ -1926,6 +1988,12 @@ async function composeChainFromReader(
         parsed.header.referenceOffset,
       );
       state = await composeDelta(state, parsed, codecs);
+      checkDecodedIndexCounts(
+        link,
+        parsed.header.updateCount + parsed.header.birthCount + parsed.header.deathCount,
+        "the decoded Delta Chunk's validated operation count",
+        state.count,
+      );
       await attachIndexedShBands(read, link, state, shDegree, parsed.header.birthCount, codecs);
     }
     checkCompleteSh(state, shDegree, `state chunk at byte ${link.chunkOffset}`);

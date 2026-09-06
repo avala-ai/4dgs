@@ -232,7 +232,13 @@ export { StreamDecoder, type StreamedRecordPart } from "./streamDecoder.js";
 
 export { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";
 
-export { type AudioPayloadChunk, type DecodeOptions, type Scene, decodeScene } from "./scene.js";
+export {
+  MAX_STREAMED_SCENE_CHUNKS,
+  type AudioPayloadChunk,
+  type DecodeOptions,
+  type Scene,
+  decodeScene,
+} from "./scene.js";
 
 export {
   HEAD_PROBE_BYTES,

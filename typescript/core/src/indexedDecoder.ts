@@ -49,6 +49,7 @@ import {
   MAGIC,
   RECORD_HEADER_BYTES,
   bytesEqual,
+  checkIndexCount,
   checkMagic,
   entryCovers,
   iterateRecords,
@@ -835,17 +836,17 @@ export class IndexedDecoder {
       );
     }
     const parsed = parseChunk(record.content);
-    if (parsed.header.count !== entry.gaussianCount) {
-      throw new MalformedFile(
-        `chunk at ${entry.chunkOffset} holds ${parsed.header.count} gaussians, ` +
-          `its index entry says ${entry.gaussianCount}`,
-      );
-    }
     const streamBytes = await chunkStreamBytes(parsed, this.codecs);
     const gaussians = await decodeChunkStreams(
       streamBytes,
       parsed.header.count,
       this.chunkOptions(),
+    );
+    checkIndexCount(
+      entry,
+      "gaussian_count",
+      gaussians.count,
+      "the decoded Chunk's validated gaussian row count",
     );
 
     const bands = new Map<number, Int32Array>();

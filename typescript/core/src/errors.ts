@@ -35,6 +35,8 @@ export const Refusal = {
   UnknownStreamCodec: "unknown-stream-codec",
   /** A gaussian's window index names a row the Window Table does not have. */
   WindowIndexOutOfRange: "window-index-out-of-range",
+  /** A Chunk Index count disagrees with the decoded record or composed state it describes. */
+  IndexRecordMismatch: "index-record-mismatch",
 } as const;
 
 /** One of the identifiers in {@link Refusal}. */

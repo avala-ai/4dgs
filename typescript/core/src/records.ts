@@ -454,6 +454,26 @@ export interface ChunkIndexEntry {
   readonly liveCount: number;
 }
 
+/** A population or operation-count claim duplicated in a Chunk Index entry. */
+export type IndexCountField = "gaussian_count" | "live_count";
+
+/** Refuse an index count that disagrees with content this reader decoded. */
+export function checkIndexCount(
+  entry: ChunkIndexEntry,
+  field: IndexCountField,
+  observed: number,
+  observation: string,
+): void {
+  const declared = field === "gaussian_count" ? entry.gaussianCount : entry.liveCount;
+  if (declared !== observed) {
+    throw new MalformedFile(
+      `the chunk index entry at ${entry.chunkOffset} declares ${field} ${declared}; ` +
+        `${observation} is ${observed}`,
+      { refusalCode: Refusal.IndexRecordMismatch },
+    );
+  }
+}
+
 /**
  * Bytes the `keyframe-delta` block appends to a Chunk Index entry: `u8` kind, `u8`
  * delta_mode, `u64` reference_offset, `u64` keyframe_offset, `u16` depth, `u64`
