@@ -4,7 +4,7 @@
 /// The specification's name for **which** rule a file broke.
 ///
 /// ``FourDGSError`` says what *kind* of thing went wrong; this says which rule, in the same
-/// seven words Python, Rust, TypeScript, C++ and Dart print for the same file. That is the
+/// eight words Python, Rust, TypeScript, C++ and Dart print for the same file. That is the
 /// difference between "both decoders refused it" and "both decoders refused it for the same
 /// reason" — a reader that rejects a bad-magic file because it mis-parsed the version passes
 /// a bare-refusal test and is still wrong.
@@ -33,6 +33,9 @@ public enum RefusalCode: String, Sendable, Equatable, CaseIterable {
 
     /// A gaussian's `window_index` names a row the Window Table does not have.
     case windowIndexOutOfRange = "window-index-out-of-range"
+
+    /// A Chunk Index count disagrees with the state record a reader decoded.
+    case indexRecordMismatch = "index-record-mismatch"
 }
 
 /// Why a file was refused.

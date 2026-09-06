@@ -6,6 +6,11 @@ All notable changes to the Swift package are documented here, following
 
 ## [Unreleased]
 
+### Changed
+
+- Chunk Index count mismatches now cross the Rust core boundary as the named `index-record-mismatch`
+  refusal, including through the Swift conformance runners and CLI.
+
 ## [0.3.0] - 2026-09-05
 
 ### Added

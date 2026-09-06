@@ -309,7 +309,7 @@ func frontMatterSite(_ walk: Walk?, _ code: RefusalCode) -> Site? {
     case .unknownQuantizationScheme, .nonPositiveStepTime:
         opcode = Opcode.quantization
         what = "the Quantization record"
-    case .unknownStreamCodec, .windowIndexOutOfRange:
+    case .unknownStreamCodec, .windowIndexOutOfRange, .indexRecordMismatch:
         return nil
     }
     guard let walk else { return nil }
