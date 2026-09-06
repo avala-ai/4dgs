@@ -48,10 +48,20 @@ export const Refusal = {
 /** One of the identifiers in {@link Refusal}. */
 export type RefusalCode = (typeof Refusal)[keyof typeof Refusal];
 
+/** One top-level record site carried by a structured refusal. */
+export interface RecordSite {
+  readonly opcode: number;
+  readonly at: number;
+}
+
 /** Options every error in this package accepts. */
 export interface FourdgsErrorOptions {
   /** The identifier for a refusal the specification names. See {@link Refusal}. */
   readonly refusalCode?: RefusalCode | undefined;
+  /** The offending record, when the refusal contract names one structurally. */
+  readonly lateRecord?: RecordSite | undefined;
+  /** The state record that established a placement boundary. */
+  readonly firstStateRecord?: RecordSite | undefined;
 }
 
 /**
@@ -73,11 +83,17 @@ export interface FourdgsErrorOptions {
 export class FourdgsError extends Error {
   /** The refusal this is, when the specification names it. */
   readonly refusalCode?: RefusalCode | undefined;
+  /** The offending record for a structured placement refusal. */
+  readonly lateRecord?: RecordSite | undefined;
+  /** The first state record for a structured placement refusal. */
+  readonly firstStateRecord?: RecordSite | undefined;
 
   constructor(message: string, options?: FourdgsErrorOptions) {
     super(message);
     this.name = new.target.name;
     this.refusalCode = options?.refusalCode;
+    this.lateRecord = options?.lateRecord;
+    this.firstStateRecord = options?.firstStateRecord;
   }
 }
 
@@ -115,7 +131,11 @@ export function lateFrontMatterRecord(
       `appears after the first state record, ${opcodeName(firstStateOpcode)} ` +
       `(opcode ${hex(firstStateOpcode)}) at byte ${firstStateOffset}; expected every ` +
       "defined front-matter record before the first Chunk or Delta Chunk",
-    { refusalCode: Refusal.LateFrontMatterRecord },
+    {
+      refusalCode: Refusal.LateFrontMatterRecord,
+      lateRecord: { opcode: lateOpcode, at: lateOffset },
+      firstStateRecord: { opcode: firstStateOpcode, at: firstStateOffset },
+    },
   );
 }
 

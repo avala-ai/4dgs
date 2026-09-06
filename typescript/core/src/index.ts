@@ -31,6 +31,7 @@ export {
   UnsupportedCodec,
   UnsupportedVersion,
   type FourdgsErrorOptions,
+  type RecordSite,
   type RefusalCode,
 } from "./errors.js";
 

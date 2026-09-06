@@ -31,6 +31,7 @@ import {
   audioSourceStateAt,
   crc32,
   type FourdgsError,
+  Refusal,
   ObjectLayer as ObjectLayerClass,
   poseApply,
   poseAt,
@@ -888,6 +889,20 @@ export function canonical(summary: unknown): string {
 export function refusalAnswer(error: FourdgsError): string | null {
   const code = error.refusalCode;
   if (code === undefined) return null;
+  if (code === Refusal.LateFrontMatterRecord) {
+    if (error.firstStateRecord === undefined || error.lateRecord === undefined) return null;
+    return canonical({
+      refused: code,
+      firstStateRecord: {
+        opcode: error.firstStateRecord.opcode,
+        at: String(error.firstStateRecord.at),
+      },
+      lateRecord: {
+        opcode: error.lateRecord.opcode,
+        at: String(error.lateRecord.at),
+      },
+    });
+  }
   return canonical({ refused: code });
 }
 
