@@ -17,6 +17,7 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
+from .decoded_f32 import check_decoded_f32
 from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec, duplicate_structural_record
 from .model import AudioSource, AudioSourceKeyframe, CameraTrajectory, GaussianSet
 from .object_layer import ObjectLayer
@@ -133,11 +134,26 @@ def decode_chunk_blob(
     body.take(1)  # opcode
     body.take(8)  # content length
     head, streams = rec.parse_chunk(body.buf[body.pos :])
-    return decode_streams(chunk_stream_bytes(head, streams), head.count, steps, origin, windows, cutoff)
+    return decode_streams(
+        chunk_stream_bytes(head, streams),
+        head.count,
+        steps,
+        origin,
+        windows,
+        cutoff,
+        record_offset=0,
+    )
 
 
 def decode_streams(
-    streams, count: int, steps: Steps, origin: np.ndarray, windows, cutoff: float = DEFAULT_CUTOFF
+    streams,
+    count: int,
+    steps: Steps,
+    origin: np.ndarray,
+    windows,
+    cutoff: float = DEFAULT_CUTOFF,
+    *,
+    record_offset: int = 0,
 ) -> dict:
     """Decode a chunk's attribute streams.
 
@@ -147,6 +163,10 @@ def decode_streams(
     class of divergence the conformance suite exists to catch, so the signature makes it
     impossible to omit. `cutoff` is required for the same reason, one step further back:
     it sets the support constant the velocity class is derived from.
+
+    ``record_offset`` is the Chunk's opcode byte.  It defaults to zero for callers that
+    supplied an isolated record blob; whole-file readers pass the physical file offset so
+    a derived-value refusal identifies the bytes that produced it.
     """
     cursor = Cursor(streams)
     got: dict[int, np.ndarray] = {}
@@ -212,9 +232,23 @@ def decode_streams(
             "object_id": None,
         }
 
-    never_fades = got[op.A_FLAGS][:, 0] != 0
+    never_fades = (got[op.A_FLAGS][:, 0] & op.FLAG_NEVER_FADES) != 0
     sigma_bins = got[op.A_SIGMA_T][:, 0]
-    sigma = np.where(never_fades, np.inf, np.exp(sigma_bins * steps.sigma_log))
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        sigma = np.where(never_fades, np.inf, np.exp(sigma_bins * steps.sigma_log))
+    check_decoded_f32(
+        sigma,
+        record="Chunk",
+        record_offset=record_offset,
+        row_kind="gaussian-birth",
+        gaussian_ids=None,
+        attribute="sigma_t",
+        components=("value",),
+        detail=lambda row, _component: (
+            f"from stored bin {int(sigma_bins[row])} with step_sigma_log {steps.sigma_log!r}"
+        ),
+        permitted_positive_infinity=never_fades,
+    )
 
     window_index = got[op.A_WINDOW_INDEX][:, 0]
     table = window_table_or_default(windows)
@@ -236,20 +270,120 @@ def decode_streams(
             )
         object_id = codes.astype(np.int32).view(np.uint32)
 
-    return {
-        "positions": dequantize(got[op.A_POSITION], steps.pos, origin),
-        "scales": np.exp(dequantize(got[op.A_SCALE], steps.scale_log)),
-        "rotations": dequantize_rotation(got[op.A_ROTATION_INDEX][:, 0], got[op.A_ROTATION], steps.rot),
-        "colors": np.concatenate(
+    rgb_bins = rct_inverse(got[op.A_COLOR])
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        positions = dequantize(got[op.A_POSITION], steps.pos, origin)
+        scales = np.exp(dequantize(got[op.A_SCALE], steps.scale_log))
+        rotations = dequantize_rotation(got[op.A_ROTATION_INDEX][:, 0], got[op.A_ROTATION], steps.rot)
+        colors = np.concatenate(
             [
-                np.clip(dequantize(rct_inverse(got[op.A_COLOR]), steps.rgb), 0.0, 1.0),
+                np.clip(dequantize(rgb_bins, steps.rgb), 0.0, 1.0),
                 np.clip(dequantize(got[op.A_OPACITY][:, 0], steps.alpha), 0.0, 1.0)[:, None],
             ],
             axis=1,
+        )
+        motions = dequantize(got[op.A_MOTION], motion_step)
+        mu_step = mu_steps(sigma_bins, steps.sigma_log, never_fades, steps.time)
+        mu_t = dequantize(got[op.A_MU_T][:, 0], mu_step)
+
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    check_decoded_f32(
+        positions,
+        record="Chunk",
+        record_offset=record_offset,
+        row_kind="gaussian-birth",
+        gaussian_ids=None,
+        attribute="position",
+        components=("x", "y", "z"),
+        detail=lambda row, component: (
+            f"from stored bin {int(got[op.A_POSITION][row, component])} with step_pos {steps.pos!r} "
+            f"and pos_origin.{('x', 'y', 'z')[component]} {float(origin[component])!r}"
         ),
-        "motions": got[op.A_MOTION].astype(np.float64) * motion_step,
-        "mu_t": got[op.A_MU_T][:, 0].astype(np.float64)
-        * mu_steps(sigma_bins, steps.sigma_log, never_fades, steps.time),
+    )
+    check_decoded_f32(
+        scales,
+        record="Chunk",
+        record_offset=record_offset,
+        row_kind="gaussian-birth",
+        gaussian_ids=None,
+        attribute="scale",
+        components=("x", "y", "z"),
+        detail=lambda row, component: (
+            f"from stored log bin {int(got[op.A_SCALE][row, component])} with step_scale_log {steps.scale_log!r}"
+        ),
+    )
+    check_decoded_f32(
+        rotations,
+        record="Chunk",
+        record_offset=record_offset,
+        row_kind="gaussian-birth",
+        gaussian_ids=None,
+        attribute="rotation",
+        components=("x", "y", "z", "w"),
+        detail=lambda row, _component: (
+            f"from stored rotation_index {int(got[op.A_ROTATION_INDEX][row, 0])} and bins "
+            f"{got[op.A_ROTATION][row].astype(int).tolist()} with step_rot {steps.rot!r}"
+        ),
+    )
+    check_decoded_f32(
+        colors[:, :3],
+        record="Chunk",
+        record_offset=record_offset,
+        row_kind="gaussian-birth",
+        gaussian_ids=None,
+        attribute="color",
+        components=("r", "g", "b"),
+        detail=lambda row, component: (
+            f"from stored (g, r-g, b-g) bins {got[op.A_COLOR][row].astype(int).tolist()}, "
+            f"reconstructed RGB bin {int(rgb_bins[row, component])}, with step_rgb {steps.rgb!r}"
+        ),
+    )
+    check_decoded_f32(
+        colors[:, 3],
+        record="Chunk",
+        record_offset=record_offset,
+        row_kind="gaussian-birth",
+        gaussian_ids=None,
+        attribute="color",
+        components=("a",),
+        detail=lambda row, _component: (
+            f"from stored opacity bin {int(got[op.A_OPACITY][row, 0])} with step_alpha {steps.alpha!r}"
+        ),
+    )
+    check_decoded_f32(
+        motions,
+        record="Chunk",
+        record_offset=record_offset,
+        row_kind="gaussian-birth",
+        gaussian_ids=None,
+        attribute="motion",
+        components=("x", "y", "z"),
+        detail=lambda row, component: (
+            f"from stored bin {int(got[op.A_MOTION][row, component])} with effective step "
+            f"{float(motion_step[row, 0])!r} (step_motion {steps.motion!r})"
+        ),
+    )
+    check_decoded_f32(
+        mu_t,
+        record="Chunk",
+        record_offset=record_offset,
+        row_kind="gaussian-birth",
+        gaussian_ids=None,
+        attribute="mu_t",
+        components=("value",),
+        detail=lambda row, _component: (
+            f"from stored bin {int(got[op.A_MU_T][row, 0])} with effective step {float(mu_step[row])!r} "
+            f"(step_time {steps.time!r})"
+        ),
+    )
+
+    return {
+        "positions": positions,
+        "scales": scales,
+        "rotations": rotations,
+        "colors": colors,
+        "motions": motions,
+        "mu_t": mu_t,
         "sigma_t": sigma,
         "window_index": window_index,
         "source_index": got[op.A_SOURCE_INDEX][:, 0] if op.A_SOURCE_INDEX in got else None,
@@ -419,6 +553,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                     np.asarray(quant.pos_origin),
                     windows,
                     header.cutoff if header else DEFAULT_CUTOFF,
+                    record_offset=record.offset,
                 )
                 chunks.append(decoded)
                 decoded_chunk_rows[record.offset] = len(decoded["positions"])
