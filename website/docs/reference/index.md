@@ -60,7 +60,7 @@ bytes with no per-language slerp or composition order of its own.
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Births and deaths in deltas                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Configurable aggregate decoded-state budget       | Planned | Planned    | Planned | Planned | Planned | Planned |
+| Configurable aggregate decoded-state budget       | Yes    | Planned    | Planned | Planned | Planned | Planned |
 | Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |

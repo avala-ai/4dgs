@@ -15,8 +15,6 @@ from __future__ import annotations
 import os
 import sys
 
-import numpy as np
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "fourdgs"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tests", "conformance"))
@@ -24,6 +22,11 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "tests", "conformance"))
 import fourdgs
 from canonical import canonical, summarize
 from fourdgs import keyframe_delta_file as kdf
+from fourdgs.decoded_budget import (
+    DecodedStateBudget,
+    array_capacity_bytes,
+    gaussian_birth_decode_working_bytes,
+)
 from fourdgs.indexed_reader import (
     open_indexed,
     read_attachments,
@@ -103,7 +106,7 @@ def _check_band_skipping(source, scene) -> None:
                 )
 
 
-def run(path: str) -> str:
+def run(path: str, *, max_decoded_state_bytes: int = fourdgs.DEFAULT_MAX_DECODED_STATE_BYTES) -> str:
     with open(path, "rb") as fh:
         data = fh.read()
 
@@ -112,12 +115,24 @@ def run(path: str) -> str:
         # canonical states must match the streamed path's exactly. Its own runner asserts
         # that agreement — here we emit the indexed decode so the harness diffs it against
         # the same committed expectation the streamed runner is held to.
-        return canonical(kdf.states_json(kdf.decode_indexed(data)[0]))
+        return canonical(kdf.states_json(kdf.decode_indexed(data, max_decoded_state_bytes=max_decoded_state_bytes)[0]))
 
+    budget = DecodedStateBudget(max_decoded_state_bytes)
     with FileReadable(path) as raw:
         source = _Counting(raw)
         scene = open_indexed(source)
-        chunks = [read_chunk(source, scene, entry, max_sh_band=3) for entry in scene.index]
+        chunks = []
+        for entry in scene.index:
+            budget.check(
+                gaussian_birth_decode_working_bytes(entry.gaussian_count, 0),
+                f"indexed Chunk decode at byte {entry.chunk_offset}",
+            )
+            chunk = read_chunk(source, scene, entry, max_sh_band=3)
+            budget.retain(
+                array_capacity_bytes(chunk),
+                f"indexed Chunk collection after byte {entry.chunk_offset}",
+            )
+            chunks.append(chunk)
         audio_sources = read_audio_sources(source, scene)
         camera = read_camera(source, scene)
         metadata = read_metadata(source, scene)
@@ -128,52 +143,17 @@ def run(path: str) -> str:
         objects = read_objects(source, scene)
         _check_band_skipping(source, scene)
 
-    table = np.asarray(scene.windows, dtype=np.float64).reshape(-1, 2) if scene.windows else np.zeros((1, 2))
-    if chunks:
-        idx = np.clip(np.concatenate([c["window_index"] for c in chunks]), 0, max(len(table) - 1, 0))
-        sh = _merge_sh(chunks, scene.header.sh_degree)
-        object_chunks = [chunk.get("object_id") for chunk in chunks]
-        object_id = (
-            np.concatenate(
-                [
-                    np.zeros(len(chunk["mu_t"]), dtype=np.uint32) if ids is None else ids
-                    for chunk, ids in zip(chunks, object_chunks, strict=True)
-                ]
-            )
-            if any(ids is not None for ids in object_chunks)
-            else None
-        )
-        gaussians = fourdgs.GaussianSet(
-            positions=np.concatenate([c["positions"] for c in chunks]).astype(np.float32),
-            scales=np.concatenate([c["scales"] for c in chunks]).astype(np.float32),
-            rotations=np.concatenate([c["rotations"] for c in chunks]).astype(np.float32),
-            colors=np.concatenate([c["colors"] for c in chunks]).astype(np.float32),
-            motions=np.concatenate([c["motions"] for c in chunks]).astype(np.float32),
-            mu_t=np.concatenate([c["mu_t"] for c in chunks]).astype(np.float32),
-            sigma_t=np.concatenate([c["sigma_t"] for c in chunks]).astype(np.float32),
-            # Window Table endpoints are f64 on the wire. Match streamed assembly:
-            # narrowing a large finite endpoint to f32 infinity changes `[lo, hi)`
-            # membership and makes the two read paths reconstruct different states.
-            win_lo=np.asarray(table[idx, 0], dtype=np.float64),
-            win_hi=np.asarray(table[idx, 1], dtype=np.float64),
-            sh=sh,
-            sh_degree=scene.header.sh_degree,
-            object_id=object_id,
-        )
-    else:
-        z3 = np.zeros((0, 3), dtype=np.float32)
-        gaussians = fourdgs.GaussianSet(
-            positions=z3,
-            scales=z3,
-            rotations=np.zeros((0, 4), dtype=np.float32),
-            colors=np.zeros((0, 4), dtype=np.float32),
-            motions=z3,
-            mu_t=np.zeros(0, dtype=np.float32),
-            sigma_t=np.zeros(0, dtype=np.float32),
-            win_lo=np.zeros(0, dtype=np.float64),
-            win_hi=np.zeros(0, dtype=np.float64),
-            sh_degree=scene.header.sh_degree,
-        )
+    # Use the SDK's assembly path so both maintained runners share the same accounting
+    # for the final GaussianSet and its simultaneous concatenation working storage.
+    from fourdgs.stream_reader import _assemble
+
+    gaussians = _assemble(
+        chunks,
+        scene.windows,
+        scene.header,
+        [chunk.get("sh", {}) for chunk in chunks],
+        budget=budget,
+    )
 
     return canonical(
         summarize(
@@ -193,21 +173,30 @@ def run(path: str) -> str:
     )
 
 
-def _merge_sh(chunks, degree: int):
-    """Assemble the scene's coefficients from the bands each chunk read."""
-    from fourdgs.stream_reader import merge_chunk_bands
-
-    if degree == 0:
-        return None
-    return merge_chunk_bands([len(c["mu_t"]) for c in chunks], [c.get("sh", {}) for c in chunks])
-
-
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("usage: decode_indexed.py <file.4dgs>", file=sys.stderr)
+    if len(argv) == 2:
+        path = argv[1]
+        max_decoded_state_bytes = fourdgs.DEFAULT_MAX_DECODED_STATE_BYTES
+    elif len(argv) == 4 and argv[1] == "--max-decoded-state-bytes":
+        path = argv[3]
+        try:
+            max_decoded_state_bytes = int(argv[2])
+        except ValueError:
+            print("--max-decoded-state-bytes must be a positive integer", file=sys.stderr)
+            return 2
+        if max_decoded_state_bytes <= 0:
+            print("--max-decoded-state-bytes must be a positive integer", file=sys.stderr)
+            return 2
+    else:
+        print(
+            "usage: decode_indexed.py [--max-decoded-state-bytes N] <file.4dgs>",
+            file=sys.stderr,
+        )
         return 2
     try:
-        print(run(argv[1]))
+        print(run(path, max_decoded_state_bytes=max_decoded_state_bytes))
+    except fourdgs.ExceedsReaderLimit:
+        print('{"unsupported":"resource-limit"}')
     except fourdgs.FourdgsError as exc:
         # A refusal is a result, not a crash: it goes to stdout and the process exits 0,
         # so the harness diffs it against the expectation like any other answer. An error
@@ -216,7 +205,7 @@ def main(argv: list[str]) -> int:
         # be claiming a valid answer for a failure nobody can check — see `refusal.py`.
         answer = refusal_answer(exc)
         if answer is None:
-            print(f"{argv[1]}: {exc}", file=sys.stderr)
+            print(f"{path}: {exc}", file=sys.stderr)
             return 1
         print(answer)
     return 0

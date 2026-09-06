@@ -111,6 +111,11 @@ class BoundViolation(FourdgsError):
 class ExceedsReaderLimit(FourdgsError):
     """A legal file whose scale is past a ceiling this reader states in advance.
 
+    Collecting readers use this when retained decoded gaussian state and the working
+    storage that produces it would cross ``max_decoded_state_bytes``. It is a resource
+    result, never a malformed-file refusal, because the same bytes work with a larger
+    ceiling or an incremental reader.
+
     Not a fault in the file: it is what a bounded one-pass operation costs. Some questions
     — how many distinct gaussian ids a sequence carries, and whether any of them was reused
     — cannot be answered exactly in one pass without space proportional to the answer, so

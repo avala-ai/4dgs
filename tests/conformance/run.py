@@ -142,7 +142,7 @@ CANONICAL_STATE_ORDER_FAMILIES = frozenset({"dart", "python", "rust", "typescrip
 # family enters this set only after both of its runners can inject the tiny budget below
 # into the collecting API and report the registered resource result. The shared-contract
 # layer intentionally claims no implementation.
-AGGREGATE_DECODED_BUDGET_FAMILIES: frozenset[str] = frozenset()
+AGGREGATE_DECODED_BUDGET_FAMILIES: frozenset[str] = frozenset({"python"})
 
 # The resource gate reuses one tiny valid corpus file. One decoded gaussian cannot fit in
 # one byte under any SDK representation, so the test is independent of allocator overhead

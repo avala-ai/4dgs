@@ -34,6 +34,13 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
+from .decoded_budget import (
+    DEFAULT_MAX_DECODED_STATE_BYTES,
+    DecodedStateBudget,
+    delta_decode_working_bytes,
+    keyframe_decode_working_bytes,
+    state_capacity_bytes,
+)
 from .decoded_f32 import check_decoded_f32
 from .exceptions import (
     ExceedsReaderLimit,
@@ -78,7 +85,13 @@ from .serialization import (
     encode_stream,
     iter_records,
 )
-from .stream_reader import check_index_count, check_sh_codes, check_window_indices, chunk_stream_bytes
+from .stream_reader import (
+    check_index_count,
+    check_sh_codes,
+    check_window_indices,
+    chunk_decoded_body_bytes,
+    chunk_stream_bytes,
+)
 
 #: Matches `tests/conformance/canonical.py`: integers are strings so a 64-bit value
 #: survives a double-backed JSON parser, floats are rounded before comparison, a
@@ -1082,7 +1095,7 @@ def _delta_chunk_groups(content) -> tuple[rec.DeltaChunkHeader, memoryview, memo
     """Parse a Delta Chunk and honour compression on its three-group records block."""
     head, stored = rec.parse_delta_chunk_block(content)
     if head.compression == "":
-        records = bytes(stored)
+        records = stored
         if len(records) != head.uncompressed_size:
             raise MalformedFile(
                 f"delta chunk at t0={head.t0} declares uncompressed_size "
@@ -1109,8 +1122,32 @@ def _delta_chunk_groups(content) -> tuple[rec.DeltaChunkHeader, memoryview, memo
     return head, updates, births, deaths
 
 
-def decode_streamed(data: bytes) -> DecodedSequence:
-    """Front to back: decode each chunk and compose it onto the state it references."""
+def _delta_decoded_body_bytes(content) -> tuple[rec.DeltaChunkHeader, int]:
+    """Validate delta block framing/codec and report owned decompression capacity."""
+    head, stored = rec.parse_delta_chunk_block(content)
+    if head.compression == "":
+        if len(stored) != head.uncompressed_size:
+            raise MalformedFile(
+                f"delta chunk at t0={head.t0} declares uncompressed_size "
+                f"{head.uncompressed_size}; its records block contains {len(stored)} bytes",
+                code="decompressed-size-mismatch",
+            )
+        return head, 0
+    if head.compression not in {"deflate", "zstd"}:
+        raise UnsupportedCodec(
+            f"delta chunk at t0={head.t0} is compressed with {head.compression!r}, which this build does not know",
+            code="unknown-stream-codec",
+        )
+    return head, int(head.uncompressed_size)
+
+
+def decode_streamed(
+    data: bytes,
+    *,
+    max_decoded_state_bytes: int = DEFAULT_MAX_DECODED_STATE_BYTES,
+) -> DecodedSequence:
+    """Collect every streamed state under an aggregate decoded-state budget."""
+    budget = DecodedStateBudget(max_decoded_state_bytes)
     check_magic(data)
     header = quant = None
     windows: list[tuple[float, float]] = []
@@ -1135,6 +1172,14 @@ def decode_streamed(data: bytes) -> DecodedSequence:
         elif record.opcode == op.CHUNK:
             if header is None or quant is None:
                 raise MalformedFile("a keyframe Chunk appears before the Header or Quantization record")
+            head, stored = rec.parse_chunk(record.content)
+            budget.check(
+                keyframe_decode_working_bytes(
+                    head.count,
+                    chunk_decoded_body_bytes(head, stored),
+                ),
+                f"streamed keyframe composition at byte {record.offset}",
+            )
             ids, bins = _keyframe_from_chunk(
                 record.content,
                 _decoded_grids(quant, windows, header.cutoff),
@@ -1150,6 +1195,10 @@ def decode_streamed(data: bytes) -> DecodedSequence:
                 stored_kind="absolute",
                 attributes=_F32_ATTRIBUTES,
             )
+            budget.retain(
+                state_capacity_bytes(state),
+                f"streamed keyframe-delta state collection after byte {record.offset}",
+            )
             by_offset[record.offset] = state
             chunks.append(
                 ChunkInfo(
@@ -1157,7 +1206,7 @@ def decode_streamed(data: bytes) -> DecodedSequence:
                 )
             )
         elif record.opcode == op.DELTA_CHUNK:
-            head_peek = rec.parse_delta_chunk_block(record.content)[0]
+            head_peek, decoded_body_bytes = _delta_decoded_body_bytes(record.content)
             reference = by_offset.get(head_peek.reference_offset)
             if reference is None:
                 raise MalformedFile(
@@ -1170,11 +1219,25 @@ def decode_streamed(data: bytes) -> DecodedSequence:
                     f"delta chunk at {record.offset} references {head_peek.reference_offset}, which is not behind it",
                     code="forward-reference",
                 )
+            budget.check(
+                delta_decode_working_bytes(
+                    reference.count,
+                    head_peek.update_count,
+                    head_peek.birth_count,
+                    head_peek.death_count,
+                    decoded_body_bytes,
+                ),
+                f"streamed delta composition at byte {record.offset}",
+            )
             state, head = _compose_delta(
                 reference,
                 record.content,
                 _decoded_grids(quant, windows, header.cutoff),
                 record_offset=record.offset,
+            )
+            budget.retain(
+                state_capacity_bytes(state),
+                f"streamed keyframe-delta state collection after byte {record.offset}",
             )
             by_offset[record.offset] = state
             chunks.append(
@@ -1277,7 +1340,11 @@ def open_indexed(data: bytes) -> IndexedSequence:
     return IndexedSequence(header=header, quantization=quant, windows=windows, index=index)
 
 
-def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEntry]]:
+def decode_indexed(
+    data: bytes,
+    *,
+    max_decoded_state_bytes: int = DEFAULT_MAX_DECODED_STATE_BYTES,
+) -> tuple[DecodedSequence, list[rec.ChunkIndexEntry]]:
     """Read the Footer, then the index, then compose each chunk by byte range.
 
     The composed state per chunk is produced by walking that chunk's chain (spec §11.8),
@@ -1288,13 +1355,21 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
     and what a caller that wants a verdict must not ask for — `compose_chain` is that
     caller's entry point.
     """
+    budget = DecodedStateBudget(max_decoded_state_bytes)
     opened = open_indexed(data)
     index = opened.index
 
     # Compose each entry by walking its chain, so both read paths are exercised.
     chunks: list[ChunkInfo] = []
     for entry in index:
-        state = compose_chain(data, index, entry, opened.windows, opened.grids)
+        state = compose_chain(
+            data,
+            index,
+            entry,
+            opened.windows,
+            opened.grids,
+            _decoded_budget=budget,
+        )
         update_count = birth_count = death_count = None
         if entry.kind:
             # The counts are not in the index — there `gaussian_count` is their sum — so a
@@ -1316,6 +1391,10 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
                 death_count,
                 state,
             )
+        )
+        budget.retain(
+            state_capacity_bytes(state),
+            f"indexed keyframe-delta state collection after byte {entry.chunk_offset}",
         )
     return DecodedSequence(
         header=opened.header, quantization=opened.quantization, windows=opened.windows, chunks=chunks
@@ -1451,6 +1530,8 @@ def compose_chain(
     entry: rec.ChunkIndexEntry,
     windows: list[tuple[float, float]] | None = None,
     grids: Grids | None = None,
+    *,
+    _decoded_budget: DecodedStateBudget | None = None,
 ) -> State:
     """Compose the chain ending at `entry`, and check the state it produces.
 
@@ -1554,7 +1635,15 @@ def compose_chain(
                 code="index-record-mismatch",
             )
         if link.kind == 0:
-            head = rec.parse_chunk(content)[0]
+            head, stored = rec.parse_chunk(content)
+            if _decoded_budget is not None:
+                _decoded_budget.check(
+                    keyframe_decode_working_bytes(
+                        head.count,
+                        chunk_decoded_body_bytes(head, stored),
+                    ),
+                    f"indexed keyframe composition at byte {link.chunk_offset}",
+                )
             ids, bins = _keyframe_from_chunk(content)
             state = keyframe_state(ids, bins)
             if link.t0 != head.t0 or link.t1 != head.t1:
@@ -1586,6 +1675,19 @@ def compose_chain(
         else:
             if state is None:
                 raise MalformedFile("a chain begins with a delta chunk", code="chain-without-keyframe")
+            head_peek, decoded_body_bytes = _delta_decoded_body_bytes(content)
+            if _decoded_budget is not None:
+                _decoded_budget.check(
+                    state_capacity_bytes(state)
+                    + delta_decode_working_bytes(
+                        state.count,
+                        head_peek.update_count,
+                        head_peek.birth_count,
+                        head_peek.death_count,
+                        decoded_body_bytes,
+                    ),
+                    f"indexed delta composition at byte {link.chunk_offset}",
+                )
             reference_at = composed_at
             composed_at = link.chunk_offset
             state, head = _compose_delta(state, content, grids, record_offset=link.chunk_offset)
@@ -1606,7 +1708,12 @@ def compose_chain(
     if state is None:
         raise MalformedFile("a chain with no chunks in it", code="chain-without-keyframe")
     check_window_indices_of(state, windows)
-    _decode_index_bands(data, entry)
+    _decode_index_bands(data, entry, budget=_decoded_budget, resident_state=state)
+    if _decoded_budget is not None:
+        _decoded_budget.check(
+            state_capacity_bytes(state),
+            f"indexed keyframe-delta state retention after byte {entry.chunk_offset}",
+        )
     return state
 
 
@@ -1614,6 +1721,9 @@ def _decode_index_bands(
     data: bytes,
     entry: rec.ChunkIndexEntry,
     on_band: Callable[[int, int], None] | None = None,
+    *,
+    budget: DecodedStateBudget | None = None,
+    resident_state: State | None = None,
 ) -> None:
     """Decode and discard every SH band the entry declares."""
     state_content = _record_at(data, entry.chunk_offset, entry.chunk_length)
@@ -1648,6 +1758,13 @@ def _decode_index_bands(
             )
         if on_band is not None:
             on_band(declared_band, offset)
+        if budget is not None:
+            channels = 3 * (2 * declared_band + 1)
+            resident = 0 if resident_state is None else state_capacity_bytes(resident_state)
+            budget.check(
+                resident + expected_rows * channels * 40 + int(content_length),
+                f"indexed SH band {declared_band} decode at byte {offset}",
+            )
         attribute, values = decode_stream(band_content)
         if attribute != op.SH_BAND_STREAM:
             raise MalformedFile(

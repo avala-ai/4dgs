@@ -8,6 +8,15 @@ All notable changes to the Python package are documented here, following
 
 ### Changed
 
+- **Collecting readers now have a configurable aggregate decoded-state budget.** `read`,
+  `keyframe_delta_file.decode_streamed` and `decode_indexed` accept the additive
+  `max_decoded_state_bytes` keyword, defaulting to 536,870,912 bytes. They account for retained
+  result arrays together with Chunk decode, state composition, SH and final assembly working storage
+  before allocating or retaining it. Exhaustion raises `ExceedsReaderLimit` with the `decoded-state`
+  resource, configured limit, phase and required bytes rather than treating a legal file as
+  malformed. Python's conformance runners expose the same option and report the portable
+  `resource-limit` result for the injected one-byte probe.
+
 - **Readers refuse decoded binary32 attribute overflow by name.** Gaussian-birth and keyframe-delta
   decoding now completes each floating reconstruction in binary64 and returns `decoded-f32-overflow`
   before a NaN, infinity or out-of-range result can narrow into state. Diagnostics identify the
