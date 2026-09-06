@@ -47,7 +47,8 @@ changelog from the package root, so a file beside the package would not be publi
    the source of truth.
 4. The feature matrix reflects what this version actually implements.
 5. Tag and push. The release workflow builds, verifies the version-vs-tag assertion, publishes via
-   trusted publishing (no long-lived tokens), and creates the GitHub Release.
+   trusted publishing (no long-lived tokens), and creates the GitHub Release. A Rust release also
+   builds and smoke-tests the Apple core described below before the crate can publish.
 6. Add the line to the release log in [CHANGELOG.md](CHANGELOG.md).
 
 ## Every release gets a GitHub Release
@@ -63,17 +64,38 @@ there is nothing for the two to disagree about.
 | Name       | `fourdgs (Python) 0.1.0`, `fourdgs (Rust) 0.1.0`, `fourdgs (Swift) 0.1.0`, `@4dgs/core 0.1.0`  |
 | Body       | `## What's changed`, that version's changelog section, then the install line and registry link |
 | Prerelease | set while the major version is `0`, because the wire format may still change                   |
-| Assets     | none — the artifact of record is on the registry, published with its provenance attestation    |
+| Assets     | none for registry-only packages; Rust attaches its checksummed Apple core XCFramework          |
 
 **A missing changelog section fails the release.** `scripts/changelog_section.py` runs before the
 build, so a version nobody wrote notes for never reaches a registry; a release with an empty body is
 the drift this rule exists to prevent, and it is easier to refuse the tag than to fix it afterwards.
 
+### The Apple Rust core
+
+Every Rust release builds `fourdgs-core-apple-X.Y.Z.xcframework.zip` from the crate at that tag and
+attaches it, with its `.sha256`, to the Rust GitHub Release. It contains static libraries for macOS
+(arm64 and x86_64), iOS devices and simulators, and visionOS devices and simulators. The release job
+imports the C header through a `CFourDGS` module, links it against each supported Apple SDK, and
+runs a throwaway SwiftPM executable against the macOS slice before the crate is allowed to publish;
+merely producing an XCFramework is not enough.
+
+The checksum is the value SwiftPM's `binaryTarget` requires. Build the exact release artifact before
+tagging with:
+
+```sh
+scripts/build_apple_xcframework.sh X.Y.Z dist
+```
+
+This is a release asset because no Apple binary registry is involved. It needs neither an Apple
+signing identity nor a stored secret: the framework contains a static library, and the release job's
+existing `contents: write` permission attaches it after crates.io's OIDC-authenticated publish.
+
 ## The conformance corpus
 
 The corpus is released like a package and is not one. It publishes to no registry, so the release
-_is_ the publication and the assets on it are the artifact of record — the one job here that
-attaches anything, for exactly the reason the others attach nothing.
+_is_ the publication and the assets on it are the artifact of record. The Rust release's Apple
+compatibility binary is the only other attached asset; registry packages otherwise use the registry
+copy as their artifact of record.
 
 | Field      | Value                                                                                            |
 | ---------- | ------------------------------------------------------------------------------------------------ |
@@ -159,14 +181,12 @@ shape one consumer's package manager can see. So:
 - Never cut a bare tag for anything other than Swift. A second consumer of the bare namespace would
   make both ambiguous, and the ambiguity would be permanent — a published tag is not retractable.
 
-**Linking, which is not solved.** The package is a binding, so it needs the core's staticlib on the
-linker's search path — today that is `-Xlinker -L…` on the command line, deliberately not an
-`unsafeFlags` entry in `Package.swift`, because that would make the package undependable as a
-versioned dependency. A consumer who resolves the package from its URL has no `target/release` and
-nothing to point `-L` at, so **the package resolves and does not link out of tree**; `Package.swift`
-emits a warning naming exactly that when it finds no built core. The fix is a `binaryTarget`
-pointing at a prebuilt `.xcframework` attached to the GitHub Release with its checksum, built for
-the platforms the manifest declares (visionOS 1, iOS 17, macOS 14). Until that exists, a bare tag
+**Linking has its binary, but the package does not consume it yet.** A Rust release now attaches a
+checksummed XCFramework built for the platforms the manifest declares (visionOS 1, iOS 17, macOS
+14). `Package.swift` still uses the source-checkout system-library target, so a consumer who
+resolves the Swift package from its URL has no `target/release` and does not link out of tree. The
+next, Swift-only layer is to point a `binaryTarget` at an actually published Rust release URL and
+copy the checksum of those exact bytes. Until the first such Rust release exists, a bare Swift tag
 buys resolution and a readable diagnostic, not a build.
 
 **Platforms.** The core builds for visionOS on stable toolchains — the Apple targets ship a

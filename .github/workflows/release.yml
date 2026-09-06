@@ -26,8 +26,8 @@ name: Release
 # it was created for. The corpus and Swift publish to no registry, so they have
 # nothing to authenticate to and ask for no id-token at all.
 #
-# Every job also leaves a GitHub Release behind, with that version's changelog
-# section as its body. A tag that publishes a package and leaves no release is a
+# Every package job also leaves a GitHub Release behind, with that version's
+# changelog section as its body. A tag that publishes a package and leaves no release is a
 # version nobody can read the reason for, and the two drift from there. The
 # section is required: the check runs before the build, so a missing one stops
 # the release while it can still be abandoned.
@@ -117,9 +117,33 @@ jobs:
             --title "fourdgs (Python) $version" \
             --notes-file "$RUNNER_TEMP/notes.md"
 
+  rust-core-apple:
+    name: Build the Apple Rust core
+    if: startsWith(github.ref, 'refs/tags/releases/rust/')
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and smoke-test the XCFramework
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/rust/v}"
+          scripts/build_apple_xcframework.sh "$version" "$RUNNER_TEMP/apple-core"
+
+      - name: Preserve the release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-core-apple
+          path: ${{ runner.temp }}/apple-core/*
+          if-no-files-found: error
+          # The XCFramework is already a zip; recompressing it only wastes runner time.
+          compression-level: 0
+
   rust:
     name: Publish fourdgs to crates.io
     if: startsWith(github.ref, 'refs/tags/releases/rust/')
+    needs: rust-core-apple
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -169,6 +193,12 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      - name: Retrieve the Apple core
+        uses: actions/download-artifact@v8
+        with:
+          name: rust-core-apple
+          path: ${{ runner.temp }}/apple-core
+
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -177,7 +207,8 @@ jobs:
           case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
           gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
             --title "fourdgs (Rust) $version" \
-            --notes-file "$RUNNER_TEMP/notes.md"
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$RUNNER_TEMP/apple-core"/*
 
   swift:
     name: Release the Swift package

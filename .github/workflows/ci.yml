@@ -1214,6 +1214,10 @@ jobs:
           cargo build -p fourdgs --release
           cargo build -p fourdgs --release --target aarch64-apple-visionos
           cargo build -p fourdgs --release --target aarch64-apple-ios
+      - name: Build and smoke-test the release XCFramework
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' rust/fourdgs/Cargo.toml | head -1)
+          scripts/build_apple_xcframework.sh "$version" "$RUNNER_TEMP/apple-core"
       - name: Build for macOS
         run: swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
       - name: Build for visionOS and iOS
