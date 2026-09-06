@@ -23,9 +23,14 @@ import {
   stepsFrom,
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
-import { duplicateStructuralRecord, ExceedsReaderLimit, MalformedFile } from "./errors.js";
+import {
+  duplicateStructuralRecord,
+  ExceedsReaderLimit,
+  lateFrontMatterRecord,
+  MalformedFile,
+} from "./errors.js";
 import { FrontMatterScanner } from "./frontMatter.js";
-import { isProvenanceOpcode, Opcode } from "./opcodes.js";
+import { isFrontMatterOpcode, isProvenanceOpcode, isStateOpcode, Opcode } from "./opcodes.js";
 import { ObjectLayer } from "./objects.js";
 import { Provenance } from "./provenance.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
@@ -512,11 +517,22 @@ export class IndexedDecoder {
       };
     const provenanceRanges: ProvenanceRange[] = [];
     const retainOptionalRecord = optionalRecordBudget(this.maxDeferredRecords);
-    let stateDataSeen = false;
+    let firstState: { readonly opcode: number; readonly offset: number } | null = null;
 
     for await (const record of scanner.records(MAGIC.length)) {
-      if (record.opcode === Opcode.Chunk || record.opcode === Opcode.DeltaChunk) {
-        stateDataSeen = true;
+      if (firstState !== null && isFrontMatterOpcode(record.opcode)) {
+        throw lateFrontMatterRecord(
+          record.opcode,
+          record.offset,
+          firstState.opcode,
+          firstState.offset,
+        );
+      }
+      if (firstState === null && isStateOpcode(record.opcode)) {
+        firstState = { opcode: record.opcode, offset: record.offset };
+      }
+      if (isStateOpcode(record.opcode)) {
+        continue;
       } else if (record.opcode === Opcode.Audio) {
         if (legacyAudio !== null) {
           throw new MalformedFile("the file carries more than one legacy Audio record");
@@ -529,9 +545,6 @@ export class IndexedDecoder {
         );
       } else if (record.opcode === Opcode.AudioSource) {
         const sourceId = readSourceId(await scanner.content(record, 4), "Audio Source");
-        if (stateDataSeen) {
-          throw new MalformedFile(`Audio Source id ${sourceId} appears after the first Chunk`);
-        }
         if (sourceRanges.has(sourceId)) {
           throw new MalformedFile(`Audio Source id ${sourceId} appears more than once`);
         }
@@ -541,9 +554,6 @@ export class IndexedDecoder {
         const prefix = new Cursor(await scanner.content(record, 12));
         const sourceId = prefix.u32();
         const dataLength = prefix.u64();
-        if (stateDataSeen) {
-          throw new MalformedFile(`Audio Data id ${sourceId} appears after the first Chunk`);
-        }
         if (dataRanges.has(sourceId)) {
           throw new MalformedFile(`Audio Data id ${sourceId} appears more than once`);
         }

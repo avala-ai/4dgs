@@ -21,11 +21,12 @@ import { Cursor } from "./cursor.js";
 import {
   duplicateStructuralRecord,
   ExceedsReaderLimit,
+  lateFrontMatterRecord,
   MalformedFile,
   TruncatedFile,
 } from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
-import { Opcode } from "./opcodes.js";
+import { isFrontMatterOpcode, isStateOpcode, Opcode } from "./opcodes.js";
 import { ObjectLayer } from "./objects.js";
 import { Provenance } from "./provenance.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
@@ -247,6 +248,7 @@ export async function decodeScene(
   const provenance = new Provenance();
   const objects = new ObjectLayer();
   let truncated = false;
+  let firstState: { readonly opcode: number; readonly offset: number } | null = null;
 
   let at = 0;
   while (at < size) {
@@ -258,6 +260,18 @@ export async function decodeScene(
     // yielded, which is the whole of truncation recovery: what is complete is decoded,
     // what is cut is not, and nothing has to be undone.
     for (const item of decoder.recordsStreaming(STREAMED_RECORD_OPCODES)) {
+      const opcodeOffset = "bytes" in item ? item.recordOffset : item.offset;
+      if (firstState !== null && isFrontMatterOpcode(item.opcode)) {
+        throw lateFrontMatterRecord(
+          item.opcode,
+          opcodeOffset,
+          firstState.opcode,
+          firstState.offset,
+        );
+      }
+      if (firstState === null && isStateOpcode(item.opcode)) {
+        firstState = { opcode: item.opcode, offset: opcodeOffset };
+      }
       if ("bytes" in item) {
         const recordEnd = item.recordOffset + RECORD_HEADER_BYTES + item.contentLength;
         if (!Number.isSafeInteger(recordEnd) || recordEnd > size) {
@@ -266,10 +280,6 @@ export async function decodeScene(
           // has not been shown to exist. `decoder.end()` records the truncation.
           truncated = true;
           continue;
-        }
-        if (chunks.length > 0) {
-          const name = item.opcode === Opcode.Audio ? "Audio" : "Audio Data";
-          throw new MalformedFile(`an ${name} record appears after the first Chunk`);
         }
         if (item.opcode === Opcode.Audio) {
           firstAudioRecord ??= { name: "Audio", offset: item.recordOffset };
@@ -361,9 +371,6 @@ export async function decodeScene(
           break;
         }
         case Opcode.AudioSource: {
-          if (chunks.length > 0) {
-            throw new MalformedFile("an Audio Source record appears after the first Chunk");
-          }
           const source = parseAudioSource(content);
           if (audioDescriptors.has(source.sourceId)) {
             throw new MalformedFile(`Audio Source id ${source.sourceId} appears more than once`);
@@ -404,12 +411,8 @@ export async function decodeScene(
           provenance.anchors.push(parseGeodeticAnchor(content));
           break;
         case Opcode.ObjectTable:
-          // Read wherever it appears. Section 5.15 is explicit that these records are
-          // "skipped and dispatched by opcode, not by position", so a table or track
-          // after a Chunk is a legal file — and dropping one loses the post-track state
-          // its gaussians require. The indexed path's front-matter walk stops at the
-          // first Chunk and so cannot see them; that asymmetry is a gap in the indexed
-          // reader, not a licence for this path to discard data the format allows.
+          // Relative order within front matter is free. The placement check above has
+          // already established that this table is not after state.
           if (objects.table !== null) {
             throw new MalformedFile(
               "the file carries a second Object Table; a scene has one (section 5.15.6)",

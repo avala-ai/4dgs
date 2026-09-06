@@ -51,9 +51,12 @@ import {
   decodeChunkStreams,
   decodeStream,
   frameOneStream,
+  isFrontMatterOpcode,
   isPrivateOpcode,
   isProvenanceOpcode,
+  isStateOpcode,
   keyframeDeltaValidationRecordOffset,
+  lateFrontMatterRecord,
   mergeBands,
   opcodeName,
   parseAudioSource,
@@ -238,7 +241,7 @@ export async function validateFile(
   const provenance = new Provenance();
   const emptyTrajectories: string[] = [];
   const objects = new ObjectLayer();
-  let firstChunkSeen = false;
+  let firstState: { readonly opcode: number; readonly offset: number } | null = null;
   let decodedShChunk: {
     readonly ordinal: number;
     readonly count: number;
@@ -288,6 +291,20 @@ export async function validateFile(
         record.opcode !== Opcode.ShBandStream
       ) {
         currentChunkOffset = null;
+      }
+      if (firstState !== null && isFrontMatterOpcode(record.opcode)) {
+        const error = lateFrontMatterRecord(
+          record.opcode,
+          record.offset,
+          firstState.opcode,
+          firstState.offset,
+        );
+        found.error(error.message);
+        found.refuse(error, record.offset, `the ${opcodeName(record.opcode)} record`);
+        return report(found);
+      }
+      if (firstState === null && isStateOpcode(record.opcode)) {
+        firstState = { opcode: record.opcode, offset: record.offset };
       }
       // A record whose own body will not parse is a finding rather than an abort: the point
       // of a validator is to say everything that is wrong with a file, not the first thing.
@@ -391,7 +408,6 @@ export async function validateFile(
           physicalChunkOffsets.push(offset);
           physicalBands.set(offset, []);
           currentChunkOffset = offset;
-          firstChunkSeen = true;
           chunkCount += 1;
           let parsed;
           try {
@@ -452,7 +468,6 @@ export async function validateFile(
           physicalChunkOffsets.push(offset);
           physicalBands.set(offset, []);
           currentChunkOffset = offset;
-          firstChunkSeen = true;
           chunkCount += 1;
           let parsed;
           try {
@@ -585,9 +600,6 @@ export async function validateFile(
             found.error(`Audio Source does not parse: ${message(error)}`);
             break;
           }
-          if (firstChunkSeen) {
-            found.error(`Audio Source id ${source.sourceId} appears after the first Chunk`);
-          }
           if (audioSources.has(source.sourceId)) {
             found.error(`Audio Source id ${source.sourceId} appears more than once`);
           }
@@ -601,9 +613,6 @@ export async function validateFile(
           } catch (error) {
             found.error(`Audio Data does not parse: ${message(error)}`);
             break;
-          }
-          if (firstChunkSeen) {
-            found.error(`Audio Data id ${payload.sourceId} appears after the first Chunk`);
           }
           if (audioData.has(payload.sourceId)) {
             found.error(`Audio Data id ${payload.sourceId} appears more than once`);

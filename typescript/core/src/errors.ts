@@ -10,6 +10,8 @@
  * broken, and the file is fine but this build cannot read one of its codecs.
  */
 
+import { opcodeName } from "./opcodes.js";
+
 /**
  * Every refusal this reader can name (spec: the refusal table).
  *
@@ -37,6 +39,8 @@ export const Refusal = {
   WindowIndexOutOfRange: "window-index-out-of-range",
   /** A reconstructed floating attribute cannot be represented as a finite binary32 value. */
   DecodedF32Overflow: "decoded-f32-overflow",
+  /** Defined front matter appears after the first Chunk or Delta Chunk. */
+  LateFrontMatterRecord: "late-front-matter-record",
   /** A Chunk Index count disagrees with the decoded record or composed state it describes. */
   IndexRecordMismatch: "index-record-mismatch",
 } as const;
@@ -97,6 +101,23 @@ export class TruncatedFile extends FourdgsError {}
  * its legal range.
  */
 export class MalformedFile extends FourdgsError {}
+
+/** The placement refusal once both physical record sites are known. */
+export function lateFrontMatterRecord(
+  lateOpcode: number,
+  lateOffset: number,
+  firstStateOpcode: number,
+  firstStateOffset: number,
+): MalformedFile {
+  const hex = (opcode: number): string => `0x${opcode.toString(16).padStart(2, "0").toUpperCase()}`;
+  return new MalformedFile(
+    `${opcodeName(lateOpcode)} record (opcode ${hex(lateOpcode)}) at byte ${lateOffset} ` +
+      `appears after the first state record, ${opcodeName(firstStateOpcode)} ` +
+      `(opcode ${hex(firstStateOpcode)}) at byte ${firstStateOffset}; expected every ` +
+      "defined front-matter record before the first Chunk or Delta Chunk",
+    { refusalCode: Refusal.LateFrontMatterRecord },
+  );
+}
 
 /**
  * A legal but unimplemented codec. The file is fine; this build cannot read it.

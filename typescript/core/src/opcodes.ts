@@ -68,6 +68,32 @@ export function isObjectOpcode(opcode: number): boolean {
   return opcode === Opcode.ObjectTable || opcode === Opcode.ObjectTrack;
 }
 
+/** True for the closed set of records spec section 4 places before state. */
+export function isFrontMatterOpcode(opcode: number): boolean {
+  return (
+    opcode === Opcode.Header ||
+    opcode === Opcode.Quantization ||
+    opcode === Opcode.WindowTable ||
+    opcode === Opcode.Audio ||
+    opcode === Opcode.Camera ||
+    opcode === Opcode.Metadata ||
+    opcode === Opcode.Attachment ||
+    opcode === Opcode.AudioSource ||
+    opcode === Opcode.AudioData ||
+    opcode === Opcode.CoordinateFrame ||
+    opcode === Opcode.SensorCalibration ||
+    opcode === Opcode.RigTrajectory ||
+    opcode === Opcode.GeodeticAnchor ||
+    opcode === Opcode.ObjectTable ||
+    opcode === Opcode.ObjectTrack
+  );
+}
+
+/** True for either top-level record that begins decoded gaussian state. */
+export function isStateOpcode(opcode: number): boolean {
+  return opcode === Opcode.Chunk || opcode === Opcode.DeltaChunk;
+}
+
 /** Records whose currently defined fields are frozen for the life of version 1. */
 export const FROZEN_OPCODES: ReadonlySet<number> = new Set([
   Opcode.Header,
