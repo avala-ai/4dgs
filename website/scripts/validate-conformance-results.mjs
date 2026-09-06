@@ -35,6 +35,7 @@ const RUNNER_KEYS = [
   "exactAggregates",
   "canonicalStateOrder",
   "aggregateDecodedBudget",
+  "lateFrontMatterRecords",
   "command",
   "passed",
   "skipped",
@@ -183,6 +184,10 @@ function validateRunner(runner, path, corpus) {
   assertBoolean(runner.exactAggregates, `${path}.exactAggregates`);
   assertBoolean(runner.canonicalStateOrder, `${path}.canonicalStateOrder`);
   assertBoolean(runner.aggregateDecodedBudget, `${path}.aggregateDecodedBudget`);
+  assertBoolean(runner.lateFrontMatterRecords, `${path}.lateFrontMatterRecords`);
+  if (runner.lateFrontMatterRecords && !runner.refusals) {
+    fail(`${path}.lateFrontMatterRecords`, "cannot be true when refusals is false");
+  }
   assertString(runner.command, `${path}.command`);
   assertInteger(runner.passed, `${path}.passed`);
   assertInteger(runner.skipped, `${path}.skipped`);

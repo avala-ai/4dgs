@@ -37,6 +37,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 INVALID = os.path.join(DATA, "invalid")
+LATE_FRONT_MATTER = os.path.join(INVALID, "late-front-matter")
 KEYFRAME = os.path.join(DATA, "keyframe")
 OBJECT = os.path.join(DATA, "object")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
@@ -324,7 +325,7 @@ def build_invalid() -> list[tuple[str, bytes, str]]:
         data = refusal.mutate(base)
         if data == base:
             raise AssertionError(f"{refusal.name}: the mutation changed nothing")
-        out.append((refusal.name, data, canonical({"refused": refusal.code})))
+        out.append((refusal.name, data, canonical(refusal.expectation(data))))
     for name, code, _rule, overrides in invalid.ENCODED:
         data, _ = build(base_scenario, tuple(sorted(invalid.BASE_FLAGS)), read_back=False, **overrides)
         if data == base:
@@ -343,7 +344,29 @@ def build_invalid() -> list[tuple[str, bytes, str]]:
         data = refusal.mutate(index_base)
         if data == index_base:
             raise AssertionError(f"{refusal.name}: the mutation changed nothing")
-        out.append((refusal.name, data, canonical({"refused": refusal.code})))
+        out.append((refusal.name, data, canonical(refusal.expectation(data))))
+
+    # Placement is enforced by both temporal models' independent streamed loops. These
+    # bases remain indexed so a skipped indexed verdict really exercises the normative
+    # exemption, rather than merely avoiding a file that has no index.
+    late_scenario = next(s for s in scenarios.SCENARIOS if s.name == invalid.LATE_GAUSSIAN_BASE)
+    late_base, _ = build(late_scenario, tuple(sorted(invalid.LATE_GAUSSIAN_FLAGS)))
+    for refusal in invalid.LATE_GAUSSIAN_REFUSALS:
+        data = refusal.mutate(late_base)
+        if data == late_base:
+            raise AssertionError(f"{refusal.name}: the mutation changed nothing")
+        out.append((refusal.name, data, canonical(refusal.expectation(data))))
+
+    late_kd_name, late_kd_base, _ = next(
+        item for item in build_keyframe_delta_corpus() if item[0] == invalid.LATE_KEYFRAME_DELTA_BASE
+    )
+    if late_kd_name != invalid.LATE_KEYFRAME_DELTA_BASE:
+        raise AssertionError(f"wrong late keyframe-delta base: {late_kd_name}")
+    for refusal in invalid.LATE_KEYFRAME_DELTA_REFUSALS:
+        data = refusal.mutate(late_kd_base)
+        if data == late_kd_base:
+            raise AssertionError(f"{refusal.name}: the mutation changed nothing")
+        out.append((refusal.name, data, canonical(refusal.expectation(data))))
     return out
 
 
@@ -1287,15 +1310,23 @@ def write_corpus(target: str) -> Corpus:
         expectations[f"object/{name}"] = expectation + "\n"
 
     invalid_dir = os.path.join(target, "invalid")
+    late_front_matter_dir = os.path.join(invalid_dir, "late-front-matter")
     os.makedirs(invalid_dir, exist_ok=True)
+    os.makedirs(late_front_matter_dir, exist_ok=True)
     for name, data, expectation in build_invalid():
-        with open(os.path.join(invalid_dir, f"{name}.4dgs"), "wb") as fh:
+        qualified = f"invalid/{name}"
+        if f"{invalid.LATE_FRONT_MATTER_PREFIX}{name}" in invalid.STREAMED_ONLY_REFUSALS:
+            directory = late_front_matter_dir
+            qualified = f"{invalid.LATE_FRONT_MATTER_PREFIX}{name}"
+        else:
+            directory = invalid_dir
+        with open(os.path.join(directory, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
+        with open(os.path.join(directory, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[f"invalid/{name}.4dgs"] = hashlib.sha256(data).hexdigest()
-        checksums[f"invalid/{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
-        expectations[f"invalid/{name}"] = expectation + "\n"
+        checksums[f"{qualified}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"{qualified}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[qualified] = expectation + "\n"
     return Corpus(checksums, expectations)
 
 
@@ -1312,7 +1343,13 @@ def write_checksums(checksums: dict[str, str]) -> None:
 def read_expectations() -> dict[str, str]:
     """Read committed expectations before regeneration overwrites their files."""
     out: dict[str, str] = {}
-    for root, prefix in ((DATA, ""), (INVALID, "invalid/"), (KEYFRAME, "keyframe/"), (OBJECT, "object/")):
+    for root, prefix in (
+        (DATA, ""),
+        (INVALID, "invalid/"),
+        (LATE_FRONT_MATTER, invalid.LATE_FRONT_MATTER_PREFIX),
+        (KEYFRAME, "keyframe/"),
+        (OBJECT, "object/"),
+    ):
         if not os.path.isdir(root):
             continue
         for name in sorted(os.listdir(root)):
@@ -1343,12 +1380,7 @@ def main(argv=None) -> int:
     committed_expectations = read_expectations() if args.verify else {}
     corpus = write_corpus(DATA)
     checksums = corpus.checksums
-    total = sum(
-        os.path.getsize(os.path.join(root, f))
-        for root in (DATA, INVALID, KEYFRAME, OBJECT)
-        for f in os.listdir(root)
-        if os.path.isfile(os.path.join(root, f))
-    )
+    total = sum(os.path.getsize(os.path.join(DATA, *name.split("/"))) for name in checksums)
     variants = sum(name.endswith(".4dgs") for name in checksums)
     print(f"{variants} variants, {total / 1024:.0f} KiB in {DATA}")
 
@@ -1401,7 +1433,12 @@ def _verify(corpus: Corpus, committed_expectations: dict[str, str]) -> bool:
         data, expectation = build(scenario, flags)
         record(scenarios.variant_name(scenario, flags), data, expectation)
     for name, data, expectation in build_invalid():
-        record(f"invalid/{name}", data, expectation)
+        qualified = (
+            f"{invalid.LATE_FRONT_MATTER_PREFIX}{name}"
+            if f"{invalid.LATE_FRONT_MATTER_PREFIX}{name}" in invalid.STREAMED_ONLY_REFUSALS
+            else f"invalid/{name}"
+        )
+        record(qualified, data, expectation)
     for name, data, expectation in build_keyframe_delta_corpus():
         record(f"keyframe/{name}", data, expectation)
     for name, data, expectation in build_object_corpus():

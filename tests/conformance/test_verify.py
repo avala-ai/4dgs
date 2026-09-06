@@ -29,11 +29,13 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "..", "scripts"))
 
 import canonical
 import encode_roundtrip
 import generate
 import json_compare
+import pack_corpus
 import run as conformance_run
 
 # `generate` puts `python/fourdgs` on the path as it imports, which is why this follows it.
@@ -138,6 +140,159 @@ def test_index_count_refusal_witnesses_change_only_the_claim_and_repair_summary_
         assert (mutated_start, mutated_end) == (summary_start, footer_start)
         assert declared_crc != base_crc
         assert zlib.crc32(mutated[mutated_start:mutated_end]) & 0xFFFFFFFF == declared_crc
+
+
+def _late_bases() -> tuple[bytes, bytes]:
+    scenario = next(item for item in generate.scenarios.SCENARIOS if item.name == invalid.LATE_GAUSSIAN_BASE)
+    gaussian, _ = generate.build(scenario, tuple(sorted(invalid.LATE_GAUSSIAN_FLAGS)))
+    kd_name, keyframe_delta, _ = next(
+        item for item in generate.build_keyframe_delta_corpus() if item[0] == invalid.LATE_KEYFRAME_DELTA_BASE
+    )
+    assert kd_name == invalid.LATE_KEYFRAME_DELTA_BASE
+    return gaussian, keyframe_delta
+
+
+def _assert_late_witness(base: bytes, refusal: invalid.Refusal, expected_opcode: int) -> None:
+    mutated = refusal.mutate(base)
+    assert len(mutated) == len(base) + invalid._RECORD_HEADER.size
+    first_state = next(
+        (opcode, content - invalid._RECORD_HEADER.size)
+        for opcode, content, _length in invalid._records(mutated)
+        if opcode in invalid._STATE_OPCODES
+    )
+    late = next(
+        (opcode, content - invalid._RECORD_HEADER.size, length)
+        for opcode, content, length in invalid._records(mutated)
+        if content - invalid._RECORD_HEADER.size > first_state[1] and opcode in invalid._FRONT_MATTER_OPCODES
+    )
+    assert late[0] == expected_opcode
+    assert late[2] == 0, "an empty body makes parse-before-placement observable"
+
+    expectation = refusal.expectation(mutated)
+    assert expectation == {
+        "refused": "late-front-matter-record",
+        "firstStateRecord": {"opcode": first_state[0], "at": str(first_state[1])},
+        "lateRecord": {"opcode": late[0], "at": str(late[1])},
+    }
+
+    _base_crc_field, base_summary, base_footer, base_crc = invalid._summary_crc_fields(base)
+    _crc_field, summary_start, footer_start, declared_crc = invalid._summary_crc_fields(mutated)
+    assert summary_start == base_summary + invalid._RECORD_HEADER.size
+    assert footer_start == base_footer + invalid._RECORD_HEADER.size
+    assert mutated[summary_start:footer_start] == base[base_summary:base_footer]
+    assert declared_crc == base_crc == zlib.crc32(mutated[summary_start:footer_start]) & 0xFFFFFFFF
+
+
+def test_late_front_matter_witnesses_cover_the_closed_class_and_both_stream_loops():
+    gaussian, keyframe_delta = _late_bases()
+    expected_gaussian = dict(invalid._LATE_GAUSSIAN_CASES)
+    expected_keyframe_delta = dict(invalid._LATE_KEYFRAME_DELTA_CASES)
+
+    assert set(expected_gaussian.values()) == invalid._FRONT_MATTER_OPCODES
+    assert set(expected_keyframe_delta.values()) == {0x03, 0x04, 0x25}
+    assert {refusal.name for refusal in invalid.LATE_GAUSSIAN_REFUSALS} == set(expected_gaussian)
+    assert {refusal.name for refusal in invalid.LATE_KEYFRAME_DELTA_REFUSALS} == set(expected_keyframe_delta)
+    assert invalid.STREAMED_ONLY_REFUSALS == {
+        f"{invalid.LATE_FRONT_MATTER_PREFIX}{name}" for name in (*expected_gaussian, *expected_keyframe_delta)
+    }
+
+    for refusal in invalid.LATE_GAUSSIAN_REFUSALS:
+        _assert_late_witness(gaussian, refusal, expected_gaussian[refusal.name])
+    for refusal in invalid.LATE_KEYFRAME_DELTA_REFUSALS:
+        _assert_late_witness(keyframe_delta, refusal, expected_keyframe_delta[refusal.name])
+
+    # These three are both late and forbidden duplicates. Their empty bodies also make
+    # body parsing invalid, so the corpus requires placement to win over both alternatives.
+    for opcode in (0x01, 0x03, 0x04):
+        refusal = next(item for item in invalid.LATE_GAUSSIAN_REFUSALS if expected_gaussian[item.name] == opcode)
+        records = [item for item in invalid._records(refusal.mutate(gaussian)) if item[0] == opcode]
+        assert len(records) == 2
+
+    active = {name for name, _data, _expectation in generate.build_invalid()}
+    assert {name.removeprefix(invalid.LATE_FRONT_MATTER_PREFIX) for name in invalid.STREAMED_ONLY_REFUSALS} <= active
+    discovered = set(conformance_run.variants())
+    assert invalid.STREAMED_ONLY_REFUSALS <= discovered
+    assert not any(name.startswith("invalid/Late") for name in discovered)
+    assert "late-front-matter-record" in invalid.CODES
+
+
+@pytest.mark.parametrize("opcode", [0x7D, 0x91], ids=["unknown", "private"])
+def test_unknown_and_private_records_remain_legal_after_state(opcode: int):
+    gaussian, keyframe_delta = _late_bases()
+    expected_chunks = len(kdf.decode_streamed(keyframe_delta).chunks)
+    gaussian = invalid._insert_before_summary(gaussian, opcode, b"control")
+    keyframe_delta = invalid._insert_before_summary(keyframe_delta, opcode, b"control")
+
+    scene = generate.fourdgs.read(gaussian)
+    assert opcode in scene.skipped_opcodes
+    assert len(kdf.decode_streamed(keyframe_delta).chunks) == expected_chunks
+
+
+def _caps(*, indexed: bool, refusals: bool = True, late: bool = False) -> conformance_run.Capabilities:
+    path = "indexed" if indexed else "streamed"
+    return conformance_run.Capabilities(
+        family="test",
+        name=f"test/decode_{path}",
+        indexed=indexed,
+        refusals=refusals,
+        late_front_matter_records=late,
+    )
+
+
+def test_late_front_matter_capability_is_streamed_only_and_does_not_weaken_other_refusals():
+    baseline = "invalid/BadMagic"
+    for variant in invalid.STREAMED_ONLY_REFUSALS:
+        assert conformance_run.supports(_caps(indexed=False, late=True), variant)
+        assert not conformance_run.supports(_caps(indexed=False, late=False), variant)
+        assert not conformance_run.supports(_caps(indexed=False, refusals=False, late=True), variant)
+        assert not conformance_run.supports(_caps(indexed=True, late=True), variant)
+    assert conformance_run.supports(_caps(indexed=False), baseline)
+    assert conformance_run.supports(_caps(indexed=True), baseline)
+
+
+def test_external_late_front_matter_capability_is_explicit_and_requires_refusals(monkeypatch):
+    declaration = {
+        "protocol": 1,
+        "name": "outside/decode_streamed",
+        "family": "outside",
+        "readPath": "streamed",
+        "refusals": True,
+        "lateFrontMatterRecords": True,
+    }
+    monkeypatch.setattr(
+        conformance_run,
+        "invoke",
+        lambda _command, _args, _timeout: conformance_run.Outcome(0, json.dumps(declaration), ""),
+    )
+    assert conformance_run.declared_capabilities(["runner"], 1).late_front_matter_records
+
+    declaration["refusals"] = False
+    with pytest.raises(conformance_run.ProtocolError, match="lateFrontMatterRecords true but refusals false"):
+        conformance_run.declared_capabilities(["runner"], 1)
+
+    declaration["lateFrontMatterRecords"] = "yes"
+    with pytest.raises(conformance_run.ProtocolError, match="expected true or false"):
+        conformance_run.declared_capabilities(["runner"], 1)
+
+
+def test_release_manifest_uses_the_same_indexed_exemption_and_temporal_model_registry(tmp_path):
+    file_path = tmp_path / "fixture.4dgs"
+    expectation_path = tmp_path / "fixture.json"
+    file_path.write_bytes(b"fixture")
+    expectation_path.write_text('{"refused":"late-front-matter-record"}\n', encoding="utf-8")
+
+    for qualified in invalid.STREAMED_ONLY_REFUSALS:
+        name = qualified.removeprefix(invalid.LATE_FRONT_MATTER_PREFIX)
+        entry = pack_corpus.describe(name, "invalid/late-front-matter", str(file_path), str(expectation_path))
+        assert entry["family"] == "invalid/late-front-matter"
+        assert not entry["indexed"]
+        expected_model = "keyframe-delta" if qualified in invalid.KEYFRAME_DELTA_REFUSALS else "gaussian-birth"
+        assert entry["temporalModel"] == expected_model
+
+    ordinary = pack_corpus.describe("BadMagic", "invalid", str(file_path), str(expectation_path))
+    assert ordinary["indexed"]
+    indexed_delta = pack_corpus.describe("WrongIndexLiveCount", "invalid", str(file_path), str(expectation_path))
+    assert indexed_delta["indexed"] and indexed_delta["temporalModel"] == "keyframe-delta"
 
 
 class TestExactAggregateTransition:

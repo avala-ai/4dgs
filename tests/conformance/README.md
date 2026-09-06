@@ -37,14 +37,35 @@ content is a refusal: a window index outside its table, a codec this build does 
 temporal model this reader has never heard of. A decoder that ignores every one of them passes the
 entire valid corpus.
 
-`generator/invalid.py` declares the other half. Each entry is a length-preserving byte mutation of
-one valid base file, chosen so that **exactly one** rule is broken, paired with the **refusal
-identifier** a conforming reader must produce. `data/invalid/<Name>.json` is the expectation, and it
-looks like this:
+`generator/invalid.py` declares the other half. Each entry is a byte mutation of a valid base file,
+chosen so that **exactly one** rule is broken, paired with the **refusal identifier** a conforming
+reader must produce. Baseline expectations live at `data/invalid/<Name>.json`; independently gated
+placement expectations live below `data/invalid/late-front-matter/`. A baseline expectation looks
+like this:
 
 ```json
 { "refused": "window-index-out-of-range" }
 ```
+
+Mutations are length-preserving where possible. The late-front-matter witnesses instead insert one
+empty framed record after state and repair the Footer's absolute `summary_start`; their Chunk Index
+entries and summary bytes/CRC remain valid. Those expectations also carry the physical evidence the
+rule requires:
+
+```json
+{
+  "firstStateRecord": { "at": "516", "opcode": 5 },
+  "lateRecord": { "at": "2374", "opcode": 1 },
+  "refused": "late-front-matter-record"
+}
+```
+
+Byte offsets use decimal strings like every potentially 64-bit integer in canonical JSON. The 15
+gaussian-birth cases exhaust §4's closed front-matter class. Three more repeat Quantization, Window
+Table and Object Track through the independent keyframe-delta stream loop. Every body is empty, so
+placement must be checked before parsing; Header, Quantization and Window Table are also duplicates,
+so their cases require positional refusal to win over multiplicity too. Unknown (`0x7D`) and private
+(`0x91`) records inserted at the same site remain legal controls in the generator tests.
 
 ### Why an identifier and not an exception type
 
@@ -78,11 +99,11 @@ no longer tell "refused for a reason nobody named" from "refused for the wrong r
 committed as the contract every other implementation is then scored against. A refusal a library
 cannot name is one the suite cannot check: fail the invocation rather than answer it.
 
-`REFUSAL_FAMILIES` in `run.py` lists the families whose runners answer these. A family absent from
-it skips the invalid corpus exactly as it would skip any variant it declines, and the feature matrix
-is where that shows up publicly. A runner from outside this repository does not appear in that set
-and does not need to: it says `"refusals": true` in its own declaration (see
-[below](#running-a-runner-that-lives-outside-this-repository)) and is scored on all eleven.
+`REFUSAL_FAMILIES` in `run.py` lists the families whose runners answer the baseline eleven.
+`LATE_FRONT_MATTER_FAMILIES` separately activates the 18 structured, streamed-only placement cases
+after a family has proved both stream loops and its validator. A runner from outside this repository
+does not appear in either set: it declares `"refusals": true` and `"lateFrontMatterRecords": true`
+itself (see [below](#running-a-runner-that-lives-outside-this-repository)).
 
 ### Aggregate decoded-state budget is a capability, not invalid data
 
@@ -250,6 +271,7 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
   "family": "go",
   "readPath": "indexed",
   "refusals": true,
+  "lateFrontMatterRecords": true,
   "declines": ["Object", "SHDegree3"],
   "exactAggregates": true,
   "canonicalStateOrder": true,
@@ -260,13 +282,14 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
 | Key                      | Required | Meaning                                                                                                 |
 | ------------------------ | -------- | ------------------------------------------------------------------------------------------------------- |
 | `protocol`               | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
-| `name`                   | yes      | exactly `<family>/decode_<readPath>`, such as `go/decode_indexed`; it must agree with both keys         |
+| `name`                   | yes      | exactly `<family>/decode_<readPath>`; it must agree with `family` and `readPath`                        |
 | `family`                 | no       | defaults to `name` up to the first `/`                                                                  |
-| `readPath`               | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
-| `refusals`               | no       | `true` to be scored on all eleven invalid variants. Absent means no, and the eleven are skipped         |
+| `readPath`               | yes      | `streamed` or `indexed`. Indexed runners skip path-inapplicable variants                                |
+| `refusals`               | no       | `true` to be scored on the baseline eleven invalid variants; absent means they are skipped              |
+| `lateFrontMatterRecords` | no       | with `refusals: true`, answer all 18 structured late-placement cases; indexed paths stay exempt         |
 | `declines`               | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
-| `exactAggregates`        | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent means the transition omits them   |
-| `canonicalStateOrder`    | no       | `true` makes `states[*].sample` strict; absent means the transition omits it                            |
+| `exactAggregates`        | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent omits them during the transition  |
+| `canonicalStateOrder`    | no       | `true` makes `states[*].sample` strict; absent omits it during the transition                           |
 | `aggregateDecodedBudget` | no       | `true` opts into the one-byte collecting-API resource gate; absent makes no memory claim                |
 
 Two consequences worth stating, because they are what the built-in tables get wrong for an outsider.
@@ -285,9 +308,15 @@ collided with a filename, and the score would have overstated what was proved. `
 works the same way for the families in this repository, so an outside runner is held to neither more
 nor less than a built-in one.
 
+`lateFrontMatterRecords` is a dependent refinement: declaring it true while `refusals` is false is a
+protocol error. It applies all 18 cases to a streamed runner and none to an indexed runner. The
+witnesses carry correct indexes, but §4 expressly permits an indexed opener to stop framing at the
+first state record; skipping those indexed invocations records that exemption rather than hiding
+missing work.
+
 **A runner that answers nothing fails.** If every valid variant matches a `declines` fragment and
-`refusals` is absent, the run ends `0 passed, 144 skipped, 0 failed` — and exits non-zero, naming
-the runner:
+`refusals` is absent, the run ends `0 passed, 92 skipped, 0 failed` — and exits non-zero, naming the
+runner:
 
 ```
 error: go/decode_streamed declined every variant, so nothing was compared
@@ -430,11 +459,12 @@ is a failure there, never a skip.
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
 C++, Swift and Dart run it on Linux. Every platform decodes the same generated corpus and compares
-against the same committed expectations. A fully supporting family makes 147 passing comparisons;
-the single `decode_indexed` variant that declares no chunk index is skipped everywhere. A language
-layer that has not landed exact canonical-unit sums and emitted-state ordering still runs those same
-147 checks: the shared transition omits only `positionSum`/`opacitySum` and `states[*].sample`,
-while every other field remains strict.
+against the same committed expectations. A family without the late-placement capability makes 147
+passing comparisons; one that claims it makes 165. The indexed path skips the 18 late-placement
+cases and the single valid variant that declares no chunk index. A language layer that has not
+landed exact canonical-unit sums and emitted-state ordering still runs those same 147 checks: the
+shared transition omits only `positionSum`/`opacitySum` and `states[*].sample`, while every other
+field remains strict.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this

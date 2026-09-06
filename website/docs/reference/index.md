@@ -13,16 +13,17 @@ harness skips the rest —
 — and this table is kept in lockstep with what runs. Nothing is marked `Yes` on the strength of code
 existing.
 
-Every row is filled in from a suite that runs: 48 valid variants and 11 invalid ones, plus 5
+Every row is filled in from a suite that runs: 48 valid variants and 29 invalid ones, plus 5
 keyframe-delta and 10 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records. Every language layer runs 147 checks; while the canonical-state stack is
-landing, a capability-gated comparison omits only exact totals and composed-state samples from SDKs
-whose implementations have not landed yet. It never skips a variant or weakens unrelated fields. C++
-and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor computes
-keyframe-delta summaries in the core, the provenance-JSON accessor does the same for the provenance
-family, and the objects-JSON pair does it for the object layer, so every binding emits identical
-bytes with no per-language slerp or composition order of its own.
+is what this table records. A language runs 147 checks before claiming the streamed-only
+late-front-matter family and 165 after it; while the canonical-state stack is landing, a
+capability-gated comparison omits only exact totals and composed-state samples from SDKs whose
+implementations have not landed yet. It never skips a variant or weakens unrelated fields. C++ and
+Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor computes keyframe-delta
+summaries in the core, the provenance-JSON accessor does the same for the provenance family, and the
+objects-JSON pair does it for the object layer, so every binding emits identical bytes with no
+per-language slerp or composition order of its own.
 
 <!-- prettier-ignore -->
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
@@ -64,6 +65,7 @@ bytes with no per-language slerp or composition order of its own.
 | Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Late front matter (streamed + validator diagnosis) | Planned | Planned    | Planned | Planned | Planned | Planned |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -305,6 +307,13 @@ readers tested only that bytes 1-4 read `4DGS`. Both refusals are the same class
 sentence's worth of prose, so nothing short of comparing identifiers could see it. Dart's
 `gaussian-birth` decoder also clamped an out-of-range window index instead of refusing it, which
 substitutes one gaussian's lifetime for another's and renders a scene rather than raising anything.
+
+**Late front matter** is a narrower, structured refusal claim. Its 15 gaussian-birth cases exhaust
+the defined placement class, and three keyframe-delta cases reach that model's independent stream
+loop. Each answer includes the physical late-record opcode/byte and first-state opcode/byte; each
+SDK must also run the same fixtures through its validator. Indexed openers are excluded because spec
+§4 permits them to stop at the first state record. The shared corpus layer starts every cell at
+`Planned`; an SDK changes only its own cell after activating and passing the capability.
 
 **Truncated-file recovery** is the one row no expectation can carry, because a cut file is a
 different file. Each runner decodes its variant twice more — once cut before the trailing magic,

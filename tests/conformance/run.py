@@ -32,6 +32,7 @@ from collections.abc import Callable, Iterator
 from decimal import InvalidOperation
 from typing import NamedTuple
 
+from generator import invalid as invalid_corpus
 from json_compare import diagnostic_differences
 from json_compare import for_capabilities as comparison_document
 from json_compare import loads as load_canonical_json
@@ -85,6 +86,7 @@ RUNNERS = [
 
 
 INVALID = os.path.join(DATA, "invalid")
+LATE_FRONT_MATTER = os.path.join(INVALID, "late-front-matter")
 #: keyframe-delta variants live in their own subdirectory, like the invalid corpus, so the
 #: top-level-only globs of the fuzzer, the Kaitai grammar and the C++ named-list test never
 #: see a temporal model they do not decode. This harness is the one consumer that dispatches
@@ -118,6 +120,12 @@ def variants() -> list[str]:
     refusals = []
     if os.path.isdir(INVALID):
         refusals = sorted(INVALID_PREFIX + f[: -len(".json")] for f in os.listdir(INVALID) if f.endswith(".json"))
+    if os.path.isdir(LATE_FRONT_MATTER):
+        refusals += sorted(
+            invalid_corpus.LATE_FRONT_MATTER_PREFIX + f[: -len(".json")]
+            for f in os.listdir(LATE_FRONT_MATTER)
+            if f.endswith(".json")
+        )
     return valid + keyframe + obj + refusals
 
 
@@ -129,6 +137,11 @@ def variants() -> list[str]:
 #: into that document and leave every other decode error on stderr with a non-zero exit —
 #: an error the vocabulary does not name is a failed invocation, not an empty identifier.
 REFUSAL_FAMILIES = frozenset({"python", "rust", "typescript", "cpp", "swift", "dart"})
+
+# Structured late-placement diagnosis is a narrower claim than the existing refusal
+# vocabulary. The corpus layer adds no family here: each SDK layer opts in only after its
+# streamed runner emits both physical sites and its validator suite proves the same rule.
+LATE_FRONT_MATTER_FAMILIES: frozenset[str] = frozenset()
 
 # Exact canonical-unit aggregation is introduced as a stacked conformance change. The
 # transition is field-level: families absent here still compare every variant and every
@@ -221,8 +234,11 @@ class Capabilities:
     #: without one.
     indexed: bool
     #: Whether this runner answers the invalid corpus with a refusal identifier. A runner
-    #: that does not skips all eleven, and the feature matrix is where that shows up.
+    #: that does not skips the baseline eleven, and the feature matrix is where that shows up.
     refusals: bool
+    #: Whether this runner answers the streamed-only late-front-matter expectations,
+    #: including the late-record and first-state physical sites.
+    late_front_matter_records: bool = False
     #: Name fragments this runner has not implemented; a variant containing one is skipped.
     declines: tuple[str, ...] = ()
     #: Whether position/opacity aggregates use exact canonical decimal units.
@@ -246,6 +262,7 @@ def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
         name=runner_name,
         indexed=runner_name.endswith("decode_indexed"),
         refusals=family in REFUSAL_FAMILIES,
+        late_front_matter_records=family in LATE_FRONT_MATTER_FAMILIES,
         declines=tuple(FAMILY_DECLINES.get(family, ())),
         exact_aggregates=family in EXACT_AGGREGATE_FAMILIES,
         canonical_state_order=family in CANONICAL_STATE_ORDER_FAMILIES,
@@ -254,7 +271,9 @@ def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
 
 
 def supports(caps: Capabilities, variant: str) -> bool:
-    # The invalid corpus is decided by `refusals` alone, and all eleven or none of it.
+    # The baseline invalid corpus is decided by `refusals` alone, and all eleven or none
+    # of it. Late placement is a separately activated diagnostic because it adds two
+    # structured physical sites and applies only to front-to-back paths.
     # `declines` names features of the *valid* corpus, and letting a fragment reach across
     # here silently unmakes the claim the runner just made: a runner declining `Unknown`
     # because it has not implemented unknown record types would answer two refusals while
@@ -263,11 +282,14 @@ def supports(caps: Capabilities, variant: str) -> bool:
     # feature name and a filename. Built-in families work the same way: `REFUSAL_FAMILIES`
     # is all-or-nothing, so an outside runner is held to neither more nor less.
     #
-    # Both read paths are asked. The two reach the Header by different routes — one front
-    # to back, one through the Footer — and a check placed on only one of them refuses
-    # half the files it should, so the invalid corpus is cut from a variant that carries
-    # an index and `UseChunkIndex` is not consulted here.
+    # Both read paths are asked for the baseline eleven. The two reach the Header by
+    # different routes — one front to back, one through the Footer — and a check placed on
+    # only one of them refuses half the files it should. The placement exception is
+    # normative: an indexed opener may stop at the first state record, so it is never
+    # required to scan the tail even though each witness carries a valid index.
     if variant.startswith(INVALID_PREFIX):
+        if variant in invalid_corpus.STREAMED_ONLY_REFUSALS:
+            return caps.refusals and caps.late_front_matter_records and not caps.indexed
         return caps.refusals
     if any(flag in variant for flag in caps.declines):
         return False
@@ -524,12 +546,18 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     aggregate_decoded_budget = doc.get("aggregateDecodedBudget", False)
     if not isinstance(aggregate_decoded_budget, bool):
         raise ProtocolError(f"declares aggregateDecodedBudget {aggregate_decoded_budget!r}; expected true or false")
+    late_front_matter_records = doc.get("lateFrontMatterRecords", False)
+    if not isinstance(late_front_matter_records, bool):
+        raise ProtocolError(f"declares lateFrontMatterRecords {late_front_matter_records!r}; expected true or false")
+    if late_front_matter_records and not refusals:
+        raise ProtocolError("declares lateFrontMatterRecords true but refusals false")
 
     return Capabilities(
         family=family,
         name=name,
         indexed=read_path == "indexed",
         refusals=refusals,
+        late_front_matter_records=late_front_matter_records,
         declines=tuple(declines),
         exact_aggregates=exact_aggregates,
         canonical_state_order=canonical_state_order,
@@ -725,6 +753,7 @@ def external_jobs(commands: list[str], timeout: float) -> list[tuple[Capabilitie
             f"{caps.name}: protocol {PROTOCOL_VERSION}, {'indexed' if caps.indexed else 'streamed'} read path, "
             f"refusals {'answered' if caps.refusals else 'declined'}, "
             f"aggregate budget {'claimed' if caps.aggregate_decoded_budget else 'unclaimed'}, "
+            f"late front matter {'answered' if caps.late_front_matter_records else 'declined'}, "
             f"declines {declines}"
         )
         jobs.append((caps, command))
@@ -866,7 +895,7 @@ def main(argv=None) -> int:
     # Two shapes of that. A family named with `--runner` whose runners are all unbuilt
     # never becomes a job at all, so the check is against the families that did. And a job
     # that exists but declines every variant — `"refusals": false` plus a `declines` list
-    # covering the valid corpus — would otherwise print `0 passed, 144 skipped, 0 failed`
+    # covering the valid corpus — would otherwise print `0 passed, 92 skipped, 0 failed`
     # and exit 0, which is a conformance claim made by answering nothing.
     idle = [caps.name for (caps, _), count in zip(jobs, executed, strict=True) if count == 0]
     if idle:

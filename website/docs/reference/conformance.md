@@ -23,8 +23,12 @@ A variant's name is its scenario followed by the flags it carries, hyphen-separa
 the decode harness matches fragments to select runners, and the encode gate makes its second,
 per-band-depth pass only when the name contains `SHDegree`. Most variants sit at the top of `data/`;
 three families live in subdirectories — `data/keyframe/`, `data/object/` and `data/invalid/` — and a
-variant there is named with its directory as a prefix. Today that is 48 valid variants at the top
-level, 5 keyframe-delta, 10 object-layer and 11 invalid.
+variant there is named with its directory as a prefix. The 18 independently gated streamed-placement
+witnesses sit one level deeper at `data/invalid/late-front-matter/`, so an SDK unit suite scanning
+the baseline invalid directory does not claim them accidentally. Today there are 48 valid variants
+at the top level, 5 keyframe-delta, 10 object-layer and 29 invalid. The immutable 0.1.0 download
+below remains the 74-variant release described by its manifest; the additional source-tree cases are
+unreleased.
 
 ## The corpus is generated, not committed
 
@@ -79,7 +83,8 @@ and it says what a major, minor and patch bump each mean for a score taken again
     <variant>.json   exactly what a correct decoder must produce from it
     keyframe/        the keyframe-delta temporal model
     object/          the object layer: an Object Table and SE(3) tracks
-    invalid/         files a conforming reader must refuse
+    invalid/         baseline files a conforming reader must refuse
+      late-front-matter/  streamed-only, independently gated placement refusals
 ```
 
 `corpus/` being byte-for-byte the generated directory is the point rather than a coincidence: an
@@ -175,6 +180,7 @@ argument. It must exit zero and print one JSON object:
   "family": "go",
   "readPath": "streamed",
   "refusals": true,
+  "lateFrontMatterRecords": true,
   "declines": ["WithObjects"],
   "exactAggregates": true,
   "canonicalStateOrder": true,
@@ -185,7 +191,9 @@ argument. It must exit zero and print one JSON object:
 `protocol` is the integer `1`; a boolean is rejected even though Python normally compares `true`
 equal to `1`. `readPath` is `streamed` or `indexed`, and `name` must be exactly
 `<family>/decode_<readPath>`. `family` may be omitted when it is the part of `name` before the first
-slash. `refusals` defaults to false and says whether the runner answers all eleven invalid variants.
+slash. `refusals` defaults to false and says whether the runner answers the baseline eleven invalid
+variants. `lateFrontMatterRecords` defaults to false and, together with `refusals: true`, opts a
+streamed runner into all 18 structured late-placement expectations; indexed runners remain exempt.
 `declines` defaults to an empty list and contains nonempty variant-name fragments for known valid
 features the runner does not implement. `exactAggregates` and `canonicalStateOrder` default to false
 and opt into strict comparison of exact root/state totals and composed-state samples. During the
@@ -325,10 +333,15 @@ not asked about those variants: the harness skips any variant whose name lacks `
 runner whose name ends in `decode_indexed`. Exactly one valid variant, `TenWindows-UseCrc`, is in
 that position, and it is skipped for the indexed path in every language.
 
-The invalid corpus is the exception, deliberately. It is cut from a base file that carries an index
-precisely so that both paths can be asked to refuse all eleven, and both are asked. A refusal check
-written into only one read path refuses half the files it should, and there is no other way to
-notice.
+The baseline eleven invalid cases are the exception, deliberately. They are cut from bases carrying
+indexes precisely so both paths can be asked to refuse them, and both are asked. A check written
+into only one read path refuses half the files it should, and there is no other way to notice.
+
+The 18 `Late*` cases also carry valid indexes, but are marked streamed-only. Spec §4 permits an
+indexed opener to stop framing at the first state record, so it need not scan the tail where the
+late record sits. `supports()` and the downloadable corpus's `MANIFEST.json` use the same explicit
+set; an indexed skip is the contract here, not a missing implementation. A streamed runner opts in
+with `lateFrontMatterRecords`, and then must answer every one.
 
 Two of the nine do not prove every indexed core. The Python and Rust runners route an unrecognized
 version prefix to their indexed opener, so their indexed magic/version checks own `BadMagic` and
@@ -358,16 +371,19 @@ implementations get abandoned rather than finished.
 
 The predicate that decides is `supports()` in the harness. Built-in runners receive capabilities
 derived from the tables in `run.py`; out-of-tree runners receive the same record from their
-`--capabilities` answer. The predicate consults three things:
+`--capabilities` answer. The predicate consults four things:
 
 1. `declines`: `FAMILY_DECLINES[family]` for a built-in or the external declaration's list. A valid
    variant containing one of those fragments is skipped. The built-in table is empty today because
    every family decodes provenance and the object layer.
 2. `refusals`: membership in `REFUSAL_FAMILIES` for a built-in or the external declaration's
-   boolean. False skips the whole invalid corpus. A decline fragment never reaches into that corpus,
-   even if an invalid filename happens to contain the same word.
-3. `indexed`: derived from the built-in runner name or the external `readPath`. An indexed runner
-   skips a valid variant without `UseChunkIndex`.
+   boolean. False skips the baseline invalid corpus. A decline fragment never reaches into that
+   corpus, even if an invalid filename happens to contain the same word.
+3. `lateFrontMatterRecords`: membership in `LATE_FRONT_MATTER_FAMILIES` for a built-in or the
+   external declaration's boolean. With `refusals: true`, this activates every structured `Late*`
+   expectation for a streamed runner. It cannot select only some opcodes.
+4. `indexed`: derived from the built-in runner name or the external `readPath`. An indexed runner
+   skips a valid variant without `UseChunkIndex` and every streamed-only late-placement variant.
 
 Some built-in entry points still define their own `supportsVariant` function. `run.py` does not call
 it; the capability record is authoritative. That keeps support decisions outside file invocation,
@@ -391,32 +407,43 @@ is rules whose whole content is a refusal — an out-of-range window index, an u
 temporal model the reader does not know — and a decoder that ignores all of them passes every valid
 variant.
 
-`generator/invalid.py` declares the other half: ten mutations of valid base files, each breaking
-exactly one rule, plus one directly encoded case, each paired with the **refusal identifier** a
-conforming reader must produce. The mutations are length-preserving wherever they can be, so nothing
-after the patch shifts and the file is wrong in exactly one way; a mutation that moved offsets would
-produce a file broken twice, and a reader could pass by noticing the wrong fault. The exception is
-`EmptyTemporalModel`: shortening a length-prefixed string would move the Header fields after it, so
-the generator writes a fresh file with an empty `temporal_model` instead of byte-patching the base.
+`generator/invalid.py` declares the other half: the baseline ten mutations of valid base files plus
+one directly encoded case, and 18 late-placement mutations, each paired with the **refusal
+identifier** a conforming reader must produce. Mutations are length-preserving wherever possible.
+`EmptyTemporalModel` is encoded afresh because shortening its string would move later Header fields.
+Each late case inserts one empty framed record after the state run and repairs Footer
+`summary_start`; its Chunk Index, summary bytes and summary CRC therefore stay valid.
 
-The expectation — and so the document the runner prints — is a JSON object with one key:
+Most expectations — and so the documents runners print — are JSON objects with one key:
 
 ```json
 { "refused": "window-index-out-of-range" }
 ```
 
-and the runner exits 0, because a refusal is a result rather than a crash.
+The late-placement expectations additionally carry the exact physical evidence:
+
+```json
+{
+  "firstStateRecord": { "at": "516", "opcode": 5 },
+  "lateRecord": { "at": "2374", "opcode": 1 },
+  "refused": "late-front-matter-record"
+}
+```
+
+Offsets are decimal strings under the canonical integer rule. The runner exits 0 in both shapes,
+because a refusal is a result rather than a crash.
 
 The identifier matters more than it looks. "Both decoders raised an error" is not agreement: one of
 them may have refused for the wrong reason, which is precisely the failure a negative test exists to
 catch. The identifier names the rule, and it is the same string in every language. The current
-invalid corpus uses eight, declared as constants in `mod refusal` in
+baseline invalid corpus uses eight, and the late family adds a ninth. They are declared as constants
+in `mod refusal` in
 [`rust/fourdgs/src/error.rs`](https://github.com/avala-ai/4dgs/blob/main/rust/fourdgs/src/error.rs)
-and gathered as `CODES` in `invalid.py`. That registry is closed for these eleven expectations: a
-runner may not substitute another identifier for them, and a new invalid-corpus refusal is added
-there rather than invented in one language. Other features have their own named refusals —
-keyframe-delta includes `depth-mismatch`, for example — and future corpus families may exercise
-those without adding them to `invalid.CODES`.
+and gathered as `CODES` in `invalid.py`. That registry is closed for these expectations: a runner
+may not substitute another identifier for them, and a new invalid-corpus refusal is added there
+rather than invented in one language. Other features have their own named refusals — keyframe-delta
+includes `depth-mismatch`, for example — and future corpus families may exercise those without
+adding them to `invalid.CODES`.
 
 | Invalid variant             | Identifier                    | The rule it breaks                                                     | Where    |
 | --------------------------- | ----------------------------- | ---------------------------------------------------------------------- | -------- |
@@ -449,40 +476,43 @@ other side: it reconstructs `exp(0) = 1` and prevents a decoder from replacing t
 an undeclared Quantization-parameter ceiling. The `never_fades` flag's specified `sigma_t = +inf` is
 the legal sentinel control and must not be refused.
 
-Spec §4 likewise defines `late-front-matter-record` before the corpus carries a witness. It applies
-when a streamed reader or validator encounters any defined front-matter opcode after the first Chunk
-or Delta Chunk, including a late duplicate Header, Quantization or Window Table. The diagnostic
-names the late opcode and its physical byte plus the first state record and its physical byte; a
-generic duplicate or parse refusal does not prove this ordering rule.
+Spec §4's `late-front-matter-record` is exercised by 15 gaussian-birth variants, one for every
+defined front-matter opcode: Header, Quantization, Window Table, legacy Audio, Camera, Metadata,
+Attachment, Audio Source, Audio Data, Coordinate Frame, Sensor Calibration, Rig Trajectory, Geodetic
+Anchor, Object Table and Object Track. Three more cases put Quantization, Window Table and Object
+Track through the independent keyframe-delta stream loop. All 18 carry empty bodies, so a parser
+that looks at the content before enforcing placement produces the wrong result. Header, Quantization
+and Window Table already occurred in front matter, so their cases also require the positional
+refusal to win over the duplicate rule.
 
-When late-front-matter variants are activated, they are applicable to streamed runners and
-validators, not universally to both decode paths. An indexed range opener may stop framing at the
-first state record and need not scan unrelated gaps, so the harness must record those invalid
-variants as streamed-only rather than treating an indexed skip as a missing refusal. An indexed
-implementation that does scan far enough may return the same refusal. This exception is specific to
-the late-placement family; all eleven invalid variants in the current corpus remain applicable to
-both read paths, and the counts and eight-identifier table above therefore do not change yet.
+Every expectation machine-checks the late opcode/byte and the first-state opcode/byte. Validators
+consume the same fixtures in each SDK's validator suite; a built-in family enters
+`LATE_FRONT_MATTER_FAMILIES` only after both its streamed runner and validator prove those sites.
+Unknown and private opcodes inserted at the same location remain accepted controls. The live harness
+and release manifest both mark all 18 invalid variants streamed-only: an indexed range opener may
+stop framing at the first state record and need not scan unrelated gaps. An implementation that does
+scan far enough may return the same refusal, but conformance does not require the extra I/O.
 
-For the current invalid corpus, only an error carrying the expected one of those eight identifiers
-is a refusal answer. More generally, a named refusal is an answer only when the expectation names
-it. If decoding fails without one — a truncated transport, an I/O error, an ordinary parse failure —
-the runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In
-particular, `{"refused": ""}` is not the representation of an unnamed error: it exits zero and
-therefore claims the runner produced a valid answer, even though the empty string is not an
-identifier the format defines. All six built-in runners preserve this split: each answers only for
-an error its package names with a refusal identifier, and writes anything else to stderr with a
-non-zero exit. The handling that does not — catching the package's error type, substituting `""` for
-a missing code and exiting zero — misclassifies an unnamed decoder error as an answered refusal. An
-empty identifier matches none of today's invalid expectations, so it is red there, but the
-misclassification is a runner defect, not an alternative protocol. An outside implementation that
-cannot name a decoder error must fail the invocation rather than copy those empty refusals.
+For the current invalid corpus, only an error carrying the expected one of its nine identifiers is a
+refusal answer. More generally, a named refusal is an answer only when the expectation names it. If
+decoding fails without one — a truncated transport, an I/O error, an ordinary parse failure — the
+runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In particular,
+`{"refused": ""}` is not the representation of an unnamed error: it exits zero and therefore claims
+the runner produced a valid answer, even though the empty string is not an identifier the format
+defines. All six built-in runners preserve this split: each answers only for an error its package
+names with a refusal identifier, and writes anything else to stderr with a non-zero exit. The
+handling that does not — catching the package's error type, substituting `""` for a missing code and
+exiting zero — misclassifies an unnamed decoder error as an answered refusal. An empty identifier
+matches none of today's invalid expectations, so it is red there, but the misclassification is a
+runner defect, not an alternative protocol. An outside implementation that cannot name a decoder
+error must fail the invocation rather than copy those empty refusals.
 
-For built-ins, whether any of this runs is gated at family granularity by `REFUSAL_FAMILIES`, which
-today holds every built-in family: `python`, `rust`, `typescript`, `cpp`, `swift` and `dart`. None
-of them skips the invalid corpus. A family absent from the set skips all eleven invalid variants,
-and the feature matrix is where that shows up publicly. An out-of-tree runner makes the same claim
-with `"refusals": true` in its capabilities object, so it needs no harness edit and is held to all
-eleven or none of them.
+For built-ins, `REFUSAL_FAMILIES` gates the baseline eleven and today holds every family: `python`,
+`rust`, `typescript`, `cpp`, `swift` and `dart`. `LATE_FRONT_MATTER_FAMILIES` independently gates
+the 18 structured cases and begins empty in the shared layer; each SDK adds its family only when its
+implementation layer proves the claim. An out-of-tree runner makes both claims itself with
+`"refusals": true` and `"lateFrontMatterRecords": true`. The latter without the former is a protocol
+error, and neither field may select only some of the cases it names.
 
 ### Aggregate decoded-budget gate
 
@@ -684,8 +714,9 @@ delta mode and live/birth/death/update counts, plus reconstructed states at prob
 the reason that model exists is cheap reconstruction at an instant, and that is what two
 implementations should be diffed on. Its shape lives in `states_json`, in `keyframe_delta_file` in
 the Python and Rust cores rather than in `canonical.py`; the `data/keyframe/` expectations are
-those. The valid `gaussian-birth` expectations are `summarize()`'s. The eleven `data/invalid/`
-expectations are the one-key refusal documents described above, not summaries of their files.
+those. The valid `gaussian-birth` expectations are `summarize()`'s. The eleven baseline
+`data/invalid/*.json` expectations are the one-key refusal documents described above, not summaries
+of their files; the structured placement expectations live under `data/invalid/late-front-matter/`.
 
 Finally, an artifact worth naming so that nobody chases it: the committed `.json` files were written
 by the Python implementation, so they carry Python's spelling of every float. That is a fact about
