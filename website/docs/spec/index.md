@@ -65,10 +65,22 @@ A decoder reconstructs, for each gaussian, this state:
 | `source_index`     | i32     | optional producer-side stable label; logical `0` when omitted    |
 | `object_id`        | u32     | optional object membership; `0` means background / unassigned    |
 
+Under `gaussian-birth`, the Chunk that stores a gaussian supplies an enclosing half-open interval
+`[chunk.t0, chunk.t1)`. Define that gaussian's effective existence interval as:
+
+```
+exist_lo = max(win_lo, chunk.t0)
+exist_hi = min(win_hi, chunk.t1)
+```
+
+For `keyframe-delta`, `exist_lo = win_lo` and `exist_hi = win_hi`; §11's state-selection rules
+determine which state is current. `exist_lo` and `exist_hi` are derived contribution bounds, not
+replacements for the decoded `win_lo` and `win_hi` fields.
+
 At scene time `t`:
 
 ```
-visible  =  win_lo <= t < win_hi  AND  marginal >= cutoff
+visible  =  exist_lo <= t < exist_hi  AND  marginal >= cutoff
 marginal =  sigma_t == +inf ? 1 : exp(-0.5 * ((t - mu_t) / sigma_t)^2)
 base_center = position + motion * (t - mu_t)
 center      = base_center
@@ -96,9 +108,9 @@ with `object_id = 0`, or whose object has no track, keeps the base center and or
 ### 3.1 Visibility profiles
 
 The temporal fields describe a soft fade, but the model also expresses a **hard** one. A gaussian
-flagged as never-fading has a marginal of 1 across its whole validity window and is absent outside
-it: full opacity, hard edges, no fade. That is a genuinely different visibility curve from the usual
-bell, reached with fields that already exist and no extra machinery.
+flagged as never-fading has a marginal of 1, so it has full opacity across its effective existence
+interval and is absent outside it: hard edges, no fade. That is a genuinely different visibility
+curve from the usual bell, reached with fields that already exist and no extra machinery.
 
 Producers SHOULD declare which they intend with the `visibility_profile` metadata key — `gaussian`
 for the soft fade, `box` for the hard-edged one. It is a statement of intent for consumers and
@@ -106,9 +118,10 @@ tooling; both decode by the same arithmetic. The registry also reserves a third 
 version's wire model cannot express, so that the distinction stays explicit rather than being
 blurred into `box`.
 
-**The validity window is the format's only hard temporal gate.** `mu_t` and `sigma_t` describe a
-soft fade; `win_lo`/`win_hi` describe existence. A gaussian outside its window does not exist at
-that time, regardless of its marginal.
+**The validity window is the only hard temporal gate stored per gaussian.** `mu_t` and `sigma_t`
+describe a soft fade; `win_lo`/`win_hi` describe existence. A gaussian outside its window does not
+exist at that time, regardless of its marginal. Under `gaussian-birth`, its owning Chunk supplies
+the separate enclosing gate §5.5 defines; the gaussian contributes only where both intervals hold.
 
 ### 3.2 Finite binary32 attribute reconstruction
 
@@ -549,6 +562,20 @@ stream's `attribute_id`. A reader walks it by decoding each stream's header and 
 is frozen (§4.4); the name is a misnomer, and this paragraph is the correction.
 
 Chunks are **independently decodable**: nothing in a chunk references another chunk.
+
+Under `gaussian-birth`, the interval is semantic rather than merely an index hint. A gaussian in a
+Chunk contributes only on the intersection of its own validity window and that Chunk's interval:
+
+```
+[max(win_lo, t0), min(win_hi, t1))
+```
+
+Outside that intersection it is absent, even if its stored validity window and marginal would
+otherwise include the requested instant. An empty intersection is valid and contributes nothing; a
+validity window that starts before `t0` or ends after `t1` is likewise valid and is clipped for
+contribution rather than refused. This rule changes neither the decoded `win_lo`/`win_hi` values nor
+the marginal arithmetic. It gives a streamed decode and an indexed decode the same gaussian state at
+an instant (§3, §8).
 
 `compression` names a codec applied to the whole `records` block, and `uncompressed_size` is the
 length that block decompresses to. When `compression` is `""` the block is stored as-is and
@@ -1464,8 +1491,18 @@ The index gives one rule, and it is the whole seek algorithm:
 chunks_for(t) = every Chunk Index entry whose [t0, t1) contains t
 ```
 
-A reader displays instant `t` by reading the Footer, the index, and then those chunks' byte ranges.
-Nothing else is required, and no chunk depends on another.
+A reader reconstructs instant `t` by reading the Footer, the index, and then those chunks' byte
+ranges. Nothing else is required, and no chunk depends on another. The predicate is complete even
+when a gaussian's stored validity window outlives its Chunk: §5.5 makes the Chunk interval an
+enclosing contribution gate, so an unselected Chunk cannot contribute at `t`.
+
+The absence of a Chunk Index changes seek cost, not reconstruction semantics. A front-to-back
+streamed decoder reads `t0` and `t1` from each Chunk itself and MUST produce the same answer at `t`
+as an indexed decoder. This does not prescribe an in-memory representation or require a second pass:
+an implementation may apply the gate while a Chunk passes, retain an association with its decoded
+rows, or expose/materialize the effective interval. Whichever shape it uses remains subject to the
+bounded-streaming rule (§1); it does not need an index or an unbounded whole-file buffer merely to
+honour the interval already present on the current Chunk.
 
 **Seek efficiency is a property of the content, not of the container.** Content whose gaussians have
 finite validity windows partitions into many small chunks, and an instant costs a fraction of the
@@ -1865,6 +1902,7 @@ and the text was the bug.
 | §4 added: defined front matter MUST precede the first state record; an observed late record is `late-front-matter-record`                         | clarification, rule added |
 | §11.5 corrected: `rotation_index` is absolute when present, not GOP-invariant, as §5.18 already required                                          | correction                |
 | §5.3/§5.18/§6.1/§6.6/§11.3/§11.5 and registry: omitted optional identity lanes are logical zero; updates carry forward or restate them absolutely | clarification, rule added |
+| §3/§5.5/§8: `gaussian-birth` contribution is the Chunk/window intersection; registry wording aligned                                              | clarification             |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
 opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append
@@ -1957,6 +1995,14 @@ do not currently emit optional identity lanes under `keyframe-delta`, and the co
 file, so no known produced file changes meaning. The ruling is made before that writer/corpus work,
 when the ambiguous shape has no compatibility constituency. It does not adopt Object Track
 composition or the `objects` profile changes still proposed under #79.
+
+The §3/§5.5/§8 row changes no byte and makes no file malformed. §5.5 has always said that a Chunk's
+gaussians are invisible outside its interval, and §8 has always made those same intervals the whole
+indexed seek predicate; the clarification applies that existing gate explicitly when a stored
+per-gaussian window extends farther. Indexed reconstruction keeps the meaning it already had. A
+streamed reconstruction that previously used only `win_lo`/`win_hi` changes at those outlying
+instants so both paths return the same state. The outliving window remains legal, its decoded
+endpoints remain intact, and no producer containment rule or new refusal is introduced.
 
 The two §6.5 rows are the same kind of change from opposite directions, and neither moves a byte in
 any file that exists.
