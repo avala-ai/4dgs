@@ -99,7 +99,7 @@ const config = {
             label: "Reference",
           },
           {
-            href: "https://viewer.4dgs.dev",
+            href: "https://avala-ai.github.io/4dgs-viewer/",
             label: "Viewer",
             position: "left",
           },
@@ -121,7 +121,7 @@ const config = {
           {
             title: "Documentation",
             items: [
-              { label: "Viewer", href: "https://viewer.4dgs.dev" },
+              { label: "Viewer", href: "https://avala-ai.github.io/4dgs-viewer/" },
               { label: "Guides", to: "/guides/" },
               { label: "Specification", to: "/spec/" },
               { label: "Feature support matrix", to: "/reference/" },
