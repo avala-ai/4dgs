@@ -6,6 +6,8 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-05
+
 ### Changed
 
 - **Decoded Chunk Index counts are verified as `index-record-mismatch`.** Ordinary and
