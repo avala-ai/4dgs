@@ -1201,10 +1201,34 @@ class TestTheIndexIsData:
 
         report = validate(_repack_summary(data, change))
         assert not report.ok
+        observed = (
+            "decoded Chunk's validated gaussian row count"
+            if field == "gaussian_count"
+            else "Chunk record there declares"
+        )
         assert any(
-            f"declares {field}" in finding.message and "Chunk record there declares" in finding.message
-            for finding in report.findings
+            f"declares {field}" in finding.message and observed in finding.message for finding in report.findings
         ), report.findings
+
+    def test_gaussian_birth_count_matches_decoded_rows_on_both_read_paths(self):
+        data = _repack_summary(
+            _real_file(),
+            lambda i, entry: _with(entry, gaussian_count=entry.gaussian_count + 1) if i == 0 else entry,
+        )
+        declared = _index_entries(data)[0].gaussian_count
+        expected = declared - 1
+
+        with pytest.raises(MalformedFile) as streamed:
+            fourdgs.read(data)
+        scene = open_indexed(BytesReadable(data))
+        with pytest.raises(MalformedFile) as indexed:
+            read_chunk(BytesReadable(data), scene, scene.index[0])
+
+        for caught in (streamed, indexed):
+            assert caught.value.code == "index-record-mismatch"
+            message = str(caught.value)
+            assert f"declares gaussian_count {declared}" in message
+            assert f"validated gaussian row count is {expected}" in message
 
     def test_a_zero_length_range_at_eof_is_a_finding_not_an_index_error(self):
         data = _keyframe_file()
