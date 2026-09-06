@@ -13,6 +13,12 @@
  */
 
 import { checkWindowIndex, windowTableOrDefault, type ChunkGaussians } from "./chunk.js";
+import {
+  DEFAULT_MAX_DECODED_STATE_BYTES,
+  DecodedStateBudget,
+  gaussianSetAssemblyBytes,
+  validateMaxDecodedStateBytes,
+} from "./decodedStateBudget.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import type { ShCoefficients } from "./sh.js";
 
@@ -158,6 +164,13 @@ export function marginalAt(muT: number, sigmaT: number, t: number): number {
   return Math.exp(-0.5 * z * z);
 }
 
+/** Resource configuration for the public final-assembly helper. */
+export interface AssembleGaussiansOptions {
+  readonly maxDecodedStateBytes?: number;
+  /** A collecting adapter uses one tracker for its retained chunks and final output. */
+  readonly decodedStateBudget?: DecodedStateBudget;
+}
+
 /**
  * Concatenate decoded chunks and resolve each gaussian's validity window.
  *
@@ -170,7 +183,20 @@ export function assembleGaussians(
   windows: Float64Array,
   shDegree: number,
   sh: ShCoefficients | null = null,
+  options: AssembleGaussiansOptions = {},
 ): GaussianSet {
+  const configuredLimit = options.maxDecodedStateBytes;
+  const maxDecodedStateBytes =
+    configuredLimit === undefined ? DEFAULT_MAX_DECODED_STATE_BYTES : configuredLimit;
+  validateMaxDecodedStateBytes(maxDecodedStateBytes);
+  if (options.decodedStateBudget !== undefined && configuredLimit !== undefined) {
+    throw new RangeError(
+      "maxDecodedStateBytes and decodedStateBudget are alternative budget sources; pass only one",
+    );
+  }
+  const budget = options.decodedStateBudget ?? new DecodedStateBudget(maxDecodedStateBytes);
+  budget.check(gaussianSetAssemblyBytes(chunks), "gaussian-birth final scene assembly");
+
   let count = 0;
   for (const chunk of chunks) count += chunk.count;
   if (count === 0) return GaussianSet.empty(shDegree);

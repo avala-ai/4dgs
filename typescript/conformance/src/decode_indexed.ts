@@ -11,6 +11,9 @@
  */
 
 import {
+  DEFAULT_MAX_DECODED_STATE_BYTES,
+  DecodedStateBudget,
+  ExceedsReaderLimit,
   FourdgsError,
   MAGIC,
   Opcode,
@@ -25,6 +28,7 @@ import {
   type ChunkGaussians,
   type IReadable,
   type ShCoefficients,
+  validateMaxDecodedStateBytes,
 } from "@4dgs/core";
 import { FileHandleReadable } from "@4dgs/nodejs";
 
@@ -49,7 +53,10 @@ async function temporalModel(source: IReadable, size: number): Promise<string | 
   return null;
 }
 
-export async function run(path: string): Promise<string> {
+export async function run(
+  path: string,
+  maxDecodedStateBytes = DEFAULT_MAX_DECODED_STATE_BYTES,
+): Promise<string> {
   const file = await FileHandleReadable.open(path);
   const source = new CountingReadable(file);
   try {
@@ -60,13 +67,21 @@ export async function run(path: string): Promise<string> {
       // Agreeing across the two paths is most of what makes an indexed keyframe-delta reader
       // trustworthy.
       const data = await source.read(0n, BigInt(size));
-      return canonical(keyframeDeltaStatesJson((await decodeKeyframeDeltaIndexed(data)).sequence));
+      return canonical(
+        keyframeDeltaStatesJson(
+          (await decodeKeyframeDeltaIndexed(data, { maxDecodedStateBytes })).sequence,
+        ),
+      );
     }
+    const decodedStateBudget = new DecodedStateBudget(maxDecodedStateBytes);
     const scene = await IndexedDecoder.open(source);
     const chunks: ChunkGaussians[] = [];
     const shParts: ShCoefficients[] = [];
     for (const entry of scene.index) {
-      const chunk = await scene.readChunk(entry, { maxShBand: MAX_SH_DEGREE });
+      const chunk = await scene.readChunk(entry, {
+        maxShBand: MAX_SH_DEGREE,
+        decodedStateBudget,
+      });
       chunks.push(chunk.gaussians);
       if (chunk.sh !== null) shParts.push(chunk.sh);
     }
@@ -86,7 +101,8 @@ export async function run(path: string): Promise<string> {
           chunks,
           scene.windows,
           scene.header.shDegree,
-          concatenateSh(shParts),
+          concatenateSh(shParts, decodedStateBudget),
+          { decodedStateBudget },
         ),
         audioSources,
         chunkIntervals: scene.index.map((entry) => [entry.t0, entry.t1] as const),
@@ -106,7 +122,10 @@ export async function run(path: string): Promise<string> {
 }
 
 /** One scene's coefficients, out of the per-chunk arrays the index led to. */
-function concatenateSh(parts: readonly ShCoefficients[]): ShCoefficients | null {
+function concatenateSh(
+  parts: readonly ShCoefficients[],
+  decodedStateBudget: DecodedStateBudget,
+): ShCoefficients | null {
   if (parts.length === 0) return null;
   const degree = parts[0]!.degree;
   let count = 0;
@@ -118,34 +137,55 @@ function concatenateSh(parts: readonly ShCoefficients[]): ShCoefficients | null 
     count += part.count;
     length += part.values.length;
   }
+  decodedStateBudget.check(length, "indexed gaussian-birth SH band assembly");
   const values = new Uint8Array(length);
   let at = 0;
   for (const part of parts) {
     values.set(part.values, at);
     at += part.values.length;
   }
+  decodedStateBudget.retain(length, "indexed gaussian-birth SH band collection");
   return { degree, coefficients: parts[0]!.coefficients, count, values, bands: parts[0]!.bands };
 }
 
-const path = process.argv[2];
-if (path === undefined) {
-  process.stderr.write("usage: decode_indexed.js <file.4dgs>\n");
+const argv = process.argv.slice(2);
+const injected = argv[0] === "--max-decoded-state-bytes";
+const path = injected ? argv[2] : argv[0];
+const limitArgument = injected ? argv[1] : undefined;
+const maxDecodedStateBytes =
+  limitArgument !== undefined && /^[0-9]+$/.test(limitArgument)
+    ? Number(limitArgument)
+    : injected
+      ? Number.NaN
+      : DEFAULT_MAX_DECODED_STATE_BYTES;
+if (
+  path === undefined ||
+  (injected ? argv.length !== 3 : argv.length !== 1) ||
+  !Number.isSafeInteger(maxDecodedStateBytes) ||
+  maxDecodedStateBytes <= 0
+) {
+  process.stderr.write("usage: decode_indexed.js [--max-decoded-state-bytes N] <file.4dgs>\n");
   process.exit(2);
 }
+validateMaxDecodedStateBytes(maxDecodedStateBytes);
 try {
-  process.stdout.write((await run(path)) + "\n");
+  process.stdout.write((await run(path, maxDecodedStateBytes)) + "\n");
 } catch (error) {
-  // Both read paths answer the invalid corpus, and they reach the Header by different
-  // routes — one front to back, one through the Footer. A check placed on only one of
-  // them refuses half the files it should, and only running both can show that.
-  if (!(error instanceof FourdgsError)) throw error;
-  // The same rule about what counts as an answer, reached by the other route: only an
-  // error the refusal table names is one. Anything else is a failed invocation, on
-  // stderr with a non-zero exit. See `refusalAnswer`.
-  const answer = refusalAnswer(error);
-  if (answer === null) {
-    process.stderr.write(`${path}: ${error.message}\n`);
-    process.exit(1);
+  if (error instanceof ExceedsReaderLimit) {
+    process.stdout.write('{"unsupported":"resource-limit"}\n');
+  } else {
+    // Both read paths answer the invalid corpus, and they reach the Header by different
+    // routes — one front to back, one through the Footer. A check placed on only one of
+    // them refuses half the files it should, and only running both can show that.
+    if (!(error instanceof FourdgsError)) throw error;
+    // The same rule about what counts as an answer, reached by the other route: only an
+    // error the refusal table names is one. Anything else is a failed invocation, on
+    // stderr with a non-zero exit. See `refusalAnswer`.
+    const answer = refusalAnswer(error);
+    if (answer === null) {
+      process.stderr.write(`${path}: ${error.message}\n`);
+      process.exit(1);
+    }
+    process.stdout.write(answer + "\n");
   }
-  process.stdout.write(answer + "\n");
 }

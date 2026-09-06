@@ -42,6 +42,7 @@ import {
 } from "./chunk.js";
 import { Crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
+import { DEFAULT_MAX_DECODED_STATE_BYTES, DecodedStateBudget } from "./decodedStateBudget.js";
 import { lateFrontMatterRecord, MalformedFile, TruncatedFile } from "./errors.js";
 import { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";
 import {
@@ -92,7 +93,13 @@ import {
 } from "./records.js";
 import { BytesReadable, type IReadable } from "./readable.js";
 import { coefficientsInBand, mergeBands, type ShCoefficients } from "./sh.js";
-import { decodeStream, frameOneStream, frameStreams, type RawStream } from "./streams.js";
+import {
+  decodedStreamWorkingBytes,
+  decodeStream,
+  frameOneStream,
+  frameStreams,
+  type RawStream,
+} from "./streams.js";
 
 /**
  * Composed bins are signed 32-bit. Not a limit anyone meets — at a millimetre grid it
@@ -104,6 +111,29 @@ import { decodeStream, frameOneStream, frameStreams, type RawStream } from "./st
  */
 export const KEYFRAME_DELTA_BIN_MIN = -2147483648;
 export const KEYFRAME_DELTA_BIN_MAX = 2147483647;
+
+/** Resource and codec configuration for a collecting keyframe-delta decode. */
+export interface KeyframeDeltaDecodeOptions {
+  readonly codecs?: CodecRegistry;
+  readonly maxDecodedStateBytes?: number;
+}
+
+function collectingDecodeConfiguration(
+  value: CodecRegistry | KeyframeDeltaDecodeOptions | undefined,
+): { readonly codecs: CodecRegistry; readonly budget: DecodedStateBudget } {
+  const options =
+    value !== undefined && typeof (value as CodecRegistry).get === "function"
+      ? { codecs: value as CodecRegistry }
+      : ((value as KeyframeDeltaDecodeOptions | undefined) ?? {});
+  return {
+    codecs: options.codecs ?? DEFAULT_CODECS,
+    budget: new DecodedStateBudget(
+      options.maxDecodedStateBytes === undefined
+        ? DEFAULT_MAX_DECODED_STATE_BYTES
+        : options.maxDecodedStateBytes,
+    ),
+  };
+}
 
 /**
  * Validation retains only interval endpoints, never decoded states, but even that metadata
@@ -226,6 +256,64 @@ export class KeyframeDeltaState {
   get count(): number {
     return this.ids.length;
   }
+}
+
+/** Typed-array capacity owned directly by one composed state's identity and bin lanes. */
+function stateCoreCapacityBytes(state: KeyframeDeltaState): number {
+  let bytes = state.ids.byteLength;
+  for (const column of binsOf(state).values()) bytes += column.values.byteLength;
+  return bytes;
+}
+
+/** Typed-array capacity reachable from one independently composed state. */
+function stateCapacityBytes(state: KeyframeDeltaState): number {
+  let bytes = stateCoreCapacityBytes(state);
+  const seen = new Set<Int32Array>();
+  for (const column of bandsOf(state).values()) {
+    for (let segment = column.tail; segment !== null; segment = segment.previous) {
+      if (!seen.has(segment.values)) {
+        seen.add(segment.values);
+        bytes += segment.values.byteLength;
+      }
+    }
+  }
+  return bytes;
+}
+
+function retainNewStateArrays(
+  state: KeyframeDeltaState,
+  budget: DecodedStateBudget,
+  retained: Set<Int32Array>,
+  phase: string,
+): void {
+  const arrays: Int32Array[] = [state.ids];
+  for (const column of binsOf(state).values()) arrays.push(column.values);
+  for (const column of bandsOf(state).values()) {
+    for (let segment = column.tail; segment !== null; segment = segment.previous) {
+      arrays.push(segment.values);
+    }
+  }
+  let added = 0;
+  for (const array of arrays) {
+    if (!retained.has(array)) added += array.byteLength;
+  }
+  budget.retain(added, phase);
+  for (const array of arrays) retained.add(array);
+}
+
+function keyframeWorkingBytes(count: number, uncompressedSize: number): bigint {
+  return BigInt(count) * 400n + BigInt(uncompressedSize) * 2n;
+}
+
+function deltaWorkingBytes(reference: KeyframeDeltaState, parsed: ParsedDeltaChunk): bigint {
+  const operations =
+    parsed.header.updateCount + parsed.header.birthCount + parsed.header.deathCount;
+  return (
+    BigInt(stateCapacityBytes(reference)) * 2n +
+    BigInt(parsed.header.birthCount) * 400n +
+    BigInt(operations) * 200n +
+    BigInt(parsed.header.uncompressedSize) * 2n
+  );
 }
 
 /** The state a keyframe chunk states outright, with its identities checked. */
@@ -803,18 +891,32 @@ async function decodeStreams(
 ): Promise<Map<number, Column>> {
   const got = new Map<number, Column>();
   if (blob.length === 0) return got;
-  const framed = frameStreams(new Cursor(blob));
+  const framed: RawStream[] = [];
+  const seen = new Set<number>();
+  for (const stream of frameStreams(new Cursor(blob))) {
+    const channels = ATTRIBUTE_CHANNELS.get(stream.attributeId);
+    // Version 1 readers skip attributes they do not understand by their framed payload
+    // length. Decoding one would both invent semantics and let a tiny constant extension
+    // allocate an arbitrarily large result outside the known-lane budget.
+    if (channels === undefined) continue;
+    if (stream.channels !== channels) {
+      throw new MalformedFile(
+        `attribute ${stream.attributeId} declares ${stream.channels} channels, the format ` +
+          `defines ${channels}`,
+      );
+    }
+    if (seen.has(stream.attributeId)) {
+      throw new MalformedFile(
+        `a keyframe-delta group carries attribute ${stream.attributeId} twice; the format ` +
+          "defines one stream per attribute",
+      );
+    }
+    seen.add(stream.attributeId);
+    framed.push(stream);
+  }
   await Promise.all(
     framed.map(async (stream) => {
       const values = await decodeStream(stream, codecs);
-      // One stream per attribute here too: the regular chunk path refuses a second,
-      // and this path had its own loop that was still resolving it silently.
-      if (got.has(stream.attributeId)) {
-        throw new MalformedFile(
-          `a keyframe-delta group carries attribute ${stream.attributeId} twice; the format ` +
-            "defines one stream per attribute",
-        );
-      }
       got.set(stream.attributeId, { channels: stream.channels, values });
     }),
   );
@@ -851,6 +953,9 @@ async function decodeShBand(
   degree: number,
   expectedRows: number,
   where: string,
+  decodedStateBudget?: DecodedStateBudget,
+  budgetPhase = "keyframe-delta SH band decode",
+  unretainedStateBytes = 0,
 ): Promise<{ band: number; stream: RawStream; values: Int32Array }> {
   const parsed = parseShBandRecord(content);
   const stream = frameOneStream(parsed.cursor);
@@ -883,6 +988,10 @@ async function decodeShBand(
         `${expectedRows}`,
     );
   }
+  decodedStateBudget?.check(
+    BigInt(unretainedStateBytes) + decodedStreamWorkingBytes(stream),
+    budgetPhase,
+  );
   return { band: parsed.band, stream, values: await decodeStream(stream, codecs) };
 }
 
@@ -1230,15 +1339,25 @@ export interface KeyframeDeltaSequence {
 }
 
 /** Front to back: decode each chunk and compose it onto the state it references. */
+export function decodeKeyframeDeltaStreamed(
+  data: Uint8Array,
+  codecs?: CodecRegistry,
+): Promise<KeyframeDeltaSequence>;
+export function decodeKeyframeDeltaStreamed(
+  data: Uint8Array,
+  options?: KeyframeDeltaDecodeOptions,
+): Promise<KeyframeDeltaSequence>;
 export async function decodeKeyframeDeltaStreamed(
   data: Uint8Array,
-  codecs: CodecRegistry = DEFAULT_CODECS,
+  configuration?: CodecRegistry | KeyframeDeltaDecodeOptions,
 ): Promise<KeyframeDeltaSequence> {
+  const { codecs, budget: decodedStateBudget } = collectingDecodeConfiguration(configuration);
   checkMagic(data);
   let header: Header | null = null;
   let quantization: Quantization | null = null;
   let windows = new Float64Array(0);
   const chunks: KeyframeDeltaChunkInfo[] = [];
+  const retainedStateArrays = new Set<Int32Array>();
   // A chunk's composed state and its `level`; the level is kept so a delta can be refused
   // against a reference at a different level (spec §11.6).
   const byOffset = new Map<number, { chunk: KeyframeDeltaChunkInfo; level: number }>();
@@ -1315,6 +1434,10 @@ export async function decodeKeyframeDeltaStreamed(
         );
       }
       const parsed = parseChunk(record.content);
+      decodedStateBudget.check(
+        keyframeWorkingBytes(parsed.header.count, parsed.header.uncompressedSize),
+        `streamed keyframe composition at byte ${record.offset}`,
+      );
       const decoded = await keyframeFromChunk(record.content, codecs);
       const state = keyframeState(decoded.ids, decoded.bins);
       const grids = {
@@ -1327,6 +1450,12 @@ export async function decodeKeyframeDeltaStreamed(
         recordOffset: record.offset,
         operation: "keyframe",
       });
+      retainNewStateArrays(
+        state,
+        decodedStateBudget,
+        retainedStateArrays,
+        `streamed keyframe-delta state collection after byte ${record.offset}`,
+      );
       currentChunk = {
         t0: parsed.header.t0,
         t1: parsed.header.t1,
@@ -1370,12 +1499,22 @@ export async function decodeKeyframeDeltaStreamed(
         record.offset,
         parsed.header.referenceOffset,
       );
+      decodedStateBudget.check(
+        deltaWorkingBytes(reference.chunk.state, parsed),
+        `streamed delta composition at byte ${record.offset}`,
+      );
       const state = await composeDelta(
         reference.chunk.state,
         parsed,
         codecs,
         { quantization, windows, supportK: supportK(header.cutoff) },
         record.offset,
+      );
+      retainNewStateArrays(
+        state,
+        decodedStateBudget,
+        retainedStateArrays,
+        `streamed keyframe-delta state collection after byte ${record.offset}`,
       );
       currentChunk = {
         t0: parsed.header.t0,
@@ -1401,7 +1540,15 @@ export async function decodeKeyframeDeltaStreamed(
       }
       const rows = currentChunk.kind === 0 ? currentChunk.state.count : currentChunk.birthCount!;
       const where = `state chunk at byte ${currentChunk.offset}`;
-      const decoded = await decodeShBand(record.content, codecs, header.shDegree, rows, where);
+      const decoded = await decodeShBand(
+        record.content,
+        codecs,
+        header.shDegree,
+        rows,
+        where,
+        decodedStateBudget,
+        `streamed SH band decode at byte ${record.offset}`,
+      );
       attachShBand(
         currentChunk.state,
         header.shDegree,
@@ -1411,6 +1558,12 @@ export async function decodeKeyframeDeltaStreamed(
         rows,
         where,
         currentBands,
+      );
+      retainNewStateArrays(
+        currentChunk.state,
+        decodedStateBudget,
+        retainedStateArrays,
+        `streamed SH band collection after byte ${record.offset}`,
       );
     } else if (record.opcode === Opcode.Footer) {
       sawFooter = true;
@@ -2114,10 +2267,19 @@ export class KeyframeDeltaIndexedDecoder {
  * seeking client's path — and must reach the same population the streamed path reaches
  * front to back.
  */
+export function decodeKeyframeDeltaIndexed(
+  data: Uint8Array,
+  codecs?: CodecRegistry,
+): Promise<KeyframeDeltaIndexedResult>;
+export function decodeKeyframeDeltaIndexed(
+  data: Uint8Array,
+  options?: KeyframeDeltaDecodeOptions,
+): Promise<KeyframeDeltaIndexedResult>;
 export async function decodeKeyframeDeltaIndexed(
   data: Uint8Array,
-  codecs: CodecRegistry = DEFAULT_CODECS,
+  configuration?: CodecRegistry | KeyframeDeltaDecodeOptions,
 ): Promise<KeyframeDeltaIndexedResult> {
+  const { codecs, budget: decodedStateBudget } = collectingDecodeConfiguration(configuration);
   checkMagic(data);
   let header: Header | null = null;
   let quantization: Quantization | null = null;
@@ -2158,11 +2320,19 @@ export async function decodeKeyframeDeltaIndexed(
   const chunks: KeyframeDeltaChunkInfo[] = [];
   const read = wholeFileRecordReader(data);
   for (const entry of index) {
-    const state = await composeChain(data, index, entry, codecs, header.shDegree, {
-      quantization,
-      windows,
-      supportK: supportK(header.cutoff),
-    });
+    const state = await composeChain(
+      data,
+      index,
+      entry,
+      codecs,
+      header.shDegree,
+      {
+        quantization,
+        windows,
+        supportK: supportK(header.cutoff),
+      },
+      decodedStateBudget,
+    );
     let updateCount: number | null = null;
     let birthCount: number | null = null;
     let deathCount: number | null = null;
@@ -2194,6 +2364,10 @@ export async function decodeKeyframeDeltaIndexed(
       deathCount,
       state,
     });
+    decodedStateBudget.retain(
+      stateCapacityBytes(state),
+      `indexed keyframe-delta state collection after byte ${entry.chunkOffset}`,
+    );
   }
 
   return { sequence: { header, quantization, windows, chunks }, index };
@@ -2277,8 +2451,17 @@ async function composeChain(
   codecs: CodecRegistry,
   shDegree: number,
   grids: DecodedStateGrids,
+  decodedStateBudget?: DecodedStateBudget,
 ): Promise<KeyframeDeltaState> {
-  return composeChainFromReader(wholeFileRecordReader(data), index, entry, codecs, shDegree, grids);
+  return composeChainFromReader(
+    wholeFileRecordReader(data),
+    index,
+    entry,
+    codecs,
+    shDegree,
+    grids,
+    decodedStateBudget,
+  );
 }
 
 async function composeChainFromReader(
@@ -2288,6 +2471,7 @@ async function composeChainFromReader(
   codecs: CodecRegistry,
   shDegree: number,
   grids: DecodedStateGrids,
+  decodedStateBudget?: DecodedStateBudget,
 ): Promise<KeyframeDeltaState> {
   const chain = chainEndingAt(index, entry);
   let state: KeyframeDeltaState | null = null;
@@ -2306,6 +2490,11 @@ async function composeChainFromReader(
     }
     const content = record.content;
     if (link.kind === 0) {
+      const head = parseChunk(content).header;
+      decodedStateBudget?.check(
+        keyframeWorkingBytes(head.count, head.uncompressedSize),
+        `indexed keyframe composition at byte ${link.chunkOffset}`,
+      );
       const decoded = await keyframeFromChunk(content, codecs);
       state = keyframeState(decoded.ids, decoded.bins);
       validateDecodedStateRows(state, decoded.ids, 0, null, grids, {
@@ -2313,7 +2502,6 @@ async function composeChainFromReader(
         recordOffset: link.chunkOffset,
         operation: "keyframe",
       });
-      const head = parseChunk(content).header;
       keyframeLevel = head.level;
       if (link.t0 !== head.t0 || link.t1 !== head.t1) {
         throw new MalformedFile(
@@ -2328,7 +2516,15 @@ async function composeChainFromReader(
         "the decoded keyframe's validated gaussian row count",
         state.count,
       );
-      await attachIndexedShBands(read, link, state, shDegree, state.count, codecs);
+      await attachIndexedShBands(
+        read,
+        link,
+        state,
+        shDegree,
+        state.count,
+        codecs,
+        decodedStateBudget,
+      );
     } else {
       if (state === null) {
         throw new MalformedFile("a keyframe-delta chain begins with a delta chunk");
@@ -2344,6 +2540,10 @@ async function composeChainFromReader(
         link.chunkOffset,
         parsed.header.referenceOffset,
       );
+      decodedStateBudget?.check(
+        BigInt(stateCapacityBytes(state)) + deltaWorkingBytes(state, parsed),
+        `indexed delta composition at byte ${link.chunkOffset}`,
+      );
       state = await composeDelta(state, parsed, codecs, grids, link.chunkOffset);
       checkDecodedIndexCounts(
         link,
@@ -2351,11 +2551,23 @@ async function composeChainFromReader(
         "the decoded Delta Chunk's validated operation count",
         state.count,
       );
-      await attachIndexedShBands(read, link, state, shDegree, parsed.header.birthCount, codecs);
+      await attachIndexedShBands(
+        read,
+        link,
+        state,
+        shDegree,
+        parsed.header.birthCount,
+        codecs,
+        decodedStateBudget,
+      );
     }
     checkCompleteSh(state, shDegree, `state chunk at byte ${link.chunkOffset}`);
   }
   if (state === null) throw new MalformedFile("an empty keyframe-delta chain");
+  decodedStateBudget?.check(
+    stateCapacityBytes(state),
+    `indexed keyframe-delta state retention after byte ${entry.chunkOffset}`,
+  );
   return state;
 }
 
@@ -2366,6 +2578,7 @@ async function attachIndexedShBands(
   shDegree: number,
   addedRows: number,
   codecs: CodecRegistry,
+  decodedStateBudget?: DecodedStateBudget,
 ): Promise<void> {
   const attached = new Set<number>();
   let expectedOffset = entry.chunkOffset + entry.chunkLength;
@@ -2384,7 +2597,16 @@ async function attachIndexedShBands(
       );
     }
     const where = `state chunk at byte ${entry.chunkOffset}`;
-    const decoded = await decodeShBand(record.content, codecs, shDegree, addedRows, where);
+    const decoded = await decodeShBand(
+      record.content,
+      codecs,
+      shDegree,
+      addedRows,
+      where,
+      decodedStateBudget,
+      `indexed SH band decode at byte ${range.offset}`,
+      stateCapacityBytes(state),
+    );
     if (decoded.band !== range.band) {
       throw new MalformedFile(
         `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band}, the record ` +

@@ -135,7 +135,7 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 2048 ] || { echo "::error::rust is ${size_kb} KiB, over the 2048 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 1344 KB
+      - name: TypeScript sources under 1408 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -194,10 +194,14 @@ jobs:
         # floating lane is checked on streamed, indexed and keyframe-delta paths, with
         # physical-row diagnostics and regression fixtures. CI measures 1296 KiB; 1344
         # is the next 64 KiB step and leaves 48 KiB without hiding a vendored dependency.
+        # Raised to 1408 KiB for the aggregate decoded-state budget: one shared tracker,
+        # pre-allocation checks on all three collectors and both runner adapters, and focused
+        # API/subprocess regressions make the clean TypeScript tree 1360 KiB. The next 64 KiB
+        # step preserves the same 48 KiB headroom without weakening the vendoring signal.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 1344 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1344 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1408 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1408 KiB budget"; exit 1; }
       - name: Dart sources under 1600 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored

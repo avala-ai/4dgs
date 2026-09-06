@@ -45,6 +45,57 @@ export interface RawStream {
   readonly payload: Uint8Array;
 }
 
+interface DecodedStreamShape {
+  readonly symbols: number;
+  readonly expectedBytes: number;
+  readonly producedBytes: number;
+}
+
+/** Validate a stream's allocation shape before its codec or typed-array storage is touched. */
+function decodedStreamShape(stream: RawStream): DecodedStreamShape {
+  const { attributeId, symbolWidth, mode, channels, elementCount } = stream;
+  // Preserve the canonical empty-stream behavior: it owns no decoded storage and its
+  // otherwise-unused payload shape is ignored by the decoder.
+  if (elementCount === 0) return { symbols: 0, expectedBytes: 0, producedBytes: 0 };
+  if (symbolWidth !== 1 && symbolWidth !== 2 && symbolWidth !== 4) {
+    throw new MalformedFile(
+      `attribute ${attributeId}: symbol width ${symbolWidth} is not 1, 2 or 4`,
+    );
+  }
+  if (mode !== MODE_RAW && mode !== MODE_DELTA && mode !== MODE_CONST) {
+    throw new MalformedFile(`attribute ${attributeId}: unknown stream mode ${mode}`);
+  }
+  if (channels === 0) {
+    throw new MalformedFile(`attribute ${attributeId}: zero channels`);
+  }
+
+  const symbols = mode === MODE_CONST ? channels : elementCount * channels;
+  const expectedBytes = symbols * symbolWidth;
+  if (expectedBytes > MAX_STREAM_BYTES) {
+    throw new MalformedFile(
+      `attribute ${attributeId} declares ${expectedBytes} decoded bytes, past the ${MAX_STREAM_BYTES} cap`,
+    );
+  }
+  const producedBytes = elementCount * channels * Int32Array.BYTES_PER_ELEMENT;
+  if (producedBytes > MAX_STREAM_BYTES) {
+    throw new MalformedFile(
+      `attribute ${attributeId} declares ${elementCount} elements x ${channels} channels, ` +
+        `which would decode to ${producedBytes} bytes, past the ${MAX_STREAM_BYTES} cap`,
+    );
+  }
+  return { symbols, expectedBytes, producedBytes };
+}
+
+/** Minimum simultaneous decoded storage used while materializing one framed stream. */
+export function decodedStreamWorkingBytes(stream: RawStream): bigint {
+  const { symbols, expectedBytes, producedBytes } = decodedStreamShape(stream);
+  if (symbols === 0) return 0n;
+  // The decompressed byte-plane body coexists with the Int32 symbols. A constant stream
+  // then expands those symbols into a second Int32 result while both are still live.
+  const constantScratch = stream.mode === MODE_CONST ? symbols * Int32Array.BYTES_PER_ELEMENT : 0;
+  return BigInt(expectedBytes) + BigInt(producedBytes) + BigInt(constantScratch);
+}
+
 /**
  * Frame every stream in a chunk's records block, decoding no payloads.
  *
@@ -84,40 +135,14 @@ export function frameOneStream(cursor: Cursor): RawStream {
  */
 export async function decodeStream(stream: RawStream, codecs: CodecRegistry): Promise<Int32Array> {
   const { attributeId, symbolWidth, mode, channels, elementCount } = stream;
+  const { symbols, expectedBytes: expected } = decodedStreamShape(stream);
   if (elementCount === 0) return new Int32Array(0);
-  if (symbolWidth !== 1 && symbolWidth !== 2 && symbolWidth !== 4) {
-    throw new MalformedFile(
-      `attribute ${attributeId}: symbol width ${symbolWidth} is not 1, 2 or 4`,
-    );
-  }
-  if (mode !== MODE_RAW && mode !== MODE_DELTA && mode !== MODE_CONST) {
-    throw new MalformedFile(`attribute ${attributeId}: unknown stream mode ${mode}`);
-  }
-  if (channels === 0) {
-    throw new MalformedFile(`attribute ${attributeId}: zero channels`);
-  }
 
-  const symbols = mode === MODE_CONST ? channels : elementCount * channels;
-  const expected = symbols * symbolWidth;
-  if (expected > MAX_STREAM_BYTES) {
-    throw new MalformedFile(
-      `attribute ${attributeId} declares ${expected} decoded bytes, past the ${MAX_STREAM_BYTES} cap`,
-    );
-  }
-
-  // The cap above bounds what arrives; this one bounds what it becomes. A constant stream
+  // The raw-byte cap bounds what arrives; this one bounds what it becomes. A constant stream
   // stores `channels` symbols and repeats them `elementCount` times, so a header declaring
   // 2^30 elements expands a one-byte payload into gigabytes — and a raw stream of one-byte
   // symbols still expands fourfold into Int32. Neither is caught by a cap on the payload,
   // and both are a few bytes of input away from any file.
-  const produced = elementCount * channels * 4;
-  if (produced > MAX_STREAM_BYTES) {
-    throw new MalformedFile(
-      `attribute ${attributeId} declares ${elementCount} elements x ${channels} channels, ` +
-        `which would decode to ${produced} bytes, past the ${MAX_STREAM_BYTES} cap`,
-    );
-  }
-
   const decompress = decompressorFor(stream.codec, codecs);
   const raw = await decompress(stream.payload, expected);
   const values = unshuffleAndUnzigzag(raw, symbolWidth, symbols);

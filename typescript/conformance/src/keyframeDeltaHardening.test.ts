@@ -17,6 +17,7 @@ import { test } from "node:test";
 
 import {
   Attribute,
+  ExceedsReaderLimit,
   MalformedFile,
   Opcode,
   Refusal,
@@ -33,6 +34,7 @@ import {
   reconstructKeyframeDelta,
   keyframeDeltaValidationRecordOffset,
   parseChunkIndexEntry,
+  parseChunk,
   DEFAULT_CODECS,
   lifeClass,
   motionStep,
@@ -43,7 +45,7 @@ import { validateFile } from "@4dgs/nodejs";
 
 import { num } from "./canonical.js";
 import { MOVING_CHAINED } from "./keyframeDeltaFixtures.js";
-import { concat, deflate, encodeTestStream, record } from "./testing.js";
+import { concat, deflate, encodeTestStream, MODE_CONST, record } from "./testing.js";
 
 function bytes(b64: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, "base64"));
@@ -162,17 +164,22 @@ async function oneGaussianStreams(
     muTBin?: number;
     sigmaTBin?: number;
     positionBins?: readonly [number, number, number];
+    positionChannels?: number;
+    positionCodec?: number;
     scaleBins?: readonly [number, number, number];
     flags?: number;
   } = {},
 ): Promise<Uint8Array> {
-  const s = (attributeId: number, values: number[], channels: number) =>
-    encodeTestStream({ attributeId, values, channels });
+  const s = (attributeId: number, values: number[], channels: number, codec?: number) =>
+    encodeTestStream({ attributeId, values, channels, ...(codec === undefined ? {} : { codec }) });
   const membership = objectId === undefined ? [] : [s(Attribute.ObjectId, [objectId], 1)];
   // One row either way: three channels is what the registry defines, and a one-channel
   // rotation is the malformed shape whose element count still matches the chunk's.
   const rotationChannels = options.rotationChannels ?? 3;
   const rotation = rotationChannels === 3 ? [0, 0, 0] : [0];
+  const positionChannels = options.positionChannels ?? 3;
+  const positionBins = options.positionBins ?? [0, 0, 0];
+  const position = Array.from({ length: positionChannels }, (_, i) => positionBins[i] ?? 0);
   return concat(
     await Promise.all([
       ...membership,
@@ -181,7 +188,7 @@ async function oneGaussianStreams(
         options.idChannels === 2 ? [options.id ?? 0, 123] : [options.id ?? 0],
         options.idChannels ?? 1,
       ),
-      s(Attribute.Position, [...(options.positionBins ?? [0, 0, 0])], 3),
+      s(Attribute.Position, position, positionChannels, options.positionCodec),
       s(Attribute.Scale, [...(options.scaleBins ?? [0, 0, 0])], 3),
       s(Attribute.RotationIndex, [3], 1),
       s(Attribute.Rotation, rotation, rotationChannels),
@@ -478,24 +485,30 @@ async function oneKeyframeFile(options: {
   sigmaTBin?: number;
   flags?: number;
   scaleBins?: readonly [number, number, number];
+  positionChannels?: number;
+  positionCodec?: number;
   stepScaleLog?: number;
   stepSigmaLog?: number;
+  extraStreams?: readonly Uint8Array[];
+  indexed?: boolean;
 }): Promise<Uint8Array> {
-  const rawStreams = await oneGaussianStreams(
-    options.windowIndex,
-    options.motionBinX,
-    options.objectId,
-    {
+  const rawStreams = concat([
+    await oneGaussianStreams(options.windowIndex, options.motionBinX, options.objectId, {
       ...(options.idChannels === undefined ? {} : { idChannels: options.idChannels }),
       ...(options.rotationChannels === undefined
         ? {}
         : { rotationChannels: options.rotationChannels }),
+      ...(options.positionChannels === undefined
+        ? {}
+        : { positionChannels: options.positionChannels }),
+      ...(options.positionCodec === undefined ? {} : { positionCodec: options.positionCodec }),
       ...(options.muTBin === undefined ? {} : { muTBin: options.muTBin }),
       ...(options.sigmaTBin === undefined ? {} : { sigmaTBin: options.sigmaTBin }),
       ...(options.flags === undefined ? {} : { flags: options.flags }),
       ...(options.scaleBins === undefined ? {} : { scaleBins: options.scaleBins }),
-    },
-  );
+    }),
+    ...(options.extraStreams ?? []),
+  ]);
   const blob = options.compress ? await deflate(rawStreams) : rawStreams;
   const chunk = chunkRecord(
     0,
@@ -504,13 +517,29 @@ async function oneKeyframeFile(options: {
     options.compress ? "deflate" : "",
     rawStreams.length,
   );
-  return concat([
+  const front = concat([
     MAGIC,
     record(0x01, headerBody(options.duration)),
     record(0x03, quantizationBody(options.stepScaleLog, options.stepSigmaLog)),
     record(0x04, windowTableBody(options.windows)),
-    chunk,
   ]);
+  if (!options.indexed) return concat([front, chunk]);
+  const chunkOffset = front.length;
+  const summaryStart = chunkOffset + chunk.length;
+  const index = keyframeDeltaIndexRecord({
+    t0: 0,
+    t1: options.duration,
+    chunkOffset,
+    chunkLength: chunk.length,
+    operationCount: 1,
+    kind: 0,
+    referenceOffset: 0,
+    keyframeOffset: chunkOffset,
+    depth: 0,
+    liveCount: 1,
+  });
+  const footer = record(Opcode.Footer, concat([u64(summaryStart), u64(0), u32(0)]));
+  return concat([front, chunk, index, footer, MAGIC]);
 }
 
 /** One SH-bearing keyframe with a complete index, Footer and trailing magic. */
@@ -568,6 +597,107 @@ async function oneKeyframeShFile(
 }
 
 // --- per-gaussian validity window (codex P1 §6.3) -------------------------
+
+test("keyframe-delta skips unknown attribute payloads before decode or budget allocation", async () => {
+  const privateStream = await encodeTestStream({
+    attributeId: 0x80,
+    values: new Array<number>(255).fill(0),
+    channels: 255,
+    mode: MODE_CONST,
+    codec: 0xfe,
+  });
+  // A constant stream stores one channel row but declares the population it would expand
+  // to. Version 1 does not know this private attribute, so neither its codec nor that
+  // expansion belongs to decoded state.
+  new DataView(privateStream.buffer, privateStream.byteOffset, privateStream.byteLength).setUint32(
+    5,
+    1_000_000,
+    true,
+  );
+  for (const indexed of [false, true]) {
+    const file = await oneKeyframeFile({
+      windows: [[0, 1]],
+      windowIndex: 0,
+      motionBinX: 0,
+      duration: 1,
+      extraStreams: [privateStream],
+      indexed,
+    });
+    const sequence = indexed
+      ? (await decodeKeyframeDeltaIndexed(file, { maxDecodedStateBytes: 2_048 })).sequence
+      : await decodeKeyframeDeltaStreamed(file, { maxDecodedStateBytes: 2_048 });
+    assert.equal(sequence.chunks[0]!.state.count, 1);
+  }
+});
+
+test("known attribute width is refused before its unknown codec can allocate", async () => {
+  for (const indexed of [false, true]) {
+    const file = await oneKeyframeFile({
+      windows: [[0, 1]],
+      windowIndex: 0,
+      motionBinX: 0,
+      duration: 1,
+      positionChannels: 4,
+      positionCodec: 0xfe,
+      indexed,
+    });
+    const decode = indexed ? decodeKeyframeDeltaIndexed : decodeKeyframeDeltaStreamed;
+    await assert.rejects(
+      () => decode(file),
+      (error: unknown) => {
+        assert.ok(error instanceof MalformedFile, String(error));
+        assert.match(error.message, /attribute 0 declares 4 channels, the format defines 3/);
+        return true;
+      },
+    );
+  }
+});
+
+test("compressed Chunk preflight counts inflater output and copy buffers", async () => {
+  const privateHead = new Uint8Array(17);
+  privateHead[0] = 0x80;
+  privateHead[1] = 1;
+  privateHead[2] = 0;
+  privateHead[3] = 0xfe;
+  privateHead[4] = 1;
+  new DataView(privateHead.buffer).setUint32(5, 4_096, true);
+  new DataView(privateHead.buffer).setBigUint64(9, 4_096n, true);
+  const privatePayload = new Uint8Array(4_096);
+  let state = 0x6d2b79f5;
+  for (let i = 0; i < privatePayload.length; i++) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    privatePayload[i] = state;
+  }
+  const file = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    compress: true,
+    extraStreams: [concat([privateHead, privatePayload])],
+    indexed: true,
+  });
+  const chunk = [...iterateRecords(file, MAGIC.length)].find(
+    (candidate) => candidate.opcode === Opcode.Chunk,
+  );
+  assert.ok(chunk !== undefined);
+  const decodedBodyBytes = parseChunk(chunk.content).header.uncompressedSize;
+  const oncePlusRows = decodedBodyBytes + 400;
+
+  for (const decode of [decodeKeyframeDeltaStreamed, decodeKeyframeDeltaIndexed]) {
+    await assert.rejects(
+      () => decode(file, { maxDecodedStateBytes: oncePlusRows }),
+      (error: unknown) => {
+        assert.ok(error instanceof ExceedsReaderLimit, String(error));
+        assert.match(error.message, /keyframe composition/);
+        assert.match(error.message, new RegExp(`configured limit is ${oncePlusRows} bytes`));
+        return true;
+      },
+    );
+  }
+});
 
 test("motion precision follows each gaussian's own validity window, not window 0", async () => {
   const motionBinX = 10;

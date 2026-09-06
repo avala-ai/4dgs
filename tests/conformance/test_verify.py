@@ -880,7 +880,9 @@ class TestAggregateDecodedBudgetGate:
         assert message in conformance_run.aggregate_budget_problem(["runner"], 1.0)
 
     def test_capability_claims_match_landed_language_layers(self):
-        assert conformance_run.AGGREGATE_DECODED_BUDGET_FAMILIES == frozenset({"cpp", "dart", "python", "rust"})
+        assert conformance_run.AGGREGATE_DECODED_BUDGET_FAMILIES == frozenset(
+            {"cpp", "dart", "python", "rust", "typescript"}
+        )
 
 
 class TestTheHarnessCanSeeASignedZero:
