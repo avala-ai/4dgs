@@ -252,3 +252,40 @@ def test_only_a_registered_identifier_is_an_answer():
     assert json.loads(refusal_answer(MalformedFile("bad magic", code="magic-mismatch"))) == {
         "refused": "magic-mismatch"
     }
+
+
+def test_late_front_matter_requires_and_serializes_both_physical_sites():
+    error = MalformedFile(
+        "late record",
+        code="late-front-matter-record",
+        late_record=fourdgs.RecordSite(opcode=op.ATTACHMENT, at=2374),
+        first_state_record=fourdgs.RecordSite(opcode=op.CHUNK, at=516),
+    )
+    assert json.loads(refusal_answer(error)) == {
+        "firstStateRecord": {"at": "516", "opcode": op.CHUNK},
+        "lateRecord": {"at": "2374", "opcode": op.ATTACHMENT},
+        "refused": "late-front-matter-record",
+    }
+    assert refusal_answer(MalformedFile("missing sites", code="late-front-matter-record")) is None
+
+
+def _late_front_variants() -> tuple[str, ...]:
+    directory = os.path.join(SHARED_CONFORMANCE, "data", "invalid", "late-front-matter")
+    return tuple(sorted(name.removesuffix(".json") for name in os.listdir(directory) if name.endswith(".json")))
+
+
+@pytest.mark.parametrize("variant", _late_front_variants())
+def test_streamed_runner_preserves_both_sites_for_every_late_front_witness(variant, tmp_path):
+    directory = os.path.join(SHARED_CONFORMANCE, "data", "invalid", "late-front-matter")
+    variant_path = os.path.join(directory, f"{variant}.4dgs")
+    if not os.path.exists(variant_path):
+        pytest.skip("late-front corpus not generated")
+    with open(variant_path, "rb") as source:
+        data = source.read()
+    with open(os.path.join(directory, f"{variant}.json"), encoding="utf-8") as source:
+        expected = json.load(source)
+
+    done = _run("decode_streamed.py", data, tmp_path)
+
+    assert done.returncode == 0, f"{variant}: {done.stderr}"
+    assert json.loads(done.stdout) == expected

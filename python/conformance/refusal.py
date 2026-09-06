@@ -60,4 +60,16 @@ def refusal_answer(exc: BaseException) -> str | None:
     code = getattr(exc, "code", "")
     if code not in CODES:
         return None
+    if code == "late-front-matter-record":
+        late = getattr(exc, "late_record", None)
+        first = getattr(exc, "first_state_record", None)
+        if late is None or first is None:
+            return None
+        return canonical(
+            {
+                "refused": code,
+                "firstStateRecord": {"opcode": first.opcode, "at": str(first.at)},
+                "lateRecord": {"opcode": late.opcode, "at": str(late.at)},
+            }
+        )
     return canonical({"refused": code})
