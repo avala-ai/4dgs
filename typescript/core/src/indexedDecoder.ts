@@ -837,11 +837,10 @@ export class IndexedDecoder {
     }
     const parsed = parseChunk(record.content);
     const streamBytes = await chunkStreamBytes(parsed, this.codecs);
-    const gaussians = await decodeChunkStreams(
-      streamBytes,
-      parsed.header.count,
-      this.chunkOptions(),
-    );
+    const gaussians = await decodeChunkStreams(streamBytes, parsed.header.count, {
+      ...this.chunkOptions(),
+      recordOffset: entry.chunkOffset,
+    });
     checkIndexCount(
       entry,
       "gaussian_count",

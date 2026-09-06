@@ -12,7 +12,31 @@
  * different numbers than the encoder wrote.
  */
 
-import { MalformedFile } from "./errors.js";
+import { MalformedFile, Refusal } from "./errors.js";
+
+/** Greatest finite IEEE 754 binary32 value (spec §3.2). */
+export const F32_MAX = (2 - 2 ** -23) * 2 ** 127;
+
+/** Check a completely reconstructed floating attribute before its binary32 boundary. */
+export function requireDecodedF32(value: number, where: string): number {
+  if (!Number.isFinite(value) || Math.abs(value) > F32_MAX) {
+    throw new MalformedFile(
+      `${where} reconstructs ${value}; expected a finite value in ` +
+        `[-${F32_MAX}, ${F32_MAX}] before binary32 narrowing`,
+      { refusalCode: Refusal.DecodedF32Overflow },
+    );
+  }
+  return value;
+}
+
+/**
+ * Reconstruct one linear grid lane without turning the legal `bin = 0` case into NaN.
+ * A finite declaration has no magnitude ceiling, and a derived effective step may exceed
+ * f64 even though its zero bin still denotes exactly zero.
+ */
+export function reconstructLinear(bin: number, step: number, origin = 0): number {
+  return (bin === 0 ? 0 : bin * step) + origin;
+}
 
 /** Grid pitches, as the Quantization record declares them. */
 export interface Steps {

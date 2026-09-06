@@ -1446,6 +1446,7 @@ async function decodeGaussianBirthChunks(
           windows: windowTableOrDefault(windows),
           supportK: supportK(header.cutoff || DEFAULT_CUTOFF),
           codecs: DEFAULT_CODECS,
+          recordOffset: framed.offset,
         });
       } catch (error) {
         found.error(`chunk ${ordinal} does not decode: ${message(error)}`);

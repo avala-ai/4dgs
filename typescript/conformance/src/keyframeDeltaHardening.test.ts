@@ -19,6 +19,7 @@ import {
   Attribute,
   MalformedFile,
   Opcode,
+  Refusal,
   RECORD_HEADER_BYTES,
   UnsupportedCodec,
   checkTiling,
@@ -121,20 +122,23 @@ async function shBandRecord(band: number, values: number[], channels: number): P
   return record(0x07, concat([new Uint8Array([band]), stream]));
 }
 
-function quantizationBody(): Uint8Array {
+function quantizationBody(
+  stepScaleLog = STEPS.scaleLog,
+  stepSigmaLog = STEPS.sigmaLog,
+): Uint8Array {
   return concat([
     str("uniform-v1"),
     f64(0),
     f64(0),
     f64(0), // pos_origin
     f64(STEPS.pos),
-    f64(STEPS.scaleLog),
+    f64(stepScaleLog),
     f64(STEPS.rot),
     f64(STEPS.rgb),
     f64(STEPS.alpha),
     f64(STEPS.motion),
     f64(STEPS.time),
-    f64(STEPS.sigmaLog),
+    f64(stepSigmaLog),
     new Uint8Array([0]), // step_sh
     EMPTY_MAP, // bounds
   ]);
@@ -157,6 +161,8 @@ async function oneGaussianStreams(
     rotationChannels?: number;
     muTBin?: number;
     sigmaTBin?: number;
+    positionBins?: readonly [number, number, number];
+    scaleBins?: readonly [number, number, number];
     flags?: number;
   } = {},
 ): Promise<Uint8Array> {
@@ -175,8 +181,8 @@ async function oneGaussianStreams(
         options.idChannels === 2 ? [options.id ?? 0, 123] : [options.id ?? 0],
         options.idChannels ?? 1,
       ),
-      s(Attribute.Position, [0, 0, 0], 3),
-      s(Attribute.Scale, [0, 0, 0], 3),
+      s(Attribute.Position, [...(options.positionBins ?? [0, 0, 0])], 3),
+      s(Attribute.Scale, [...(options.scaleBins ?? [0, 0, 0])], 3),
       s(Attribute.RotationIndex, [3], 1),
       s(Attribute.Rotation, rotation, rotationChannels),
       s(Attribute.Color, [0, 0, 0], 3),
@@ -260,6 +266,36 @@ function updateDeltaChunkRecord(options: {
   );
 }
 
+function keyframeDeltaIndexRecord(options: {
+  t0: number;
+  t1: number;
+  chunkOffset: number;
+  chunkLength: number;
+  operationCount: number;
+  kind: 0 | 1;
+  referenceOffset: number;
+  keyframeOffset: number;
+  depth: number;
+  liveCount: number;
+}): Uint8Array {
+  return record(
+    Opcode.ChunkIndex,
+    concat([
+      f64(options.t0),
+      f64(options.t1),
+      u64(options.chunkOffset),
+      u64(options.chunkLength),
+      u32(options.operationCount),
+      u32(0), // no SH bands
+      new Uint8Array([options.kind, 0]), // kind, keyframe-reference delta mode
+      u64(options.referenceOffset),
+      u64(options.keyframeOffset),
+      u16(options.depth),
+      u64(options.liveCount),
+    ]),
+  );
+}
+
 /**
  * A keyframe with one gaussian and no `object_id`, then a delta that births one with it.
  *
@@ -272,24 +308,62 @@ async function keyframeThenBirthFile(options: {
   objectId?: number;
   keyframeObjectId?: number;
   birthIdChannels?: number;
+  birthScaleBins?: readonly [number, number, number];
+  stepScaleLog?: number;
+  indexed?: boolean;
 }): Promise<Uint8Array> {
   const keyframeStreams = await oneGaussianStreams(0, 0, options.keyframeObjectId);
   const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
   const front = concat([
     MAGIC,
-    record(0x01, headerBody(1)),
-    record(0x03, quantizationBody()),
+    record(0x01, headerBody(1, 0, 2)),
+    record(0x03, quantizationBody(options.stepScaleLog)),
     record(0x04, windowTableBody([[0, 1]])),
   ]);
   const births = await oneGaussianStreams(0, 0, options.objectId, {
     id: options.born,
+    ...(options.birthScaleBins === undefined ? {} : { scaleBins: options.birthScaleBins }),
     ...(options.birthIdChannels === undefined ? {} : { idChannels: options.birthIdChannels }),
   });
-  return concat([
-    front,
-    keyframe,
-    deltaChunkRecord({ t0: 0.5, t1: 1, referenceOffset: front.length, births }),
+  const keyframeOffset = front.length;
+  const deltaOffset = keyframeOffset + keyframe.length;
+  const delta = deltaChunkRecord({
+    t0: 0.5,
+    t1: 1,
+    referenceOffset: keyframeOffset,
+    births,
+  });
+  if (!options.indexed) return concat([front, keyframe, delta]);
+
+  const summaryStart = deltaOffset + delta.length;
+  const indexes = concat([
+    keyframeDeltaIndexRecord({
+      t0: 0,
+      t1: 0.5,
+      chunkOffset: keyframeOffset,
+      chunkLength: keyframe.length,
+      operationCount: 1,
+      kind: 0,
+      referenceOffset: 0,
+      keyframeOffset,
+      depth: 0,
+      liveCount: 1,
+    }),
+    keyframeDeltaIndexRecord({
+      t0: 0.5,
+      t1: 1,
+      chunkOffset: deltaOffset,
+      chunkLength: delta.length,
+      operationCount: 1,
+      kind: 1,
+      referenceOffset: keyframeOffset,
+      keyframeOffset,
+      depth: 1,
+      liveCount: 2,
+    }),
   ]);
+  const footer = record(Opcode.Footer, concat([u64(summaryStart), u64(0), u32(0)]));
+  return concat([front, keyframe, delta, indexes, footer, MAGIC]);
 }
 
 async function keyframeThenBirthShFile(): Promise<Uint8Array> {
@@ -403,6 +477,9 @@ async function oneKeyframeFile(options: {
   muTBin?: number;
   sigmaTBin?: number;
   flags?: number;
+  scaleBins?: readonly [number, number, number];
+  stepScaleLog?: number;
+  stepSigmaLog?: number;
 }): Promise<Uint8Array> {
   const rawStreams = await oneGaussianStreams(
     options.windowIndex,
@@ -416,6 +493,7 @@ async function oneKeyframeFile(options: {
       ...(options.muTBin === undefined ? {} : { muTBin: options.muTBin }),
       ...(options.sigmaTBin === undefined ? {} : { sigmaTBin: options.sigmaTBin }),
       ...(options.flags === undefined ? {} : { flags: options.flags }),
+      ...(options.scaleBins === undefined ? {} : { scaleBins: options.scaleBins }),
     },
   );
   const blob = options.compress ? await deflate(rawStreams) : rawStreams;
@@ -429,7 +507,7 @@ async function oneKeyframeFile(options: {
   return concat([
     MAGIC,
     record(0x01, headerBody(options.duration)),
-    record(0x03, quantizationBody()),
+    record(0x03, quantizationBody(options.stepScaleLog, options.stepSigmaLog)),
     record(0x04, windowTableBody(options.windows)),
     chunk,
   ]);
@@ -437,13 +515,19 @@ async function oneKeyframeFile(options: {
 
 /** One SH-bearing keyframe with a complete index, Footer and trailing magic. */
 async function oneKeyframeShFile(
-  options: { indexASecondBand?: boolean } = {},
+  options: {
+    indexASecondBand?: boolean;
+    scaleBins?: readonly [number, number, number];
+    stepScaleLog?: number;
+  } = {},
 ): Promise<Uint8Array> {
-  const streams = await oneGaussianStreams(0, 0);
+  const streams = await oneGaussianStreams(0, 0, undefined, {
+    ...(options.scaleBins === undefined ? {} : { scaleBins: options.scaleBins }),
+  });
   const front = concat([
     MAGIC,
     record(0x01, headerBody(1, 1)),
-    record(0x03, quantizationBody()),
+    record(0x03, quantizationBody(options.stepScaleLog)),
     record(0x04, windowTableBody([[0, 1]])),
   ]);
   const chunk = chunkRecord(0, 1, streams, "", streams.length);
@@ -673,14 +757,18 @@ test("an out-of-range window index is refused, not clamped", async () => {
     motionBinX: 1,
     duration: 1,
   });
-  // The window index is used when the pitch is derived, i.e. during reconstruction.
-  const decoded = await decodeKeyframeDeltaStreamed(file);
-  const chunkOffset = decoded.chunks[0]!.offset;
-  assert.throws(
-    () => keyframeDeltaStatesJson(decoded),
+  // Motion reconstruction needs the referenced window to derive its effective pitch, so
+  // the decoded-state range check reaches the same window refusal while reading the row.
+  const chunkOffset = [...iterateRecords(file, MAGIC.length)].find(
+    (candidate) => candidate.opcode === Opcode.Chunk,
+  )!.offset;
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(file),
     (error: unknown) =>
       error instanceof MalformedFile &&
-      error.message.includes(`keyframe-delta chunk at byte ${chunkOffset}, gaussian id 0`) &&
+      error.message.includes(
+        `Chunk opcode at byte ${chunkOffset}, keyframe row 0, gaussian_id 0`,
+      ) &&
       error.message.includes("window index 3 is outside the 1-entry window table"),
   );
 });
@@ -1048,6 +1136,212 @@ test("a streamless empty keyframe reconstructs as empty state", async () => {
   assert.equal(reconstructed.ids.byteLength, 0);
   assert.equal(reconstructed.centers.byteLength, 0);
   assert.equal(reconstructed.sh, null);
+});
+
+test("decoded f32 overflow names a keyframe Chunk identically on streamed and indexed paths", async () => {
+  const file = await oneKeyframeShFile({ scaleBins: [100, 0, 0], stepScaleLog: 1 });
+  const chunk = [...iterateRecords(file, MAGIC.length)].find(
+    (candidate) => candidate.opcode === Opcode.Chunk,
+  );
+  assert.ok(chunk !== undefined);
+  const rejects = (error: unknown): boolean => {
+    assert.ok(error instanceof MalformedFile, String(error));
+    assert.equal(error.refusalCode, Refusal.DecodedF32Overflow);
+    assert.match(error.message, new RegExp(`Chunk opcode at byte ${chunk.offset}`));
+    assert.match(
+      error.message,
+      /keyframe row 0, gaussian_id 0, scale component x, stored bin 100, effective step 1/,
+    );
+    return true;
+  };
+
+  await assert.rejects(() => decodeKeyframeDeltaStreamed(file), rejects);
+  await assert.rejects(() => decodeKeyframeDeltaIndexed(file), rejects);
+  const report = await validateFile(file, { decode: true });
+  assert.equal(report.refused?.code, Refusal.DecodedF32Overflow);
+  assert.equal(report.refused?.at, chunk.offset);
+});
+
+test("decoded f32 overflow belongs to the Delta Chunk update row", async () => {
+  const keyframeStreams = await oneGaussianStreams(0, 0);
+  const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1)),
+    record(0x03, quantizationBody(1)),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const updates = concat(
+    await Promise.all([
+      encodeTestStream({ attributeId: Attribute.GaussianId, values: [0], channels: 1 }),
+      encodeTestStream({ attributeId: Attribute.Scale, values: [100, 0, 0], channels: 3 }),
+    ]),
+  );
+  const keyframeOffset = front.length;
+  const deltaOffset = front.length + keyframe.length;
+  const delta = updateDeltaChunkRecord({
+    t0: 0.5,
+    t1: 1,
+    referenceOffset: keyframeOffset,
+    updates,
+  });
+  const summaryStart = deltaOffset + delta.length;
+  const indexes = concat([
+    keyframeDeltaIndexRecord({
+      t0: 0,
+      t1: 0.5,
+      chunkOffset: keyframeOffset,
+      chunkLength: keyframe.length,
+      operationCount: 1,
+      kind: 0,
+      referenceOffset: 0,
+      keyframeOffset,
+      depth: 0,
+      liveCount: 1,
+    }),
+    keyframeDeltaIndexRecord({
+      t0: 0.5,
+      t1: 1,
+      chunkOffset: deltaOffset,
+      chunkLength: delta.length,
+      operationCount: 1,
+      kind: 1,
+      referenceOffset: keyframeOffset,
+      keyframeOffset,
+      depth: 1,
+      liveCount: 1,
+    }),
+  ]);
+  const footer = record(Opcode.Footer, concat([u64(summaryStart), u64(0), u32(0)]));
+  const file = concat([front, keyframe, delta, indexes, footer, MAGIC]);
+
+  const rejects = (error: unknown): boolean => {
+    assert.ok(error instanceof MalformedFile, String(error));
+    assert.equal(error.refusalCode, Refusal.DecodedF32Overflow);
+    assert.match(error.message, new RegExp(`Delta Chunk opcode at byte ${deltaOffset}`));
+    assert.match(
+      error.message,
+      /update row 0, gaussian_id 0, scale component x, composed bin 100, effective step 1/,
+    );
+    return true;
+  };
+  await assert.rejects(() => decodeKeyframeDeltaStreamed(file), rejects);
+  await assert.rejects(() => decodeKeyframeDeltaIndexed(file), rejects);
+  const report = await validateFile(file, { decode: true });
+  assert.equal(report.refused?.code, Refusal.DecodedF32Overflow);
+  assert.equal(report.refused?.at, deltaOffset);
+});
+
+test("decoded f32 overflow belongs to the Delta Chunk birth row", async () => {
+  const file = await keyframeThenBirthFile({
+    born: 7,
+    birthScaleBins: [100, 0, 0],
+    stepScaleLog: 1,
+    indexed: true,
+  });
+  const delta = [...iterateRecords(file, MAGIC.length)].find(
+    (candidate) => candidate.opcode === Opcode.DeltaChunk,
+  );
+  assert.ok(delta !== undefined);
+
+  const rejects = (error: unknown): boolean => {
+    assert.ok(error instanceof MalformedFile, String(error));
+    assert.equal(error.refusalCode, Refusal.DecodedF32Overflow);
+    assert.match(error.message, new RegExp(`Delta Chunk opcode at byte ${delta.offset}`));
+    assert.match(
+      error.message,
+      /birth row 0, gaussian_id 7, scale component x, stored bin 100, effective step 1/,
+    );
+    return true;
+  };
+  await assert.rejects(() => decodeKeyframeDeltaStreamed(file), rejects);
+  await assert.rejects(() => decodeKeyframeDeltaIndexed(file), rejects);
+  const report = await validateFile(file, { decode: true });
+  assert.equal(report.refused?.code, Refusal.DecodedF32Overflow);
+  assert.equal(report.refused?.at, delta.offset);
+});
+
+test("decoded f32 checks cover derived infinite steps and future flag bits", async () => {
+  const decode = async (
+    motionBinX: number,
+    options: Parameters<typeof oneGaussianStreams>[3],
+    steps: Partial<typeof STEPS>,
+  ) =>
+    decodeChunkStreams(await oneGaussianStreams(0, motionBinX, undefined, options), 1, {
+      steps: { ...STEPS, sh: 1, ...steps },
+      posOrigin: [0, 0, 0],
+      windows: new Float64Array([0, 1]),
+      supportK: supportK(0.05),
+      codecs: DEFAULT_CODECS,
+      recordOffset: 321,
+    });
+  const refuses =
+    (attribute: string, details: RegExp) =>
+    (error: unknown): boolean => {
+      assert.ok(error instanceof MalformedFile, String(error));
+      assert.equal(error.refusalCode, Refusal.DecodedF32Overflow);
+      assert.match(error.message, new RegExp(`Chunk opcode at byte 321, row 0, ${attribute}`));
+      assert.match(error.message, details);
+      return true;
+    };
+
+  const zero = await decode(
+    0,
+    { flags: 0, sigmaTBin: -127 },
+    {
+      motion: Number.MAX_VALUE,
+      sigmaLog: 1,
+    },
+  );
+  assert.equal(zero.motions[0], 0); // bin 0 is legal even when its derived step is +inf
+  await assert.rejects(
+    () => decode(1, { flags: 0, sigmaTBin: -127 }, { motion: Number.MAX_VALUE, sigmaLog: 1 }),
+    refuses("motion component x", /stored bin 1, effective step Infinity/),
+  );
+  await assert.rejects(
+    () => decode(0, { positionBins: [2, 0, 0] }, { pos: Number.MAX_VALUE }),
+    refuses("position component x", /stored bin 2, effective step 1\.7976931348623157e\+308/),
+  );
+  await assert.rejects(
+    () => decode(0, { muTBin: 2 }, { time: Number.MAX_VALUE }),
+    refuses("mu_t component scalar", /stored bin 2, effective step 1\.7976931348623157e\+308/),
+  );
+  await assert.rejects(
+    () => decode(0, { flags: 0b10, sigmaTBin: 100 }, { sigmaLog: 1 }),
+    refuses("sigma_t component scalar", /stored bin 100, effective step 1/),
+  );
+  const futureNeverFades = await decode(0, { flags: 0b11, sigmaTBin: 100 }, { sigmaLog: 1 });
+  assert.equal(futureNeverFades.sigmaT[0], Infinity);
+});
+
+test("large finite steps, never_fades, f32 rounding and underflow remain legal", async () => {
+  const keyframe = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    scaleBins: [0, 0, 0],
+    stepScaleLog: Number.MAX_VALUE,
+    stepSigmaLog: Number.MAX_VALUE,
+  });
+  const sequence = await decodeKeyframeDeltaStreamed(keyframe);
+  const reconstructed = reconstructKeyframeDelta(sequence, sequence.chunks[0]!, 0.5);
+  assert.deepEqual([...reconstructed.scales], [1, 1, 1]);
+
+  const gaussianStreams = await oneGaussianStreams(0, 0, undefined, {
+    flags: 0,
+    sigmaTBin: -127,
+  });
+  const gaussian = await decodeChunkStreams(gaussianStreams, 1, {
+    steps: { ...STEPS, pos: 0.1, sigmaLog: 1, sh: 1 },
+    posOrigin: [0.1, 0, 0],
+    windows: new Float64Array([0, 1]),
+    supportK: supportK(0.05),
+    codecs: DEFAULT_CODECS,
+    recordOffset: 321,
+  });
+  assert.equal(gaussian.positions[0], new Float32Array([0.1])[0]);
+  assert.equal(gaussian.sigmaT[0], 0);
 });
 
 test("an update restates rotation_index and rotation together", async () => {

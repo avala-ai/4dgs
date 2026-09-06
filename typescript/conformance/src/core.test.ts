@@ -63,6 +63,7 @@ import {
   Opcode,
   RECORD_HEADER_BYTES,
 } from "@4dgs/core";
+import { validateFile } from "@4dgs/nodejs";
 
 import { roundHalfEven } from "./canonical.js";
 import { MODE_CONST, MODE_DELTA, MODE_RAW, concat, encodeTestStream, record } from "./testing.js";
@@ -71,8 +72,9 @@ async function decodeOne(bytes: Uint8Array): Promise<Int32Array> {
   return decodeStream(frameOneStream(new Cursor(bytes)), DEFAULT_CODECS);
 }
 
-function withStepTime(
+function withQuantizationStep(
   bytes: Uint8Array,
+  step: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7,
   value: number,
 ): { readonly bytes: Uint8Array; readonly recordAt: number; readonly fieldAt: number } {
   const out = Uint8Array.from(bytes);
@@ -83,7 +85,7 @@ function withStepTime(
   const contentAt = quantization.offset + RECORD_HEADER_BYTES;
   const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
   const schemeLength = view.getUint32(contentAt, true);
-  const fieldAt = contentAt + 4 + schemeLength + 3 * 8 + 6 * 8;
+  const fieldAt = contentAt + 4 + schemeLength + 3 * 8 + step * 8;
   view.setFloat64(fieldAt, value, true);
   return { bytes: out, recordAt: quantization.offset, fieldAt };
 }
@@ -244,7 +246,7 @@ test("a named refusal carries the identifier every SDK is compared on", () => {
 test("a non-positive birth-time grid is refused by name on both read paths", async () => {
   const encoded = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1);
   for (const value of [0, -0, -0.004]) {
-    const mutated = withStepTime(encoded, value);
+    const mutated = withQuantizationStep(encoded, 6, value);
     const spelling = Object.is(value, -0) ? "-0.0" : value === 0 ? "0.0" : String(value);
     const rejects = (error: unknown): boolean => {
       assert.ok(error instanceof MalformedFile, String(error));
@@ -263,6 +265,76 @@ test("a non-positive birth-time grid is refused by name on both read paths", asy
     await assert.rejects(() => decodeScene(new BytesReadable(mutated.bytes)), rejects);
     await assert.rejects(() => IndexedDecoder.open(new BytesReadable(mutated.bytes)), rejects);
   }
+});
+
+test("decoded f32 scale overflow is refused at the same Chunk row on both read paths", async () => {
+  const defaultScaleStep = 2 * Math.log1p(0.02);
+  const gaussian = oneTemporalGaussian(0.5, 0.1);
+  gaussian.scales.fill(Math.exp(100 * defaultScaleStep));
+  const encoded = await encodeScene(gaussian, 1, { maxDepth: 0, shBands: 0 });
+  const mutated = withQuantizationStep(encoded, 1, 1).bytes;
+  const chunk = [...iterateRecords(mutated, MAGIC.length)].find(
+    (candidate) => candidate.opcode === Opcode.Chunk,
+  );
+  assert.ok(chunk !== undefined);
+
+  const rejects = (error: unknown): boolean => {
+    assert.ok(error instanceof MalformedFile, String(error));
+    assert.equal(error.refusalCode, Refusal.DecodedF32Overflow);
+    assert.match(error.message, new RegExp(`Chunk opcode at byte ${chunk.offset}`));
+    assert.match(error.message, /row 0, scale component x, stored bin 100, effective step 1/);
+    assert.match(error.message, /expected a finite value in \[-3\.4028234663852886e\+38/);
+    return true;
+  };
+
+  await assert.rejects(() => decodeScene(new BytesReadable(mutated)), rejects);
+  const indexed = await IndexedDecoder.open(new BytesReadable(mutated));
+  await assert.rejects(() => indexed.readChunk(indexed.chunksForTime(0.5)[0]!), rejects);
+  const report = await validateFile(mutated, { decode: true });
+  assert.equal(report.refused?.code, Refusal.DecodedF32Overflow);
+  assert.equal(report.refused?.at, chunk.offset);
+});
+
+test("decoded f32 checks preserve result-dependent valid controls", async () => {
+  const zeroScale = oneTemporalGaussian(0.5, Number.POSITIVE_INFINITY);
+  zeroScale.scales.fill(1);
+  const encoded = await encodeScene(zeroScale, 1, { maxDepth: 0, shBands: 0 });
+  const mutated = withQuantizationStep(
+    withQuantizationStep(encoded, 1, Number.MAX_VALUE).bytes,
+    7,
+    Number.MAX_VALUE,
+  ).bytes;
+
+  const streamed = await decodeScene(new BytesReadable(mutated));
+  assert.deepEqual([...streamed.gaussians.scales], [1, 1, 1]);
+  assert.equal(streamed.gaussians.sigmaT[0], Number.POSITIVE_INFINITY);
+
+  const indexed = await IndexedDecoder.open(new BytesReadable(mutated));
+  const decoded = await indexed.readChunk(indexed.chunksForTime(0.5)[0]!);
+  assert.deepEqual([...decoded.gaussians.scales], [1, 1, 1]);
+  assert.equal(decoded.gaussians.sigmaT[0], Number.POSITIVE_INFINITY);
+});
+
+test("unflagged sigma_t overflow uses decoded-f32-overflow", async () => {
+  const defaultSigmaStep = 2 * Math.log1p(0.02);
+  const encoded = await encodeScene(
+    oneTemporalGaussian(0.5, Math.exp(100 * defaultSigmaStep), 1e4),
+    1e4,
+    { maxDepth: 0, shBands: 0 },
+  );
+  const mutated = withQuantizationStep(encoded, 7, 1).bytes;
+  await assert.rejects(
+    () => decodeScene(new BytesReadable(mutated)),
+    (error: unknown) => {
+      assert.ok(error instanceof MalformedFile, String(error));
+      assert.equal(error.refusalCode, Refusal.DecodedF32Overflow);
+      assert.match(
+        error.message,
+        /row 0, sigma_t component scalar, stored bin 100, effective step 1/,
+      );
+      return true;
+    },
+  );
 });
 
 test("CRC-32 matches the IEEE values the footer is written with", () => {
