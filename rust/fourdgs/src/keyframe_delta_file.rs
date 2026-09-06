@@ -1786,6 +1786,17 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                     state,
                 });
             }
+            op::CHUNK_INDEX => {
+                let entry = rec::ChunkIndexEntry::parse(record.content)
+                    .map_err(|error| error.at_record("Chunk Index record", record.offset as u64))?;
+                if let Some(chunk) = chunks
+                    .binary_search_by_key(&entry.chunk_offset, |chunk| chunk.offset)
+                    .ok()
+                    .and_then(|index| chunks.get(index))
+                {
+                    check_decoded_index_counts(&entry, chunk)?;
+                }
+            }
             _ => {}
         }
     }
@@ -1963,6 +1974,12 @@ pub fn read_keyframe_entry<R: crate::Readable + ?Sized>(
     }
     let (state, head) = decode_keyframe_chunk(&content, windows)?;
     check_keyframe_mu_t(&state, head.t0, quantization)?;
+    check_index_count(
+        entry,
+        "gaussian_count",
+        state.count() as u64,
+        "the decoded keyframe's validated gaussian row count",
+    )?;
     Ok((state, head))
 }
 
@@ -1985,7 +2002,76 @@ pub fn read_delta_entry<R: crate::Readable + ?Sized>(
             op::name(opcode)
         )));
     }
-    compose_delta_chunk(reference, &content, windows)
+    let decoded = compose_delta_chunk(reference, &content, windows)?;
+    let operations = u64::from(decoded.1.update_count)
+        + u64::from(decoded.1.birth_count)
+        + u64::from(decoded.1.death_count);
+    check_index_count(
+        entry,
+        "gaussian_count",
+        operations,
+        "the decoded Delta Chunk's validated operation count",
+    )?;
+    Ok(decoded)
+}
+
+pub(crate) fn check_index_count(
+    entry: &rec::ChunkIndexEntry,
+    field: &str,
+    observed: u64,
+    observation: &str,
+) -> Result<()> {
+    let declared = match field {
+        "gaussian_count" => u64::from(entry.gaussian_count),
+        "live_count" => entry.live_count,
+        _ => unreachable!("the index has only two count claims"),
+    };
+    if declared != observed {
+        return Err(Error::index_record_mismatch(
+            entry.chunk_offset,
+            field,
+            declared,
+            observed,
+            observation,
+        ));
+    }
+    Ok(())
+}
+
+fn check_decoded_index_counts(entry: &rec::ChunkIndexEntry, chunk: &ChunkInfo) -> Result<()> {
+    let (operations, observation) = if chunk.kind == 0 {
+        (
+            chunk.state.count() as u64,
+            "the decoded keyframe's validated gaussian row count",
+        )
+    } else {
+        (
+            u64::from(
+                chunk
+                    .update_count
+                    .expect("a decoded delta has an update count"),
+            ) + u64::from(
+                chunk
+                    .birth_count
+                    .expect("a decoded delta has a birth count"),
+            ) + u64::from(
+                chunk
+                    .death_count
+                    .expect("a decoded delta has a death count"),
+            ),
+            "the decoded Delta Chunk's validated operation count",
+        )
+    };
+    check_index_count(entry, "gaussian_count", operations, observation)?;
+    if entry.extended {
+        check_index_count(
+            entry,
+            "live_count",
+            chunk.state.count() as u64,
+            "the composed state's live population",
+        )?;
+    }
+    Ok(())
 }
 
 /// Check that an indexed entry's declared population is the state composition produced.
@@ -1995,12 +2081,12 @@ pub fn read_delta_entry<R: crate::Readable + ?Sized>(
 /// enforce the same invariant.
 pub fn check_composed_population(entry: &rec::ChunkIndexEntry, state: &State) -> Result<()> {
     let composed = state.count() as u64;
-    if entry.live_count != composed {
-        return Err(Error::Malformed(format!(
-            "the index entry at {} declares live_count {}; composing its [{}, {}) state yields {} gaussians",
-            entry.chunk_offset, entry.live_count, entry.t0, entry.t1, composed
-        )));
-    }
+    check_index_count(
+        entry,
+        "live_count",
+        composed,
+        "the composed state's live population",
+    )?;
     if entry.t0 == entry.t1 && composed != 0 {
         return Err(Error::Malformed(format!(
             "the index entry at {} composes {} gaussians over the zero-width interval [{}, {}); expected 0 because no instant can select a half-open zero-width interval",

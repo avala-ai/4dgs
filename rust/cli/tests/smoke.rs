@@ -837,6 +837,90 @@ fn populated_sequence(sample_times: &[f64], duration_sec: f64) -> Vec<u8> {
         .expect("the populated seed sequence encodes")
 }
 
+fn churn_sequence() -> Vec<u8> {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions, Sample};
+
+    let gaussian_set = |ids: &[i64], mu_t: f32| fourdgs::GaussianSet {
+        positions: ids.iter().flat_map(|id| [*id as f32, 0.0, 0.0]).collect(),
+        scales: vec![0.1; ids.len() * 3],
+        rotations: (0..ids.len()).flat_map(|_| [0.0, 0.0, 0.0, 1.0]).collect(),
+        colors: (0..ids.len()).flat_map(|_| [0.5, 0.5, 0.5, 1.0]).collect(),
+        motions: vec![0.0; ids.len() * 3],
+        mu_t: vec![mu_t; ids.len()],
+        sigma_t: vec![1.0; ids.len()],
+        win_lo: vec![0.0; ids.len()],
+        win_hi: vec![4.0; ids.len()],
+        ..Default::default()
+    };
+    let original = vec![0, 1, 2, 3];
+    let churned = vec![0, 1, 2, 4];
+    let samples = vec![
+        Sample {
+            t0: 0.0,
+            ids: original.clone(),
+            gaussians: gaussian_set(&original, 0.0),
+        },
+        Sample {
+            t0: 1.0,
+            ids: churned.clone(),
+            gaussians: gaussian_set(&churned, 0.0),
+        },
+        Sample {
+            t0: 2.0,
+            ids: churned.clone(),
+            gaussians: gaussian_set(&churned, 0.0),
+        },
+        Sample {
+            t0: 3.0,
+            ids: churned.clone(),
+            gaussians: gaussian_set(&churned, 3.0),
+        },
+    ];
+    write_sequence(
+        &samples,
+        4.0,
+        &KeyframeDeltaOptions {
+            keyframe_every: 3,
+            ..Default::default()
+        },
+    )
+    .expect("the churn witness encodes")
+}
+
+fn with_wrong_delta_index_count(
+    data: &[u8],
+    field: &str,
+) -> (Vec<u8>, fourdgs::records::ChunkIndexEntry, u64) {
+    let (summary_start, _) = summary_bounds(data);
+    let (mut entries, rest) = summary_parts(data);
+    assert_eq!(entries[1].kind, 1, "the witness changes the first delta");
+    assert_ne!(
+        u64::from(entries[1].gaussian_count),
+        entries[1].live_count,
+        "Delta operations and composed population must be distinct observations"
+    );
+    let observed = match field {
+        "gaussian_count" => {
+            let observed = u64::from(entries[1].gaussian_count);
+            entries[1].gaussian_count += 1;
+            observed
+        }
+        "live_count" => {
+            let observed = entries[1].live_count;
+            entries[1].live_count += 1;
+            observed
+        }
+        _ => unreachable!("the index has only two count claims"),
+    };
+    let wrong = entries[1].clone();
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(rest)
+        .collect();
+    (rebuilt(&data[..summary_start], &summary), wrong, observed)
+}
+
 fn rewrite_first_keyframe_t1(data: &mut [u8], t1: f64) {
     let (summary_start, _) = summary_bounds(data);
     let record = fourdgs::serialization::Records::new(&data[..summary_start], fourdgs::MAGIC.len())
@@ -901,7 +985,85 @@ fn indexed_decode_requires_live_count_to_match_the_composed_state() {
         .expect_err("the index population must agree with composition");
     let text = error.to_string();
     assert!(text.contains("declares live_count 0"), "{text}");
-    assert!(text.contains("yields 1 gaussians"), "{text}");
+    assert!(text.contains("live population is 1"), "{text}");
+}
+
+#[test]
+fn decoded_keyframe_delta_index_counts_are_named_on_every_rust_read_path() {
+    use fourdgs::keyframe_delta_file::{
+        compose_chain, decode_indexed, decode_streamed, open_indexed,
+    };
+    use fourdgs::keyframe_delta_validate::{validate, ValidationMode};
+
+    let base = churn_sequence();
+    for field in ["gaussian_count", "live_count"] {
+        let (data, wrong, observed) = with_wrong_delta_index_count(&base, field);
+        let declared = if field == "gaussian_count" {
+            u64::from(wrong.gaussian_count)
+        } else {
+            wrong.live_count
+        };
+
+        let streamed = decode_streamed(&data).expect_err("the streamed decoder read the state");
+        let indexed = decode_indexed(&data).expect_err("the indexed decoder read the state");
+        for error in [streamed, indexed] {
+            assert_eq!(
+                error.refusal_code(),
+                Some(fourdgs::error::refusal::INDEX_RECORD_MISMATCH)
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("chunk index entry at {}", wrong.chunk_offset)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("declares {field} {declared}")),
+                "{message}"
+            );
+            assert!(message.contains(&format!("is {observed}")), "{message}");
+        }
+
+        let mut source = fourdgs::BytesReadable::new(&data);
+        let opened = open_indexed(&mut source).unwrap();
+        let selected = &opened.index[2];
+        assert_eq!(selected.reference_offset, wrong.chunk_offset);
+        let error = compose_chain(
+            &mut source,
+            &opened.index,
+            selected,
+            &opened.quantization,
+            &opened.windows,
+        )
+        .expect_err("the selected chain decodes the wrong intermediate delta");
+        assert_eq!(
+            error.refusal_code(),
+            Some(fourdgs::error::refusal::INDEX_RECORD_MISMATCH)
+        );
+        assert!(error.to_string().contains(field), "{error}");
+
+        // A direct seek into the later GOP must not decode or reject the unrelated first GOP.
+        let later_keyframe = &opened.index[3];
+        assert_eq!(later_keyframe.kind, 0);
+        let state = compose_chain(
+            &mut source,
+            &opened.index,
+            later_keyframe,
+            &opened.quantization,
+            &opened.windows,
+        )
+        .expect("the unrelated GOP stays independently seekable");
+        assert_eq!(state.count() as u64, later_keyframe.live_count);
+
+        for mode in [ValidationMode::Streamed, ValidationMode::Indexed] {
+            let mut source = fourdgs::BytesReadable::new(&data);
+            let failure = validate(&mut source, mode, |_offset, _id| Ok(()))
+                .expect_err("a validator that decoded the state checks its index counts");
+            assert_eq!(
+                failure.error.refusal_code(),
+                Some(fourdgs::error::refusal::INDEX_RECORD_MISMATCH)
+            );
+        }
+    }
 }
 
 #[test]

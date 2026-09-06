@@ -8,6 +8,12 @@ All notable changes to the Rust crate are documented here, following
 
 ### Changed
 
+- **Decoded Chunk Index counts are verified as `index-record-mismatch`.** Ordinary and
+  keyframe-delta readers now compare `gaussian_count` with validated Chunk rows or Delta operations,
+  and compare `live_count` with every composed keyframe or delta state. Selected indexed reads check
+  only their required chain, while streamed validation retains only bounded scalar observations for
+  the trailing index. The named diagnostic crosses the C ABI with the entry, field, declared value,
+  and observed row, operation, or population count.
 - **Readers refuse a finite `Quantization.step_time` at or below zero by name.** Both front-to-back
   and indexed opens return `non-positive-step-time`, including for either sign of zero, and the C
   ABI preserves the same identifier and record byte. A zero pitch makes birth-time grid selection

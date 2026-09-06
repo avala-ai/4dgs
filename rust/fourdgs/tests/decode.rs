@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use fourdgs::error::Error;
 use fourdgs::opcode as op;
 use fourdgs::quantization::{life_class, mu_step, rint, support_k, Bounds, Profile, Steps};
-use fourdgs::records::{ChunkIndexEntry, Header, Quantization, RigTrajectory, WindowTable};
-use fourdgs::serialization::{put_record, MAGIC};
+use fourdgs::records::{ChunkIndexEntry, Footer, Header, Quantization, RigTrajectory, WindowTable};
+use fourdgs::serialization::{crc32, put_record, Records, MAGIC, RECORD_HEADER_SIZE};
 use fourdgs::stream::{unzigzag, zigzag};
 
 /// A file with a Header and a Quantization record and nothing else: the smallest thing a
@@ -390,6 +390,56 @@ fn two_window_file() -> Vec<u8> {
         ..Default::default()
     };
     fourdgs::write_to_vec(&g, 2.0, &options, &Default::default()).expect("the fixture encodes")
+}
+
+fn with_wrong_first_index_gaussian_count(mut bytes: Vec<u8>) -> (Vec<u8>, u64, u32, u32) {
+    let footer_at = bytes.len() - MAGIC.len() - Footer::default().encode().len();
+    let mut footer = Footer::parse(&bytes[footer_at + RECORD_HEADER_SIZE..]).unwrap();
+    let index = Records::new(&bytes[..footer_at], footer.summary_start as usize)
+        .map(|record| record.unwrap())
+        .find(|record| record.opcode == op::CHUNK_INDEX)
+        .expect("the writer emits a Chunk Index");
+    let entry = ChunkIndexEntry::parse(index.content).unwrap();
+    let declared = entry.gaussian_count + 1;
+    let field_at = index.offset + RECORD_HEADER_SIZE + 32;
+    bytes[field_at..field_at + 4].copy_from_slice(&declared.to_le_bytes());
+    footer.summary_crc = crc32(&bytes[footer.summary_start as usize..footer_at]);
+    let encoded = footer.encode();
+    bytes[footer_at..footer_at + encoded.len()].copy_from_slice(&encoded);
+    (bytes, entry.chunk_offset, declared, entry.gaussian_count)
+}
+
+#[test]
+fn decoded_chunk_rows_must_match_the_index_on_both_read_paths() {
+    let (bytes, entry_offset, declared, observed) =
+        with_wrong_first_index_gaussian_count(two_window_file());
+
+    let streamed = fourdgs::read_bytes(&bytes).expect_err("the streamed read decoded the Chunk");
+    let mut source = fourdgs::BytesReadable::new(&bytes);
+    let scene = fourdgs::indexed_reader::open_indexed(&mut source).unwrap();
+    let entry = scene.index[0].clone();
+    let indexed = fourdgs::indexed_reader::read_chunk(&mut source, &scene, &entry, 3)
+        .expect_err("the indexed read decoded the Chunk");
+
+    for error in [streamed, indexed] {
+        assert_eq!(
+            error.refusal_code(),
+            Some(fourdgs::error::refusal::INDEX_RECORD_MISMATCH)
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("chunk index entry at {entry_offset}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("declares gaussian_count {declared}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("validated gaussian row count is {observed}")),
+            "{message}"
+        );
+    }
 }
 
 /// The byte just past the last Chunk record, so nothing spliced there can be caught by a

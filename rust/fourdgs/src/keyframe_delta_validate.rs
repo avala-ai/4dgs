@@ -5,16 +5,17 @@
 //!
 //! Decoding a whole sequence is the wrong primitive for a validator: it retains every
 //! reconstructed population and, on the byte-oriented C ABI, first requires the whole file.
-//! These walkers use [`crate::Readable`], retain only the current state and GOP keyframe, and
-//! report identity introductions to an edge-owned sink. The sink is deliberately supplied by
-//! the caller: a complete validator can partition the lifetime identity set onto scratch storage
-//! without putting filesystem I/O in the core or accumulating one set across all chunks.
+//! These walkers use [`crate::Readable`], retain only the current state and GOP keyframe plus
+//! scalar count observations for the trailing Chunk Index, and report identity introductions to
+//! an edge-owned sink. The sink is deliberately supplied by the caller: a complete validator can
+//! partition the lifetime identity set onto scratch storage without putting filesystem I/O in the
+//! core or accumulating one set across all chunks.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::keyframe_delta::State;
 use crate::keyframe_delta_file::{
-    check_keyframe_mu_t, compose_delta_chunk, open_indexed, ranged_framing,
+    check_index_count, check_keyframe_mu_t, compose_delta_chunk, open_indexed, ranged_framing,
     ranged_front_matter_content, ranged_header, ranged_record, read_delta_entry,
     read_keyframe_entry,
 };
@@ -57,6 +58,36 @@ pub struct ValidationSummary {
 
 type ValidationResult<T> = std::result::Result<T, ValidationFailure>;
 type BirthBands = BTreeMap<(i64, u8), Vec<i64>>;
+
+#[derive(Clone, Copy)]
+struct DecodedIndexCounts {
+    gaussian_count: u64,
+    live_count: u64,
+    gaussian_observation: &'static str,
+}
+
+fn remember_decoded_index_counts(
+    counts: &mut BTreeMap<u64, DecodedIndexCounts>,
+    offset: u64,
+    gaussian_count: u64,
+    live_count: u64,
+    gaussian_observation: &'static str,
+) -> Result<()> {
+    if counts.len() >= MAX_INDEX_ENTRIES {
+        return Err(Error::UnsupportedOperation(format!(
+            "streamed validation limits decoded state count observations to {MAX_INDEX_ENTRIES} entries"
+        )));
+    }
+    counts.insert(
+        offset,
+        DecodedIndexCounts {
+            gaussian_count,
+            live_count,
+            gaussian_observation,
+        },
+    );
+    Ok(())
+}
 
 struct LocatingReadable<'a, R: Readable + ?Sized> {
     inner: &'a mut R,
@@ -966,6 +997,10 @@ where
     let mut bands: Vec<u8> = Vec::new();
     let mut band_births: Vec<i64> = Vec::new();
     let mut birth_bands = BirthBands::new();
+    // A summary follows the state records it describes. Keep only three scalars per
+    // decoded state until those entries arrive, capped by the same limit as indexed
+    // validation rather than retaining another population.
+    let mut decoded_index_counts: BTreeMap<u64, DecodedIndexCounts> = BTreeMap::new();
     let mut at = MAGIC.len() as u64;
 
     while at < size {
@@ -1067,6 +1102,13 @@ where
                         crate::keyframe_delta_file::check_streamed_population(
                             at, head.t0, head.t1, &state,
                         )?;
+                        remember_decoded_index_counts(
+                            &mut decoded_index_counts,
+                            at,
+                            state.count() as u64,
+                            state.count() as u64,
+                            "the decoded keyframe's validated gaussian row count",
+                        )?;
                         let ids = introductions(
                             current.as_ref().map(|(_, _, _, state)| state),
                             &state,
@@ -1165,6 +1207,15 @@ where
                             crate::keyframe_delta_file::check_streamed_population(
                                 at, head.t0, head.t1, &state,
                             )?;
+                            remember_decoded_index_counts(
+                                &mut decoded_index_counts,
+                                at,
+                                u64::from(head.update_count)
+                                    + u64::from(head.birth_count)
+                                    + u64::from(head.death_count),
+                                state.count() as u64,
+                                "the decoded Delta Chunk's validated operation count",
+                            )?;
                             check_repeated_birth_invariants(
                                 current.as_ref().map(|(_, _, _, state)| state),
                                 &state,
@@ -1212,6 +1263,34 @@ where
                 bands.push(band);
                 Ok(())
             }),
+            op::CHUNK_INDEX => {
+                if content_length > MAX_INDEX_RECORD_BYTES {
+                    Err(Error::UnsupportedOperation(format!(
+                        "streamed validation limits Chunk Index records to {MAX_INDEX_RECORD_BYTES} bytes; the record at {at} declares {content_length} bytes"
+                    )))
+                } else {
+                    ranged_record(source, at, Some(total)).and_then(|(_, content)| {
+                        let entry = rec::ChunkIndexEntry::parse(&content)?;
+                        if let Some(observed) = decoded_index_counts.get(&entry.chunk_offset) {
+                            check_index_count(
+                                &entry,
+                                "gaussian_count",
+                                observed.gaussian_count,
+                                observed.gaussian_observation,
+                            )?;
+                            if entry.extended {
+                                check_index_count(
+                                    &entry,
+                                    "live_count",
+                                    observed.live_count,
+                                    "the composed state's live population",
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    })
+                }
+            }
             _ => Ok(()),
         };
         outcome.map_err(|error| ValidationFailure::at(error, at))?;

@@ -130,6 +130,92 @@ fn last_error() -> String {
         .into_owned()
 }
 
+fn last_refusal_code() -> Option<String> {
+    let mut data: *const c_char = std::ptr::null();
+    let mut length = 0usize;
+    // SAFETY: both out parameters are live locals for the duration of the call.
+    assert_eq!(
+        unsafe { fourdgs_last_refusal_code(&mut data, &mut length) },
+        FOURDGS_STATUS_OK
+    );
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: the accessor returned a static length-delimited refusal identifier.
+    Some(
+        String::from_utf8(
+            unsafe { std::slice::from_raw_parts(data as *const u8, length) }.to_vec(),
+        )
+        .unwrap(),
+    )
+}
+
+fn encoded_drift() -> Vec<u8> {
+    let (first, second) = drift();
+    // SAFETY: every pointer is backed by a live local and the writer is freed once.
+    unsafe {
+        let writer = fourdgs_kd_writer_new();
+        assert_eq!(
+            fourdgs_kd_writer_set_duration(writer, 8.0),
+            FOURDGS_STATUS_OK
+        );
+        assert_eq!(add(writer, 0.0, &first), FOURDGS_STATUS_OK);
+        assert_eq!(add(writer, 4.0, &second), FOURDGS_STATUS_OK);
+        let bytes = encode(writer).expect("encode");
+        fourdgs_kd_writer_free(writer);
+        bytes
+    }
+}
+
+fn with_wrong_delta_index_count(mut bytes: Vec<u8>, field: &str) -> Vec<u8> {
+    use fourdgs::records::{ChunkIndexEntry, Footer};
+    use fourdgs::serialization::{crc32, Records, MAGIC, RECORD_HEADER_SIZE};
+
+    let footer_at = bytes.len() - MAGIC.len() - Footer::default().encode().len();
+    let mut footer = Footer::parse(&bytes[footer_at + RECORD_HEADER_SIZE..]).unwrap();
+    let (record_at, mut entry) = {
+        let record = Records::new(&bytes[..footer_at], footer.summary_start as usize)
+            .map(|record| record.unwrap())
+            .filter(|record| record.opcode == fourdgs::opcode::CHUNK_INDEX)
+            .nth(1)
+            .expect("the writer emits a delta index entry");
+        (
+            record.offset,
+            ChunkIndexEntry::parse(record.content).unwrap(),
+        )
+    };
+    match field {
+        "gaussian_count" => entry.gaussian_count += 1,
+        "live_count" => entry.live_count += 1,
+        _ => unreachable!("the index has only two count claims"),
+    }
+    let encoded = entry.encode();
+    bytes[record_at..record_at + encoded.len()].copy_from_slice(&encoded);
+    footer.summary_crc = crc32(&bytes[footer.summary_start as usize..footer_at]);
+    let encoded = footer.encode();
+    bytes[footer_at..footer_at + encoded.len()].copy_from_slice(&encoded);
+    bytes
+}
+
+fn keyframe_delta_states_status(bytes: &[u8], indexed: c_int) -> c_int {
+    let mut output: *const c_char = std::ptr::null();
+    let mut length = 0usize;
+    // SAFETY: the input and both output parameters are live for the call. A failing call
+    // allocates no output, which is the only case this helper exercises.
+    let status = unsafe {
+        fourdgs_keyframe_delta_states_json(
+            bytes.as_ptr(),
+            bytes.len(),
+            indexed,
+            &mut output,
+            &mut length,
+        )
+    };
+    assert!(output.is_null(), "a refused decode allocates no JSON");
+    assert_eq!(length, 0, "a refused decode writes no JSON length");
+    status
+}
+
 #[test]
 fn a_sequence_assembled_through_the_abi_is_the_file_rust_would_have_written() {
     let (first, second) = drift();
@@ -156,6 +242,28 @@ fn a_sequence_assembled_through_the_abi_is_the_file_rust_would_have_written() {
         // The indexed path is the one that checks the tiling and walks the chain, so a wrong
         // offset or a wrong reference shows up only here.
         kdf::decode_indexed(&bytes).expect("indexed decode");
+    }
+}
+
+#[test]
+fn decoded_index_count_refusals_cross_the_c_abi_on_both_paths() {
+    for field in ["gaussian_count", "live_count"] {
+        let bytes = with_wrong_delta_index_count(encoded_drift(), field);
+        for indexed in [0, 1] {
+            assert_eq!(
+                keyframe_delta_states_status(&bytes, indexed),
+                FOURDGS_STATUS_MALFORMED
+            );
+            assert_eq!(
+                last_refusal_code().as_deref(),
+                Some(fourdgs::error::refusal::INDEX_RECORD_MISMATCH)
+            );
+            let message = last_error();
+            assert!(message.contains("chunk index entry at"), "{message}");
+            assert!(message.contains(field), "{message}");
+            assert!(message.contains("declares"), "{message}");
+            assert!(message.contains(" is "), "{message}");
+        }
     }
 }
 
