@@ -145,6 +145,11 @@ them still declares `uniform-v1`, because the depths refine one attribute's grid
 the set. Spending a scheme name on them would make every file that used them unreadable to a reader
 that validates the name — which is the one reader the name exists for.
 
+`uniform-v1` has no global magnitude ceiling for a finite quantization origin or step. The result,
+not the declaration alone, decides safety: spec §3.2 requires every reconstructed binary32 attribute
+lane to remain finite and in range and names the malformed refusal `decoded-f32-overflow`. A large
+finite step with a zero bin remains legal.
+
 ---
 
 ## SH bit depths

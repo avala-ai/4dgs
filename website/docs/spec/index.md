@@ -107,6 +107,44 @@ blurred into `box`.
 soft fade; `win_lo`/`win_hi` describe existence. A gaussian outside its window does not exist at
 that time, regardless of its marginal.
 
+### 3.2 Finite binary32 attribute reconstruction
+
+The reconstructed attribute lanes §3 stores as `f32` have a range contract, not a recommendation
+about a decoder's intermediate arithmetic. Let `F32_MAX = (2 - 2^-23) * 2^127`, the greatest finite
+IEEE 754 binary32 value. A reader MAY reconstruct in a wider type, but after applying an attribute's
+complete reconstruction rule and before narrowing it to the decoded state, every component of
+`position`, `scale`, `rotation`, `color` (RGB and opacity), `motion`, `mu_t` and `sigma_t` MUST be
+finite and in `[-F32_MAX, +F32_MAX]`. A value that is NaN, infinite or outside that closed interval
+makes the file malformed, and the reader MUST refuse it with the identifier `decoded-f32-overflow`.
+It MUST NOT silently narrow the value to an infinity, clamp it to the binary32 range or substitute
+another finite value.
+
+There is exactly one exception: when the gaussian's `flags` bit 0 (`never_fades`) is set, its
+decoded `sigma_t` MUST be `+inf`, as §3.1 defines. The flag is what makes that infinity legal. A
+`sigma_t` reconstruction that produces `+inf`, `-inf` or NaN while `never_fades` is clear is
+`decoded-f32-overflow`; an implementation MUST NOT reinterpret it as the flag being set.
+
+“In range” does not mean “exactly representable.” Ordinary rounding to binary32, including a
+subnormal or signed zero after underflow, is legal. In particular, the finite sigma underflow
+handled by §6.3 remains legal. The refusal is for a non-finite or out-of-range reconstructed result,
+not for the precision loss inherent in the format's declared `f32` destination.
+
+The rule covers all of the floating attribute lanes even where another rule makes overflow
+unreachable: colour and opacity are clamped to `[0, 1]`, and the reconstructed rotation is a
+normalized quaternion. Spherical harmonics are instead retained as `u8` codes; their optional float
+mapping is fixed to `[-4, +4]` by §6.5. Exact integer labels such as `object_id`, and `f64` values
+read directly from records such as Window Table endpoints (§5.4), are not binary32 attribute
+reconstructions and are outside this rule.
+
+The refusal belongs to the state record whose row first produces the invalid absolute value, not to
+the Quantization record merely because one of its finite steps participates in the arithmetic. For
+`gaussian-birth` and a `keyframe-delta` keyframe, that record is the Chunk. For a delta update or
+birth, it is the Delta Chunk that first makes the composed absolute state invalid. A diagnosis MUST
+name the byte of that record's opcode, the zero-based row (and `gaussian_id` when the model carries
+one), the attribute and component, the contributing stored or composed bin or bins, the effective
+step and origin when applicable, and the reconstructed value against the finite binary32 range. Both
+read paths attribute the same bytes to the same physical state record.
+
 ---
 
 ## 4. File layout
@@ -366,6 +404,15 @@ arithmetic in §6, which is unchanged, and it adds no obligation to a decoder: a
 malformed file is the one it already had, and this rule neither creates a new refusal nor removes an
 existing one. Validators are where it is enforced — a tool that reports why a file is wrong SHOULD
 report a non-finite quantization parameter as an error, naming the field.
+
+Finiteness is the complete declaration-wide restriction; version 1 places no additional global
+magnitude ceiling on a finite origin or step. Safety depends on the derived value and its
+destination: the greatest finite `f64` `step_scale_log` with a scale bin of `0` reconstructs the
+harmless value `exp(0) = 1`, while `step_scale_log = 1` with a scale bin of `100` reconstructs a
+finite binary64 value outside the binary32 range. A reader accepts the former and refuses the latter
+under §3.2 as `decoded-f32-overflow`. The same result-dependent rule applies to every binary32
+attribute lane, including an unflagged `sigma_t`; a reader MUST NOT reject a Quantization record
+solely because a finite parameter is large.
 
 **`step_time` MUST be strictly positive.** This is a reader obligation in addition to the writer
 rule above: a reader MUST refuse a Quantization record whose finite `step_time` is less than or
@@ -1670,6 +1717,7 @@ and the text was the bug.
 | §4 added: Header, Quantization and Window Table appear exactly once, and a reader MUST refuse a file carrying two of any of them          | rule added                |
 | §5.3 added: `step_time` MUST be strictly positive and a reader refuses a non-positive value                                               | rule added                |
 | §5.8 added: decoded Chunk Index counts MUST agree with parsed operations and the composed population                                      | clarification, rule added |
+| §3.2/§5.3 added: derived binary32 attributes MUST stay finite and in range; finite quantization has no global cap                         | clarification, rule added |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
 opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append
@@ -1728,6 +1776,14 @@ decodes without complaint into geometry that is entirely infinity or NaN, and th
 is a renderer drawing nothing rather than a reader saying why. Making it a rule is what lets a
 validator name the field instead of leaving the reader to infer it. It adds nothing to what a
 decoder must do; §6's arithmetic and every decoder's succeed-or-refuse behaviour are untouched.
+
+The §3.2/§5.3 row is the separate reader ruling that the earlier writer-only finiteness rule left
+open. It changes no record layout and spends no flag: it defines the legal result of arithmetic over
+the existing bins and finite `f64` parameters. The boundary is deliberately on each reconstructed
+binary32 value, because the same large step is harmless beside a zero bin and invalid beside a bin
+whose value cannot fit. That makes `decoded-f32-overflow` a malformed-file result without inventing
+a declaration ceiling, and keeps `sigma_t = +inf` exclusively as the value selected by the existing
+`never_fades` bit.
 
 The two §6.5 rows are the same kind of change from opposite directions, and neither moves a byte in
 any file that exists.
