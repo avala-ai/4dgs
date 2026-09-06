@@ -632,7 +632,7 @@ delta mode and live/birth/death/update counts, plus reconstructed states at prob
 the reason that model exists is cheap reconstruction at an instant, and that is what two
 implementations should be diffed on. Its shape lives in `states_json`, in `keyframe_delta_file` in
 the Python and Rust cores rather than in `canonical.py`; the `data/keyframe/` expectations are
-those. The valid `gaussian-birth` expectations are `summarize()`'s. The seven `data/invalid/`
+those. The valid `gaussian-birth` expectations are `summarize()`'s. The eleven `data/invalid/`
 expectations are the one-key refusal documents described above, not summaries of their files.
 
 Finally, an artifact worth naming so that nobody chases it: the committed `.json` files were written
@@ -663,6 +663,11 @@ worse than a red one.
 built-in table for that run; the capabilities handshake is its build/liveness check, so the harness
 does not apply the built-in "last command element exists" shortcut to commands such as `go run` or
 `dotnet run`. `--timeout` changes the per-probe and per-variant limit for either kind of runner.
+
+An implementation maintained outside this repository can publish the resulting score, immutable
+runner and evidence digests, and reproduction instructions in the
+[independent implementations catalog](./independent-implementations.mdx). Partial and single-path
+results are welcome; the catalog keeps every skip and every path that was not submitted visible.
 
 `--update` rewrites the expectations from the current runner output. Use it when you have decided
 that a change to the format or the summary is correct — never to make a red suite green, which is

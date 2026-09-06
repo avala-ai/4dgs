@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "corpus": {
+    "version": "0.1.0",
+    "tag": "releases/corpus/v0.1.0",
+    "tagCommit": "d9a76528560496b06f4d9baa25d53c3d944537d8",
+    "manifestSchema": 1,
+    "archiveUrl": "https://github.com/avala-ai/4dgs/releases/download/releases%2Fcorpus%2Fv0.1.0/4dgs-conformance-corpus-0.1.0.tar.gz",
+    "archiveSha256": "a147df71cb13eebb42997a5b3e6433b1e27e572a891bd1b28d9db7572b63ac3c",
+    "variantCount": 74,
+    "indexedVariantCount": 73
+  },
+  "results": []
+}

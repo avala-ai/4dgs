@@ -3,7 +3,9 @@
   "private": true,
   "scripts": {
     "start": "docusaurus start",
-    "build": "docusaurus build",
+    "build": "node --test scripts/validate-conformance-results.test.mjs && node scripts/validate-conformance-results.mjs && docusaurus build",
+    "validate:conformance-results": "node scripts/validate-conformance-results.mjs",
+    "test:conformance-results": "node --test scripts/validate-conformance-results.test.mjs",
     "test:security": "node scripts/check-image-size-zero-box.mjs",
     "serve": "docusaurus serve",
     "clear": "docusaurus clear"

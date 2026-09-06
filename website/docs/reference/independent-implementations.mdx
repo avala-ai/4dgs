@@ -1,0 +1,244 @@
+import catalog from "@site/static/conformance/results.json";
+
+# Independent implementations
+
+Verifiable conformance results from implementations maintained outside the 4dgs repository. The
+table deliberately has the same partial-support vocabulary as the [SDK feature matrix](./index.md):
+an honest partial result is useful, and a read path that was not submitted is visible rather than
+inferred. The source of this page is the public, machine-readable
+
+<a href="/conformance/results.json">
+  <code>results.json</code>
+</a>
+catalog.
+
+export const ResultScore = ({ result, readPath }) => {
+  const runner = result.runners.find((candidate) => candidate.readPath === readPath);
+  if (!runner) {
+    return <em>Not submitted</em>;
+  }
+  const eligible =
+    readPath === "indexed" ? catalog.corpus.indexedVariantCount : catalog.corpus.variantCount;
+  const tested = runner.passed + runner.failed;
+  return (
+    <span>
+      <strong>
+        {runner.passed}/{eligible}
+      </strong>
+      <br />
+      <small>
+        {tested} tested; {runner.skipped} skipped by the harness
+      </small>
+    </span>
+  );
+};
+
+export const TotalScore = ({ result }) => {
+  const passed = result.runners.reduce((sum, runner) => sum + runner.passed, 0);
+  const eligible = catalog.corpus.variantCount + catalog.corpus.indexedVariantCount;
+  return (
+    <strong>
+      {passed}/{eligible}
+    </strong>
+  );
+};
+
+export const Results = () => {
+  if (catalog.results.length === 0) {
+    return (
+      <div className="alert alert--secondary" role="status">
+        <strong>No independent results have been published yet.</strong> The route is ready for an
+        implementation maintained outside this repository to submit the first verifiable result.
+      </div>
+    );
+  }
+  return (
+    <>
+      <table>
+        <thead>
+          <tr>
+            <th>Implementation</th>
+            <th>Language</th>
+            <th>Corpus</th>
+            <th>Date</th>
+            <th>Streamed</th>
+            <th>Indexed</th>
+            <th>Total</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {catalog.results.map((result) => (
+            <tr key={result.id}>
+              <td>
+                <a href={result.implementation.url}>{result.implementation.name}</a>{" "}
+                {result.implementation.version}
+              </td>
+              <td>{result.implementation.language}</td>
+              <td>{result.corpusVersion}</td>
+              <td>{result.run.date}</td>
+              <td>
+                <ResultScore result={result} readPath="streamed" />
+              </td>
+              <td>
+                <ResultScore result={result} readPath="indexed" />
+              </td>
+              <td>
+                <TotalScore result={result} />
+              </td>
+              <td>
+                <a href={result.run.evidenceUrl}>run</a> ·{" "}
+                <a href={result.run.reproduceUrl}>reproduce</a>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {catalog.results.map((result) => (
+        <details key={`${result.id}-details`}>
+          <summary>
+            Evidence details for {result.implementation.name} {result.implementation.version}
+          </summary>
+          <ul>
+            <li>
+              Platform: <code>{result.run.platform}</code>
+            </li>
+            <li>
+              Runner artifact: <a href={result.runnerArtifact.url}>download</a>, SHA-256{" "}
+              <code>{result.runnerArtifact.sha256}</code>
+            </li>
+            <li>
+              Run evidence SHA-256: <code>{result.run.evidenceSha256}</code>
+            </li>
+            {result.runners.map((runner) => (
+              <li key={runner.readPath}>
+                <code>{runner.name}</code>: protocol {runner.protocol}; command{" "}
+                <code>{runner.command}</code>; refusals {String(runner.refusals)}; declines{" "}
+                {runner.declines.length === 0 ? "none" : runner.declines.join(", ")}; exact
+                aggregates {String(runner.exactAggregates)}; canonical state order{" "}
+                {String(runner.canonicalStateOrder)}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ))}
+    </>
+  );
+};
+
+<Results />
+
+## Corpus identity
+
+Every result currently refers to the immutable 0.1.0 corpus:
+
+| Field             | Value                                                                                                                                                        |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Corpus version    | `0.1.0`                                                                                                                                                      |
+| Release tag       | [`releases/corpus/v0.1.0`](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fcorpus%2Fv0.1.0)                                                         |
+| Peeled tag commit | [`d9a76528560496b06f4d9baa25d53c3d944537d8`](https://github.com/avala-ai/4dgs/commit/d9a76528560496b06f4d9baa25d53c3d944537d8)                               |
+| Manifest schema   | `1`                                                                                                                                                          |
+| Archive           | [`4dgs-conformance-corpus-0.1.0.tar.gz`](https://github.com/avala-ai/4dgs/releases/download/releases%2Fcorpus%2Fv0.1.0/4dgs-conformance-corpus-0.1.0.tar.gz) |
+| Archive SHA-256   | `a147df71cb13eebb42997a5b3e6433b1e27e572a891bd1b28d9db7572b63ac3c`                                                                                           |
+| Harness variants  | 74                                                                                                                                                           |
+| Indexed-eligible  | 73                                                                                                                                                           |
+
+The tag commit identifies the source that generated the corpus; the archive digest identifies the
+bytes that were actually tested. Both are recorded because either one alone leaves part of the run
+implicit.
+
+## How scoring works
+
+The catalog records the harness's raw `passed`, `skipped` and `failed` totals, not a hand-computed
+percentage. Each submitted runner accounts for all 74 manifest variants. A streamed runner can
+answer all 74; an indexed runner can answer 73, because one valid variant deliberately carries no
+chunk index and is skipped. A complete two-path result is therefore **147/147**.
+
+This page derives each path's denominator and the combined score from the corpus metadata. A read
+path that was not submitted contributes zero to the combined 147 checks and is labelled **Not
+submitted**. A declared feature gap is a harness skip, not a pass; the runner's `declines` and
+`refusals` capability fields remain visible in its evidence details. Only runs with zero failures
+are published, but skips are welcome: `51/74` is an honest, useful result, not a failed attempt to
+claim `74/74`.
+
+The `exactAggregates` and `canonicalStateOrder` capability gates are shown too. When either is
+false, the harness omits that transition field exactly as the
+[runner protocol](./conformance.md#capabilities-handshake) specifies; the score makes no claim for
+the omitted field.
+
+## Evidence required
+
+A catalog entry identifies one implementation version, language and permanent project URL, then
+records:
+
+- the runner artifact's stable HTTPS URL and SHA-256;
+- the corpus version;
+- the UTC run date and platform;
+- a stable HTTPS URL for the complete harness output and the SHA-256 of those exact bytes;
+- a permanent reproduction document or script URL;
+- for each submitted read path, the complete protocol-1 capabilities declaration, exact command, and
+  raw `passed`, `skipped`, `failed` totals.
+
+Evidence must be public without authentication and remain downloadable. Prefer a release asset or a
+file at an immutable source revision over an expiring CI artifact. The evidence bundle must include
+the capabilities response plus complete harness stdout and stderr, including per-variant failures
+and final totals, so somebody else can check the catalog without trusting a summary written for the
+pull request.
+
+## Verify and reproduce
+
+First verify the exact corpus archive:
+
+```sh
+curl -fL \
+  'https://github.com/avala-ai/4dgs/releases/download/releases%2Fcorpus%2Fv0.1.0/4dgs-conformance-corpus-0.1.0.tar.gz' \
+  -o 4dgs-conformance-corpus-0.1.0.tar.gz
+printf '%s  %s\n' \
+  'a147df71cb13eebb42997a5b3e6433b1e27e572a891bd1b28d9db7572b63ac3c' \
+  '4dgs-conformance-corpus-0.1.0.tar.gz' | sha256sum --check -
+tar -xzf 4dgs-conformance-corpus-0.1.0.tar.gz
+cd 4dgs-conformance-corpus-0.1.0/corpus
+sha256sum --check CHECKSUMS.txt
+```
+
+Then download the result's runner artifact and run-evidence file, verify each digest from the table,
+and follow its reproduction URL using the recorded command and platform. The
+[conformance suite page](./conformance.md#running-it) documents how to drive an external runner
+through this repository's harness. The archive's `MANIFEST.json` also has enough information to
+drive a runner without cloning this repository.
+
+## Publish a result
+
+Publication is an ordinary documentation pull request under
+[project governance](https://github.com/avala-ai/4dgs/blob/main/GOVERNANCE.md#independent-conformance-results),
+not a private certification process:
+
+1. Capture the runner's `--capabilities` response, then run each read path separately so its final
+   74-variant totals can be copied without separating a combined log by hand. Preserve the complete
+   stdout and stderr and compute the evidence bundle's SHA-256.
+2. Add one entry, sorted by stable `id`, to
+   [`website/static/conformance/results.json`](https://github.com/avala-ai/4dgs/edit/main/website/static/conformance/results.json).
+   The field contract is enforced by the dependency-free validator; its focused tests contain full
+   and partial synthetic examples.
+3. Run `yarn workspace website test:conformance-results` and `yarn workspace website build`, then
+   open a pull request following
+   [CONTRIBUTING.md](https://github.com/avala-ai/4dgs/blob/main/CONTRIBUTING.md#pull-requests).
+
+Review checks the catalog's structure, the cited digests and whether the evidence reproduces the
+numbers. Merging records that evidence; it does not ask a maintainer to vouch for the
+implementation.
+
+## What a result does not claim
+
+**A published score is agreement with one corpus version, not an endorsement, certification,
+security audit or general quality ranking.** It says nothing about inputs the corpus does not
+contain.
+
+The conformance harness materializes small canonical summaries, so a result does **not** prove that
+the implementation obeys the format's bounded-memory requirement on arbitrary input. That needs
+separate implementation tests and review; no score here turns an unbounded decoder into a conforming
+one.
+
+Decoding ends at reconstructed gaussian state at time `t`. Rendering, ordering, culling,
+level-of-detail policy, GPU code, listener processing and image or audio quality are outside the
+format and outside this score. The catalog must not be used as a renderer comparison.
