@@ -84,6 +84,19 @@ public enum Runner {
     /// commit the empty identifier as the expectation every other SDK is scored against.
     static func refusal(_ error: FourDGSError) -> JSON? {
         guard let code = error.refusalCode else { return nil }
+        if let records = error.lateFrontMatterRecords {
+            return .object([
+                "firstStateRecord": .object([
+                    "at": .integer(records.firstStateRecord.offset),
+                    "opcode": .number(String(records.firstStateRecord.opcode)),
+                ]),
+                "lateRecord": .object([
+                    "at": .integer(records.lateRecord.offset),
+                    "opcode": .number(String(records.lateRecord.opcode)),
+                ]),
+                "refused": .string(code.rawValue),
+            ])
+        }
         return .object(["refused": .string(code.rawValue)])
     }
 

@@ -37,6 +37,15 @@ private let unnamed = Data([0x34, 0x44, 0x47])
 /// unnamed ones into failures.
 private let named = Data("NOT4DGS!\n".utf8)
 
+private func corpusDirectory() -> URL {
+    if let fromEnvironment = ProcessInfo.processInfo.environment["FOURDGS_CORPUS"] {
+        return URL(fileURLWithPath: fromEnvironment)
+    }
+    var root = URL(fileURLWithPath: #filePath)
+    for _ in 0..<4 { root.deleteLastPathComponent() }
+    return root.appendingPathComponent("tests/conformance/data")
+}
+
 private struct Runs {
     let code: Int32
     let out: String
@@ -127,6 +136,55 @@ final class ConformanceRunnerTests: XCTestCase {
         }
     }
 
+    func testStreamedRunnerEmitsBothSitesForEveryLateFrontMatterVariant() throws {
+        let directory = corpusDirectory().appendingPathComponent("invalid/late-front-matter")
+        guard FileManager.default.fileExists(atPath: directory.path) else {
+            if ProcessInfo.processInfo.environment["CI"] != nil {
+                XCTFail("the corpus is missing; run tests/conformance/generate.py")
+                return
+            }
+            throw XCTSkip("no corpus; run tests/conformance/generate.py first")
+        }
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasSuffix(".4dgs") }.sorted()
+        XCTAssertEqual(names.count, 18)
+
+        for name in names {
+            let input = directory.appendingPathComponent(name)
+            let expectation = input.deletingPathExtension().appendingPathExtension("json")
+            let done = try decode("decode_streamed", Data(contentsOf: input))
+            XCTAssertEqual(done.code, 0, "\(name): \(done.err)")
+            XCTAssertEqual(done.err, "", name)
+            let actualJSON = try JSONSerialization.jsonObject(with: Data(done.out.utf8)) as? NSDictionary
+            let expectedJSON =
+                try JSONSerialization.jsonObject(
+                    with: Data(contentsOf: expectation)) as? NSDictionary
+            XCTAssertEqual(actualJSON, expectedJSON, name)
+        }
+    }
+
+    func testStreamedPlacementPrecedesATruncatedLateBody() throws {
+        let input = corpusDirectory().appendingPathComponent(
+            "invalid/late-front-matter/LateHeader.4dgs")
+        let expectation = input.deletingPathExtension().appendingPathExtension("json")
+        guard FileManager.default.fileExists(atPath: input.path) else {
+            throw XCTSkip("no corpus; run tests/conformance/generate.py first")
+        }
+        let expectedJSON = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: expectation))
+                as? [String: Any])
+        let late = try XCTUnwrap(expectedJSON["lateRecord"] as? [String: Any])
+        let lateAt = try XCTUnwrap(UInt64(try XCTUnwrap(late["at"] as? String)))
+        var bytes = [UInt8](try Data(contentsOf: input))
+        for index in 0..<8 { bytes[Int(lateAt) + 1 + index] = 0xFF }
+
+        let done = try decode("decode_streamed", Data(bytes))
+        XCTAssertEqual(done.code, 0, done.err)
+        XCTAssertEqual(done.err, "")
+        let actualJSON = try JSONSerialization.jsonObject(with: Data(done.out.utf8)) as? NSDictionary
+        XCTAssertEqual(actualJSON, expectedJSON as NSDictionary)
+    }
+
     /// The rule both runners share, asked of the classifier directly: `nil` is "not one of
     /// the refusals the corpus compares", which the callers turn into a failed invocation
     /// rather than into a refusal nobody can check.
@@ -137,6 +195,14 @@ final class ConformanceRunnerTests: XCTestCase {
         XCTAssertEqual(
             Runner.refusal(.notFourDGS(offset: 0, found: []))?.serialized(),
             JSON.object(["refused": .string("magic-mismatch")]).serialized())
+        let records = LateFrontMatterRecords(
+            lateRecord: RecordSite(opcode: 0x03, offset: 90),
+            firstStateRecord: RecordSite(opcode: 0x05, offset: 42))
+        XCTAssertEqual(
+            Runner.refusal(.lateFrontMatterRecord(records: records))?.serialized(),
+            "{\"firstStateRecord\":{\"at\":\"42\",\"opcode\":5},"
+                + "\"lateRecord\":{\"at\":\"90\",\"opcode\":3},"
+                + "\"refused\":\"late-front-matter-record\"}")
     }
 }
 

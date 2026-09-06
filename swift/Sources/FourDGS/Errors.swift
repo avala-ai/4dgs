@@ -4,7 +4,7 @@
 /// The specification's name for **which** rule a file broke.
 ///
 /// ``FourDGSError`` says what *kind* of thing went wrong; this says which rule, in the same
-/// eight words Python, Rust, TypeScript, C++ and Dart print for the same file. That is the
+/// words Python, Rust, TypeScript, C++ and Dart print for the same file. That is the
 /// difference between "both decoders refused it" and "both decoders refused it for the same
 /// reason" — a reader that rejects a bad-magic file because it mis-parsed the version passes
 /// a bare-refusal test and is still wrong.
@@ -36,6 +36,31 @@ public enum RefusalCode: String, Sendable, Equatable, CaseIterable {
 
     /// A Chunk Index count disagrees with the state record a reader decoded.
     case indexRecordMismatch = "index-record-mismatch"
+
+    /// A defined front-matter record follows the first Chunk or Delta Chunk.
+    case lateFrontMatterRecord = "late-front-matter-record"
+}
+
+/// One physical top-level record in a structured placement diagnosis.
+public struct RecordSite: Sendable, Equatable {
+    public let opcode: UInt8
+    public let offset: UInt64
+
+    public init(opcode: UInt8, offset: UInt64) {
+        self.opcode = opcode
+        self.offset = offset
+    }
+}
+
+/// The two physical records that prove a `late-front-matter-record` refusal.
+public struct LateFrontMatterRecords: Sendable, Equatable {
+    public let lateRecord: RecordSite
+    public let firstStateRecord: RecordSite
+
+    public init(lateRecord: RecordSite, firstStateRecord: RecordSite) {
+        self.lateRecord = lateRecord
+        self.firstStateRecord = firstStateRecord
+    }
 }
 
 /// Why a file was refused.
@@ -59,9 +84,11 @@ public enum RefusalCode: String, Sendable, Equatable, CaseIterable {
 /// that destructures `case .malformed(let offset, let record, let field, let reason)` now
 /// fails to compile with "tuple pattern has the wrong length". Adding an associated value
 /// to a public case is a breaking change to the API, and this one is taken deliberately:
-/// nothing is released, no package registry entry exists, and the alternative — a seventh
-/// case, or a parallel error type — would break every exhaustive `switch` instead, which
-/// is worse. Anyone destructuring these three cases adds a `_` for the new element.
+/// nothing is released and no package registry entry exists. A dedicated case would break every
+/// exhaustive `switch` without preserving those cases' existing distinctions. The placement
+/// refusal below is different: its two-site evidence does not fit an existing case, so it is an
+/// additive case and the changelog calls out that source break. Anyone destructuring the three
+/// C-backed cases adds a `_` for the trailing element.
 public enum FourDGSError: Error, Equatable, Sendable {
 
     // MARK: Malformed — the file is wrong
@@ -115,6 +142,11 @@ public enum FourDGSError: Error, Equatable, Sendable {
     /// grows a new failure mode is still diagnosable from Swift.
     case core(code: Int32, message: String, refusal: RefusalCode? = nil)
 
+    /// A streamed framing pass found defined front matter after state began. Both physical
+    /// sites are data rather than text so tools and conformance runners never parse a human
+    /// diagnostic to recover the evidence required by spec section 4.
+    case lateFrontMatterRecord(records: LateFrontMatterRecords)
+
     /// Reached a path whose implementation is still the C ABI seam.
     case notImplemented(String)
 }
@@ -129,7 +161,7 @@ extension FourDGSError {
     /// distinction a caller needs — "no error at all" — is the absence of a thrown error,
     /// not `nil` here.
     ///
-    /// Three cases answer from the case alone, because each is one rule and nothing else:
+    /// Four cases answer from the case alone, because each is one rule and nothing else:
     /// a file whose magic is wrong broke exactly the magic rule. The other three answer
     /// with what they were built carrying, because the same case stands for several rules.
     public var refusalCode: RefusalCode? {
@@ -140,6 +172,8 @@ extension FourDGSError {
             return .unsupportedMajorVersion
         case .windowIndexOutOfRange:
             return .windowIndexOutOfRange
+        case .lateFrontMatterRecord:
+            return .lateFrontMatterRecord
         case .malformed(_, _, _, _, let refusal):
             return refusal
         case .unsupportedCodec(_, _, _, let refusal):
@@ -189,9 +223,47 @@ extension FourDGSError: CustomStringConvertible {
             return "unreadable source: \(description)"
         case .core(let code, let message, _):
             return "4dgs core error \(code): \(message)"
+        case .lateFrontMatterRecord(let records):
+            let late = records.lateRecord
+            let state = records.firstStateRecord
+            return
+                "the defined front-matter record \(topLevelRecordName(late.opcode)) "
+                + "(opcode 0x\(hexByte(late.opcode).uppercased())) at byte \(late.offset) follows "
+                + "the first state record \(topLevelRecordName(state.opcode)) "
+                + "(opcode 0x\(hexByte(state.opcode).uppercased())) at byte \(state.offset); every "
+                + "defined front-matter record must precede the first state record"
         case .notImplemented(let what):
             return "\(what) is not implemented yet in the Swift SDK"
         }
+    }
+
+    /// Structured physical evidence for `late-front-matter-record`, when present.
+    public var lateFrontMatterRecords: LateFrontMatterRecords? {
+        guard case .lateFrontMatterRecord(let records) = self else { return nil }
+        return records
+    }
+}
+
+private func topLevelRecordName(_ opcode: UInt8) -> String {
+    switch opcode {
+    case 0x01: return "Header"
+    case 0x03: return "Quantization"
+    case 0x04: return "WindowTable"
+    case 0x05: return "Chunk"
+    case 0x09: return "Audio"
+    case 0x0A: return "Camera"
+    case 0x0B: return "Metadata"
+    case 0x0D: return "Attachment"
+    case 0x10: return "DeltaChunk"
+    case 0x11: return "Audio Source"
+    case 0x12: return "Audio Data"
+    case 0x20: return "CoordinateFrame"
+    case 0x21: return "SensorCalibration"
+    case 0x22: return "RigTrajectory"
+    case 0x23: return "GeodeticAnchor"
+    case 0x24: return "ObjectTable"
+    case 0x25: return "ObjectTrack"
+    default: return "record"
     }
 }
 

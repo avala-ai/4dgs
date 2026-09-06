@@ -141,7 +141,59 @@ private func expectedRefusal(_ variant: URL) -> String? {
     return object["refused"] as? String
 }
 
+private func expectedLateFrontMatterRecords(_ variant: URL) throws -> LateFrontMatterRecords {
+    let json = variant.deletingPathExtension().appendingPathExtension("json")
+    let data = try Data(contentsOf: json)
+    let object = try XCTUnwrap(
+        try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        json.lastPathComponent)
+
+    func site(_ key: String) throws -> RecordSite {
+        let fields = try XCTUnwrap(object[key] as? [String: Any], "\(json.lastPathComponent).\(key)")
+        let atText = try XCTUnwrap(fields["at"] as? String)
+        let at = try XCTUnwrap(UInt64(atText))
+        let opcode = try XCTUnwrap(fields["opcode"] as? NSNumber)
+        return RecordSite(opcode: opcode.uint8Value, offset: at)
+    }
+
+    return try LateFrontMatterRecords(
+        lateRecord: site("lateRecord"), firstStateRecord: site("firstStateRecord"))
+}
+
 final class ValidateTests: XCTestCase {
+
+    func testEveryLateFrontMatterVariantCarriesBothPhysicalSites() throws {
+        try requireCorpus()
+        let directory = corpusDirectory().appendingPathComponent("invalid/late-front-matter")
+        let files = variants(directory)
+        XCTAssertEqual(files.count, 18)
+
+        for file in files {
+            let expected = try expectedLateFrontMatterRecords(file)
+            let report = validate(try readFixture(file))
+            let refusal = try XCTUnwrap(
+                report.findings.compactMap(\.refusal).first {
+                    $0.code == .lateFrontMatterRecord
+                }, file.lastPathComponent)
+            XCTAssertEqual(refusal.lateFrontMatterRecords, expected, file.lastPathComponent)
+            XCTAssertEqual(refusal.site?.offset, expected.lateRecord.offset, file.lastPathComponent)
+        }
+    }
+
+    func testLatePlacementPrecedesATruncatedLateBody() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "invalid/late-front-matter/LateHeader.4dgs")
+        let expected = try expectedLateFrontMatterRecords(file)
+        var bytes = try readFixture(file)
+        writeU64(UInt64.max, into: &bytes, at: expected.lateRecord.offset + 1)
+
+        let report = validate(bytes)
+        let refusal = try XCTUnwrap(report.findings.compactMap(\.refusal).first)
+        XCTAssertEqual(refusal.code, .lateFrontMatterRecord)
+        XCTAssertEqual(refusal.lateFrontMatterRecords, expected)
+        XCTAssertEqual(report.findings.count, 1, report.findings.map(\.message).joined(separator: "\n"))
+    }
 
     func testEveryInvalidVariantIsRefusedByItsOwnIdentifier() throws {
         try requireCorpus()
@@ -1097,7 +1149,7 @@ final class ValidateTests: XCTestCase {
 
         var lateAudio = keyframe
         lateAudio[Int(statistics.offset)] = Opcode.audioSource
-        says(lateAudio, "appears after the first Chunk or DeltaChunk")
+        says(lateAudio, "defined front-matter record Audio Source")
 
         var shortFooter = keyframe
         writeU64(19, into: &shortFooter, at: keyframeFooter.offset + 1)
@@ -1359,7 +1411,11 @@ final class ValidateTests: XCTestCase {
         stateBeforeQuantization.insert(contentsOf: stateBytes, at: Int(quantization.offset))
         XCTAssertTrue(
             validate(stateBeforeQuantization).findings.contains {
-                $0.message.contains("appears before Quantization")
+                $0.refusal?.code == .lateFrontMatterRecord
+                    && $0.refusal?.lateFrontMatterRecords?.firstStateRecord.offset
+                        == quantization.offset
+                    && $0.refusal?.lateFrontMatterRecords?.lateRecord.offset
+                        == quantization.offset + firstState.total
             })
 
         var malformedAuxiliary = original
@@ -1512,7 +1568,8 @@ final class ValidateTests: XCTestCase {
         let lateFindings = validate(lateWindow).findings
         XCTAssertTrue(
             lateFindings.contains {
-                $0.message.contains("physical WindowTable record at byte \(footer.offset)")
+                $0.refusal?.code == .lateFrontMatterRecord
+                    && $0.refusal?.lateFrontMatterRecords?.lateRecord.offset == footer.offset
             }, lateFindings.map(\.message).joined(separator: "\n"))
     }
 
@@ -1694,10 +1751,10 @@ final class ValidateTests: XCTestCase {
         var lateLegacy = keyframeDelta
         lateLegacy.insert(
             contentsOf: validLegacy, at: Int(firstState.offset + firstState.total))
-        XCTAssertFalse(
+        XCTAssertTrue(
             validate(lateLegacy).findings.contains {
-                $0.message.contains("Audio at byte")
-                    && $0.message.contains("appears after the first Chunk")
+                $0.refusal?.code == .lateFrontMatterRecord
+                    && $0.refusal?.lateFrontMatterRecords?.lateRecord.opcode == Opcode.audio
             })
     }
 

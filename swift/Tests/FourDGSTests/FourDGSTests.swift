@@ -307,7 +307,7 @@ final class RefusalTests: XCTestCase {
             [
                 "magic-mismatch", "unsupported-major-version", "unknown-temporal-model",
                 "unknown-quantization-scheme", "non-positive-step-time", "unknown-stream-codec",
-                "window-index-out-of-range", "index-record-mismatch",
+                "window-index-out-of-range", "index-record-mismatch", "late-front-matter-record",
             ])
     }
 
