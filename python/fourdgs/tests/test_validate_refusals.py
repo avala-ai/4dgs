@@ -346,12 +346,17 @@ class TestTheInvalidCorpus:
         So each one is checked against the file itself: the byte the report names has to
         be the first byte of a record of the kind the report says sits there.
         """
-        expected_opcode = {
-            "unknown-temporal-model": op.HEADER,
-            "unknown-quantization-scheme": op.QUANTIZATION,
-            "non-positive-step-time": op.QUANTIZATION,
-            "unknown-stream-codec": op.CHUNK,
-            "window-index-out-of-range": op.CHUNK,
+        expected_opcodes = {
+            "unknown-temporal-model": (op.HEADER,),
+            "unknown-quantization-scheme": (op.QUANTIZATION,),
+            "non-positive-step-time": (op.QUANTIZATION,),
+            "unknown-stream-codec": (op.CHUNK,),
+            "window-index-out-of-range": (op.CHUNK,),
+            # An index-record disagreement belongs to the physical state record the
+            # entry names. Which one is determined by the entry's kind rather than by
+            # the refusal identifier: the activated count witnesses are DeltaChunks,
+            # while the same rule also applies to indexed keyframe Chunks.
+            "index-record-mismatch": (op.CHUNK, op.DELTA_CHUNK),
         }
         corpus = _invalid_corpus()
         _require_corpus([path for _, path, _ in corpus], "invalid corpus")
@@ -364,10 +369,11 @@ class TestTheInvalidCorpus:
             )
             assert named is not None, f"{name}: no finding carried the declared identifier"
             assert named.site is not None, f"{name}: the refusal was named but not placed"
-            if code in expected_opcode:
-                assert data[named.site.offset] == expected_opcode[code], (
-                    f"{name}: byte {named.site.offset} is not the {op.name(expected_opcode[code])} record"
-                )
+            if code in expected_opcodes:
+                expected = expected_opcodes[code]
+                actual = data[named.site.offset]
+                names = " or ".join(op.name(value) for value in expected)
+                assert actual in expected, f"{name}: byte {named.site.offset} is not the {names} record"
                 checked += 1
             else:
                 assert named.site.offset == 0, f"{name}: a magic refusal is about byte 0"
