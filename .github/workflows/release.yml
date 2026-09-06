@@ -284,16 +284,17 @@ jobs:
             echo
             echo "This tag is the version of the **Swift package** and of nothing else in this repository — Swift is the one language here whose package manager reads plain SemVer tags. See [RELEASING.md](https://github.com/avala-ai/4dgs/blob/main/RELEASING.md#swift-tags-look-repository-wide-and-are-not)."
             echo
-            echo "The package resolves from that URL; it does not yet link outside a checkout of this repository, because it binds the Rust core and ships no prebuilt copy of it. See [swift/README.md](https://github.com/avala-ai/4dgs/blob/main/swift/README.md#the-core-is-not-in-the-box)."
+            echo "The package builds out of tree without Cargo: SwiftPM verifies and links the checksummed Rust 0.7.1 XCFramework described in [swift/README.md](https://github.com/avala-ai/4dgs/blob/main/swift/README.md#the-core-is-in-the-package)."
           } > "$RUNNER_TEMP/notes.md"
 
       - name: Build and test what the tag will offer
-        # The core first, because the package links it. This is the same pair of commands
-        # the Swift CI job runs, on the same manifest, from the repository root.
+        # On macOS the manifest fetches the same binary target an outside consumer gets.
+        # Generate the corpus before testing so the CLI tests cannot skip into a green run.
         run: |
-          cargo build -p fourdgs --release
-          swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
-          swift test --scratch-path swift/.build -Xlinker -L$PWD/target/release
+          python -m pip install -e ./python/fourdgs >/dev/null
+          python tests/conformance/generate.py >/dev/null
+          swift build --scratch-path swift/.build
+          swift test --scratch-path swift/.build
 
       - name: A consumer can resolve this tag
         # The claim the whole ticket is about, checked against SwiftPM rather than against
@@ -302,14 +303,16 @@ jobs:
         # needs no network and no published release — the mechanism under test is the tag
         # shape and the manifest's location, and neither cares which host serves it.
         #
-        # `resolve` and not `build`: the core is not in the box, so a consumer's build is
-        # exactly what does not work yet. Do not "fix" this by adding a build here; fix it
-        # by shipping an XCFramework binary target.
+        # An executable target forces the final link, and running it proves the core loads.
+        # The consumer starts with no checkout and never invokes the runner's Rust toolchain.
         run: |
           version="${GITHUB_REF#refs/tags/v}"
           consumer="$RUNNER_TEMP/consumer"
           mkdir -p "$consumer/Sources/Consumer"
-          echo 'import FourDGS' > "$consumer/Sources/Consumer/Consumer.swift"
+          cat > "$consumer/Sources/Consumer/main.swift" <<'SWIFT'
+          import FourDGS
+          print(fourdgsPackageVersion)
+          SWIFT
           cat > "$consumer/Package.swift" <<EOF
           // swift-tools-version:5.9
           import PackageDescription
@@ -317,7 +320,7 @@ jobs:
               name: "Consumer",
               platforms: [.macOS(.v14)],
               dependencies: [.package(url: "file://$PWD", exact: "$version")],
-              targets: [.target(name: "Consumer", dependencies: [.product(name: "FourDGS", package: "4dgs")])]
+              targets: [.executableTarget(name: "Consumer", dependencies: [.product(name: "FourDGS", package: "4dgs")])]
           )
           EOF
           cd "$consumer" && swift package resolve
@@ -326,7 +329,11 @@ jobs:
             cat Package.resolved
             exit 1
           }
-          echo "resolved $version from a URL"
+          test "$(swift run Consumer)" = "$version" || {
+            echo "::error::the out-of-tree executable did not link and run FourDGS $version"
+            exit 1
+          }
+          echo "resolved, linked and ran $version from a URL"
 
       - name: GitHub Release
         env:

@@ -36,39 +36,39 @@ six-language repository belonging to one of them is the price, and it was judged
 against maintaining a generated mirror repository.
 
 ```swift
-.package(url: "https://github.com/avala-ai/4dgs", from: "0.1.0")
+.package(url: "https://github.com/avala-ai/4dgs", from: "0.3.0")
 ```
 
 The versions that resolves against come from plain `vX.Y.Z` tags on this repository, because those
 are the only tags SwiftPM reads — the `releases/<lang>/vX.Y.Z` tags every other package here is cut
-from are invisible to it. **A bare `v0.1.0` tag is the Swift package's version and nothing else**;
+from are invisible to it. **A bare `v0.3.0` tag is the Swift package's version and nothing else**;
 it says nothing about Python, Rust, TypeScript, C++ or Dart. See
 [RELEASING.md](../RELEASING.md#swift-tags-look-repository-wide-and-are-not).
 
-Read the next section before you write that line into a manifest, though.
+## The core is in the package
 
-## The core is not in the box
+On Apple hosts, `Package.swift` fetches the Rust 0.7.1 core as a checksummed binary target. The
+published XCFramework contains macOS, iOS device and simulator, and visionOS device and simulator
+slices. A consumer resolving the package from this repository therefore needs neither Cargo nor a
+source checkout; SwiftPM verifies the archive before linking it.
 
-**`FourDGS` links the Rust core, and this package ships no prebuilt copy of it.** Resolving the
-package fetches Swift sources and a module map; it does not fetch a `libfourdgs`. Nothing here
-builds until one is on the linker's search path.
-
-Inside a checkout of this repository that is one `cargo` invocation, below. Outside one — a consumer
-who resolved the package from its URL — it currently means building the core from the resolved
-checkout by hand and passing its directory with `-Xlinker -L`, which is not something to ask of
-anyone. The fix is a binary target pointing at a prebuilt `.xcframework` attached to a GitHub
-Release with its checksum, built for visionOS, iOS and macOS; it is not done. Until it is, **the
-package resolves and does not link out of tree.**
-
-The manifest says so itself: if it finds no `libfourdgs` in `target/release` under the package
-directory, evaluating it emits a warning naming what is missing and how to supply it, so the first
-thing anyone sees is that sentence rather than `cannot find -lfourdgs` seven times.
+The URL names an immutable GitHub Release asset and the manifest pins its SwiftPM checksum. A core
+release is never replaced in place: changing either its bytes or ABI means publishing a new Rust
+version and then a new Swift version that names it.
 
 ## Building
 
 Swift 5.9 or newer; the tools version is pinned to 5.9 because CI's macOS runner ships 5.10.
 
-The package links the core, so build that first and put it on the linker's search path:
+On macOS, `swift build` and Xcode use the published XCFramework with no linker flags:
+
+```bash
+swift build --scratch-path swift/.build
+swift test  --scratch-path swift/.build
+```
+
+Linux and the repository's source-conformance jobs deliberately build the current Rust checkout
+instead:
 
 ```bash
 cargo build -p fourdgs --release
@@ -81,9 +81,8 @@ Both commands run from the repository root, where the manifest is. `--scratch-pa
 build directory inside the language it belongs to rather than at the root of a repository five other
 languages share.
 
-The `-L` is passed on the command line rather than written into `Package.swift`, because an unsafe
-flag there would make the package undependable as a versioned dependency — the same reason the
-manifest warns about the missing library instead of pointing at it.
+The `-L` is Linux-only and is passed on the command line rather than written into `Package.swift`,
+because an unsafe flag there would make the package undependable as a versioned dependency.
 
 `conformance/` builds `decode_streamed` and `decode_indexed`, registered in
 `tests/conformance/run.py` and skipped until built.
