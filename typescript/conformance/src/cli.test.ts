@@ -20,7 +20,14 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -535,6 +542,51 @@ test("end to end: every deliberately broken file is refused by identifier and by
     assert.equal(Number(match[2]), at, `${variant}: ${refusal}`);
     // The byte is a real place in this file, not a placeholder.
     assert.ok(at < readFileSync(path).length, variant);
+  }
+});
+
+test("end to end: every shared late-front witness preserves both physical sites", async (t) => {
+  if (!existsSync(EXECUTABLE)) return t.skip("not built");
+  const names = readdirSync(`${DATA}invalid/late-front-matter`)
+    .filter((name) => /^Late.*\.json$/.test(name))
+    .sort();
+  if (names.length === 0) return t.skip("late-front corpus not generated");
+  assert.equal(names.length, 18);
+
+  for (const name of names) {
+    const variant = name.slice(0, -".json".length);
+    const path = corpus(`invalid/late-front-matter/${variant}`)!;
+    const expected = JSON.parse(
+      readFileSync(`${DATA}invalid/late-front-matter/${name}`, "utf8"),
+    ) as {
+      readonly refused: string;
+      readonly firstStateRecord: { readonly opcode: number; readonly at: string };
+      readonly lateRecord: { readonly opcode: number; readonly at: string };
+    };
+    const report = await validateFile(new Uint8Array(readFileSync(path)), { decode: true });
+    assert.equal(report.ok, false, variant);
+    assert.equal(report.refused?.code, expected.refused, variant);
+    assert.equal(report.refused?.at, Number(expected.lateRecord.at), variant);
+    assert.match(
+      report.refused?.message ?? "",
+      new RegExp(`opcode 0x${expected.lateRecord.opcode.toString(16).padStart(2, "0")}`, "i"),
+      variant,
+    );
+    assert.match(
+      report.refused?.message ?? "",
+      new RegExp(`byte ${expected.lateRecord.at}\\b`),
+      variant,
+    );
+    assert.match(
+      report.refused?.message ?? "",
+      new RegExp(`opcode 0x${expected.firstStateRecord.opcode.toString(16).padStart(2, "0")}`, "i"),
+      variant,
+    );
+    assert.match(
+      report.refused?.message ?? "",
+      new RegExp(`byte ${expected.firstStateRecord.at}\\b`),
+      variant,
+    );
   }
 });
 
