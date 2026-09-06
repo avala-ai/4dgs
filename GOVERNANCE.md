@@ -18,6 +18,19 @@ as the project does; it is a stub, not a constitution.
 Maintained by Avala AI. A formal maintainer list and a path to maintainership will be added when
 there are contributors outside the founding organization.
 
+## Independent conformance results
+
+An implementation maintained outside this repository may publish a result through an ordinary pull
+request that changes the public results catalog under `website/static/conformance/`. The submission
+must identify an immutable corpus, runner artifact and run-evidence file by URL and SHA-256, include
+reproduction instructions, and pass the catalog validator. Partial results are welcome and must
+preserve every skip the harness reported.
+
+Review verifies that the structured entry agrees with its cited evidence; it does not certify,
+endorse or assume maintenance responsibility for the implementation. Corrections and removals use
+the same pull-request process. A dispute about what the corpus proves is a project decision under
+the rules above, not a private decision attached to the catalog entry.
+
 ## Licensing intent
 
 The specification is intended to be implementable **royalty-free**, by anyone, without a licence

@@ -126,6 +126,10 @@ const config = {
               { label: "Specification", to: "/spec/" },
               { label: "Feature support matrix", to: "/reference/" },
               { label: "Conformance suite", to: "/reference/conformance" },
+              {
+                label: "Independent implementations",
+                to: "/reference/independent-implementations",
+              },
             ],
           },
           {

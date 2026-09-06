@@ -3,6 +3,10 @@
 Support in this project is **per feature, not per language**. A partial SDK is a deliberate,
 documented state — not a defect — and this table is the public contract that says so.
 
+Results for implementations maintained outside this repository live in the
+[independent implementations catalog](./independent-implementations.mdx). They use the same honest
+partial-support vocabulary without adding third-party claims to this repository's own SDK matrix.
+
 **A `Yes` means the conformance suite proves it.** Each SDK answers the variants it supports, the
 harness skips the rest —
 [which variants those are, and who decides, is the runner protocol](./conformance.md#declining-a-variant)
