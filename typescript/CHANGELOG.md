@@ -36,6 +36,10 @@ The four packages version together.
 
 ### Changed
 
+- **Late-front-matter refusals expose both record sites to conformance tooling.** The structured
+  error retains the late opcode/byte and first-state opcode/byte, and the streamed runner now emits
+  those fields for all 18 shared placement witnesses. The validator is checked against the same
+  corpus files before TypeScript claims the capability.
 - **Streamed readers refuse defined front matter after state by name.** Once a Chunk or Delta Chunk
   has appeared, a later Header, Quantization, Window Table, audio, camera, metadata, attachment,
   provenance, or object record returns `late-front-matter-record`. The diagnosis names the late

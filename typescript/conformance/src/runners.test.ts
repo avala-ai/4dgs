@@ -31,6 +31,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
+import { lateFrontMatterRecord, MalformedFile, Refusal } from "@4dgs/core";
+
+import { refusalAnswer } from "./canonical.js";
+
 /** The built runners, spawned the way `tests/conformance/run.py` spawns them. */
 const RUNNERS = ["decode_streamed.js", "decode_indexed.js"] as const;
 
@@ -48,6 +52,26 @@ const UNNAMED = new Uint8Array([0x34, 0x44, 0x47]);
  * unnamed ones into failures.
  */
 const NAMED = new TextEncoder().encode("NOT4DGS!\n");
+
+test("late front matter answers with both physical record sites", () => {
+  const answer = refusalAnswer(lateFrontMatterRecord(0x25, 2374, 0x05, 516));
+  assert.deepEqual(JSON.parse(answer!), {
+    firstStateRecord: { at: "516", opcode: 5 },
+    lateRecord: { at: "2374", opcode: 37 },
+    refused: Refusal.LateFrontMatterRecord,
+  });
+
+  // A named error without the structured sites must fail the runner invocation instead
+  // of claiming the richer conformance answer with invented or missing evidence.
+  assert.equal(
+    refusalAnswer(
+      new MalformedFile("missing structured placement sites", {
+        refusalCode: Refusal.LateFrontMatterRecord,
+      }),
+    ),
+    null,
+  );
+});
 
 interface Run {
   readonly code: number;
