@@ -34,7 +34,9 @@ All notable changes to the Dart package are documented here, following
   provenance, or object record returns `late-front-matter-record`. The diagnosis names both physical
   opcode bytes, and placement is checked before a late duplicate or malformed body can produce a
   less specific answer. Validators apply the same full-file rule; indexed open may retain its
-  bounded stop at the first state record. Unknown and private records remain position-independent.
+  bounded stop at the first state record. `FourdgsLateFrontMatterFile` and validator refusals expose
+  both sites as typed data, and the streamed conformance runner proves all 18 shared witnesses.
+  Unknown and private records remain position-independent.
 
 - **Readers refuse a finite `Quantization.step_time` at or below zero by name.** Both front-to-back
   and indexed opens return `non-positive-step-time`, including for either sign of zero, and the

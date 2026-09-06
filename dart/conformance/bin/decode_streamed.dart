@@ -95,15 +95,12 @@ void main(List<String> args) {
   } on FourdgsReaderLimit {
     stdout.writeln('{"unsupported":"resource-limit"}');
   } on FourdgsException catch (error) {
-    // A refusal is an answer, printed on stdout and exiting 0. Only this
-    // library's own exceptions qualify: anything else — a bug in the runner, a
-    // failed check from `checks.dart` — stays a crash, because a decoder must
-    // not be able to pass the invalid corpus by falling over in roughly the
-    // right place. And not even all of those: an error the refusal table cannot
-    // name is a failed invocation too, because answering it with an empty
-    // identifier would claim a valid answer for a failure no expectation can
-    // check. See [refusalAnswer].
-    final String? answer = refusalAnswer(error);
+    // Only named refusals are answers. Unnamed decoder errors and runner bugs
+    // remain failures, so crashing cannot pass an invalid-corpus case.
+    final String? answer = refusalAnswer(
+      error,
+      structuredLateFrontMatter: true,
+    );
     if (answer == null) {
       stderr.writeln('${parsed.path}: $error');
       exit(1);

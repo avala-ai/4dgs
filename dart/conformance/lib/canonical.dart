@@ -259,9 +259,26 @@ String canonical(Map<String, Object?> summary) {
 /// `run.py --update` — which writes whatever a runner prints, without parsing it
 /// — could commit the empty identifier as the expectation every other SDK is
 /// then scored against.
-String? refusalAnswer(FourdgsException error) {
+String? refusalAnswer(
+  FourdgsException error, {
+  bool structuredLateFrontMatter = false,
+}) {
   final String? code = error.refusalCode;
   if (code == null) return null;
+  if (structuredLateFrontMatter && code == refusalLateFrontMatterRecord) {
+    if (error is! FourdgsLateFrontMatterFile) return null;
+    return canonical(<String, Object?>{
+      'refused': code,
+      'firstStateRecord': <String, Object?>{
+        'opcode': error.firstStateRecord.opcode,
+        'at': error.firstStateRecord.offset.toString(),
+      },
+      'lateRecord': <String, Object?>{
+        'opcode': error.lateRecord.opcode,
+        'at': error.lateRecord.offset.toString(),
+      },
+    });
+  }
   return canonical(<String, Object?>{'refused': code});
 }
 

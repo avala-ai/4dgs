@@ -82,6 +82,20 @@ ProcessResult invoke(String runner, List<String> arguments) {
   ]);
 }
 
+Map<String, Object?> _document(String text) =>
+    (jsonDecode(text) as Map).cast<String, Object?>();
+
+({int opcode, int offset}) _recordSite(
+  Map<String, Object?> document,
+  String key,
+) {
+  final site = (document[key]! as Map).cast<String, Object?>();
+  return (
+    opcode: site['opcode']! as int,
+    offset: int.parse(site['at']! as String),
+  );
+}
+
 void main() {
   for (final String runner in runners) {
     test('$runner: an error the refusal table cannot name is a failure', () {
@@ -169,4 +183,76 @@ void main() {
       <String, Object?>{'refused': 'magic-mismatch'},
     );
   });
+
+  test(
+    'all shared late-front witnesses prove runner and validator sites',
+    () async {
+      const unstructured = FourdgsMalformedFile(
+        'placement without sites',
+        refusalCode: refusalLateFrontMatterRecord,
+      );
+      expect(
+        refusalAnswer(unstructured, structuredLateFrontMatter: true),
+        isNull,
+        reason: 'the runner must not parse message text',
+      );
+      final directory = Directory(
+        '../../tests/conformance/data/invalid/late-front-matter',
+      );
+      final expectations = directory
+        .listSync()
+        .whereType<File>()
+        .where((file) => file.path.endsWith('.json'))
+        .toList(growable: false)..sort((a, b) => a.path.compareTo(b.path));
+      expect(
+        expectations,
+        hasLength(18),
+        reason:
+            'run `python3 tests/conformance/generate.py` from the repository root',
+      );
+
+      for (final expectation in expectations) {
+        final expected = _document(expectation.readAsStringSync());
+        final file = File(
+          expectation.path.substring(0, expectation.path.length - 5) + '.4dgs',
+        );
+        expect(file.existsSync(), isTrue, reason: file.path);
+
+        final done = decode('decode_streamed.dart', file.readAsBytesSync());
+        expect(done.exitCode, 0, reason: '${file.path}: ${done.stderr}');
+        expect(_document(done.stdout as String), expected, reason: file.path);
+        expect(done.stderr as String, isEmpty, reason: file.path);
+
+        final report = await validateFourdgs(
+          FourdgsBytes(file.readAsBytesSync()),
+        );
+        final named =
+            report.findings
+                .where(
+                  (finding) =>
+                      finding.refusal?.code == refusalLateFrontMatterRecord,
+                )
+                .single
+                .refusal!;
+        final expectedLate = _recordSite(expected, 'lateRecord');
+        final expectedFirst = _recordSite(expected, 'firstStateRecord');
+        final placement = named.lateFrontMatter!;
+        expect(
+          (
+            placement.lateRecord.opcode,
+            placement.lateRecord.offset,
+            placement.firstStateRecord.opcode,
+            placement.firstStateRecord.offset,
+          ),
+          (
+            expectedLate.opcode,
+            expectedLate.offset,
+            expectedFirst.opcode,
+            expectedFirst.offset,
+          ),
+          reason: file.path,
+        );
+      }
+    },
+  );
 }
