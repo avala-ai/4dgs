@@ -11,9 +11,7 @@ use std::collections::BTreeMap;
 use crate::codec;
 use crate::error::{Error, Result};
 use crate::opcode as op;
-use crate::quantization::{
-    dequantize_rotation, life_class, motion_step, mu_step, rct_inverse, Steps,
-};
+use crate::quantization::{dequantize_rotation_wide, life_class, motion_step, mu_step, Steps};
 use crate::records::ChunkHeader;
 use crate::serialization::{Cursor, MAX_STREAM_BYTES};
 use crate::stream::{decode_stream_with_limit, DecodedStream};
@@ -416,40 +414,106 @@ pub(crate) fn decode_streams_with_limit(
 
         let never_fades = flags.get(i, 0) & op::FLAG_NEVER_FADES != 0;
         let sigma_bin = sigma.get(i, 0);
-        out.sigma_t.push(if never_fades {
+        let sigma_value = if never_fades {
             f32::INFINITY
         } else {
-            ((sigma_bin as f64 * steps.sigma_log).exp()) as f32
-        });
+            let value = (sigma_bin as f64 * steps.sigma_log).exp();
+            crate::decoded_f32::ensure(value, || {
+                format!(
+                    "row {i} attribute sigma_t component 0 from bin {sigma_bin} and step_sigma_log {}",
+                    steps.sigma_log
+                )
+            })?;
+            value as f32
+        };
+        out.sigma_t.push(sigma_value);
 
         for (axis, origin_axis) in origin.iter().enumerate().take(3) {
-            out.positions
-                .push((position.get(i, axis) as f64 * steps.pos + origin_axis) as f32);
-            out.scales
-                .push(((scale.get(i, axis) as f64 * steps.scale_log).exp()) as f32);
+            let position_bin = position.get(i, axis);
+            let position_value = crate::decoded_f32::linear(position_bin, steps.pos, *origin_axis);
+            crate::decoded_f32::ensure(position_value, || {
+                format!(
+                    "row {i} attribute position component {axis} from bin {position_bin}, step_pos {}, and origin {origin_axis}",
+                    steps.pos
+                )
+            })?;
+            out.positions.push(position_value as f32);
+
+            let scale_bin = scale.get(i, axis);
+            let scale_value = (scale_bin as f64 * steps.scale_log).exp();
+            crate::decoded_f32::ensure(scale_value, || {
+                format!(
+                    "row {i} attribute scale component {axis} from bin {scale_bin} and step_scale_log {}",
+                    steps.scale_log
+                )
+            })?;
+            out.scales.push(scale_value as f32);
         }
 
-        let quat = dequantize_rotation(rotation_index.get(i, 0), rotation.row(i), steps.rot);
-        out.rotations.extend_from_slice(&quat);
-
-        let rgb = rct_inverse(color.row(i));
-        for c in rgb {
-            out.colors
-                .push((c as f64 * steps.rgb).clamp(0.0, 1.0) as f32);
+        let largest = rotation_index.get(i, 0);
+        let rotation_bins = rotation.row(i);
+        let quat = dequantize_rotation_wide(largest, rotation_bins, steps.rot);
+        for (component, value) in quat.into_iter().enumerate() {
+            crate::decoded_f32::ensure(value, || {
+                format!(
+                    "row {i} attribute rotation component {component} from largest bin {largest}, stored bins {rotation_bins:?}, and step_rot {}",
+                    steps.rot
+                )
+            })?;
+            out.rotations.push(value as f32);
         }
-        out.colors
-            .push((opacity.get(i, 0) as f64 * steps.alpha).clamp(0.0, 1.0) as f32);
+
+        let color_bins = color.row(i);
+        // Undo the reversible colour transform in the wider reconstruction domain. The
+        // mathematical sum may exceed i64 even though the post-grid clamp is a legal colour.
+        let rgb_codes = [
+            color_bins[1] as f64 + color_bins[0] as f64,
+            color_bins[0] as f64,
+            color_bins[2] as f64 + color_bins[0] as f64,
+        ];
+        for (component, code) in rgb_codes.into_iter().enumerate() {
+            let value = (code * steps.rgb).clamp(0.0, 1.0);
+            crate::decoded_f32::ensure(value, || {
+                format!(
+                    "row {i} attribute color component {component} from stored bins {color_bins:?} and step_rgb {}",
+                    steps.rgb
+                )
+            })?;
+            out.colors.push(value as f32);
+        }
+        let opacity_bin = opacity.get(i, 0);
+        let opacity_value = (opacity_bin as f64 * steps.alpha).clamp(0.0, 1.0);
+        crate::decoded_f32::ensure(opacity_value, || {
+            format!(
+                "row {i} attribute color component 3 (opacity) from bin {opacity_bin} and step_alpha {}",
+                steps.alpha
+            )
+        })?;
+        out.colors.push(opacity_value as f32);
 
         // Both per-gaussian pitches come from the sigma bin this decoder has already
         // read, so there is no side channel to get wrong (spec §6.3).
         let class = life_class(sigma_bin, steps.sigma_log, never_fades, win_hi - win_lo, k);
         let m_step = motion_step(class, steps.motion);
         for k_axis in 0..3 {
-            out.motions
-                .push((motion.get(i, k_axis) as f64 * m_step) as f32);
+            let motion_bin = motion.get(i, k_axis);
+            let value = crate::decoded_f32::linear(motion_bin, m_step, 0.0);
+            crate::decoded_f32::ensure(value, || {
+                format!(
+                    "row {i} attribute motion component {k_axis} from bin {motion_bin} and effective step {m_step}"
+                )
+            })?;
+            out.motions.push(value as f32);
         }
         let t_step = mu_step(sigma_bin, steps.sigma_log, never_fades, steps.time);
-        out.mu_t.push((mu.get(i, 0) as f64 * t_step) as f32);
+        let mu_bin = mu.get(i, 0);
+        let mu_value = crate::decoded_f32::linear(mu_bin, t_step, 0.0);
+        crate::decoded_f32::ensure(mu_value, || {
+            format!(
+                "row {i} attribute mu_t component 0 from bin {mu_bin} and effective step {t_step}"
+            )
+        })?;
+        out.mu_t.push(mu_value as f32);
     }
 
     if let Some(src) = got.get(&op::A_SOURCE_INDEX) {
@@ -481,6 +545,133 @@ pub(crate) fn decode_streams_with_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_row_streams(scale_bin: i64, sigma_bin: i64, flags_bin: i64) -> Vec<u8> {
+        let channels = [3usize, 3, 1, 3, 3, 1, 3, 1, 1, 1, 1];
+        let mut streams = Vec::new();
+        for (&attribute, &channel_count) in op::REQUIRED_ATTRIBUTES.iter().zip(&channels) {
+            let mut values = vec![0; channel_count];
+            if attribute == op::A_SCALE {
+                values[0] = scale_bin;
+            } else if attribute == op::A_SIGMA_T {
+                values[0] = sigma_bin;
+            } else if attribute == op::A_FLAGS {
+                values[0] = flags_bin;
+            }
+            streams.extend_from_slice(
+                &crate::stream::encode_stream(
+                    attribute,
+                    &values,
+                    channel_count,
+                    codec::DEFLATE,
+                    6,
+                    false,
+                )
+                .expect("one-row required stream"),
+            );
+        }
+        streams
+    }
+
+    fn unit_steps() -> Steps {
+        Steps {
+            pos: 1.0,
+            scale_log: 1.0,
+            rot: 1.0,
+            rgb: 1.0,
+            alpha: 1.0,
+            motion: 1.0,
+            time: 1.0,
+            sigma_log: 1.0,
+            sh: 1,
+        }
+    }
+
+    #[test]
+    fn refuses_completed_scale_outside_binary32() {
+        let error = decode_streams(
+            &one_row_streams(100, 0, 0),
+            1,
+            &unit_steps(),
+            &[0.0; 3],
+            &[(0.0, 1.0)],
+            crate::quantization::DEFAULT_CUTOFF,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.refusal_code(),
+            Some(crate::error::refusal::DECODED_F32_OVERFLOW)
+        );
+        let message = error.to_string();
+        assert!(message.contains("row 0"), "{message}");
+        assert!(message.contains("attribute scale component 0"), "{message}");
+        assert!(message.contains("bin 100"), "{message}");
+        assert!(message.contains("step_scale_log 1"), "{message}");
+    }
+
+    #[test]
+    fn refuses_unflagged_sigma_outside_binary32() {
+        let error = decode_streams(
+            &one_row_streams(0, 100, 0),
+            1,
+            &unit_steps(),
+            &[0.0; 3],
+            &[(0.0, 1.0)],
+            crate::quantization::DEFAULT_CUTOFF,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.refusal_code(),
+            Some(crate::error::refusal::DECODED_F32_OVERFLOW)
+        );
+        assert!(error.to_string().contains("attribute sigma_t"), "{error}");
+    }
+
+    #[test]
+    fn accepts_zero_bins_with_the_largest_finite_steps_and_the_sigma_sentinel() {
+        let mut steps = unit_steps();
+        steps.scale_log = f64::MAX;
+        steps.sigma_log = f64::MAX;
+        let ordinary = decode_streams(
+            &one_row_streams(0, 0, 0),
+            1,
+            &steps,
+            &[0.0; 3],
+            &[(0.0, 1.0)],
+            crate::quantization::DEFAULT_CUTOFF,
+        )
+        .unwrap();
+        assert_eq!(ordinary.scales[0], 1.0);
+        assert_eq!(ordinary.sigma_t[0], 1.0);
+
+        // Sigma underflow selects effective motion/mu steps beyond binary64. Their zero bins
+        // still reconstruct exact zero; the result contract does not reject the intermediate.
+        steps.motion = f64::MAX;
+        steps.time = f64::MAX;
+        let zero_linear = decode_streams(
+            &one_row_streams(0, -1, 0),
+            1,
+            &steps,
+            &[0.0; 3],
+            &[(0.0, 1.0)],
+            crate::quantization::DEFAULT_CUTOFF,
+        )
+        .unwrap();
+        assert_eq!(zero_linear.sigma_t[0], 0.0);
+        assert_eq!(zero_linear.motions[0], 0.0);
+        assert_eq!(zero_linear.mu_t[0], 0.0);
+
+        let sentinel = decode_streams(
+            &one_row_streams(0, 100, op::FLAG_NEVER_FADES),
+            1,
+            &steps,
+            &[0.0; 3],
+            &[(0.0, 1.0)],
+            crate::quantization::DEFAULT_CUTOFF,
+        )
+        .unwrap();
+        assert_eq!(sentinel.sigma_t[0], f32::INFINITY);
+    }
 
     #[test]
     fn unknown_chunk_codec_precedes_the_decoded_size_ceiling() {

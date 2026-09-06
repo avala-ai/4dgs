@@ -1464,7 +1464,8 @@ fn read_from_with_limits<R: Read>(
                     &scene.windows,
                     cutoff,
                     decode_budget,
-                )?;
+                )
+                .map_err(|error| error.at_record("Chunk record", offset))?;
                 drop(blob);
                 drop(content);
                 let added = decoded_chunk_resident_bytes(&chunk, &BTreeMap::new())?;

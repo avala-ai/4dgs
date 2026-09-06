@@ -149,6 +149,8 @@ pub mod refusal {
     pub const WINDOW_INDEX_OUT_OF_RANGE: &str = "window-index-out-of-range";
     /// A Chunk Index count disagrees with the state record a reader decoded.
     pub const INDEX_RECORD_MISMATCH: &str = "index-record-mismatch";
+    /// A completed floating attribute reconstruction cannot inhabit its binary32 lane.
+    pub const DECODED_F32_OVERFLOW: &str = "decoded-f32-overflow";
 }
 
 impl Error {

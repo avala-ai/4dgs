@@ -269,6 +269,15 @@ pub const REST: [[usize; 3]; 4] = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]];
 /// positive, so it comes back as a square root; the result is renormalized because that
 /// reconstruction and the grid together can leave the quaternion slightly off unit.
 pub fn dequantize_rotation(largest: i64, bins: &[i64], step: f64) -> [f32; 4] {
+    let out = dequantize_rotation_wide(largest, bins, step);
+    [out[0] as f32, out[1] as f32, out[2] as f32, out[3] as f32]
+}
+
+/// The complete smallest-three reconstruction before the decoded-state `f32` narrowing.
+///
+/// Kept crate-private because the public format surface remains binary32. Decoders use this
+/// intermediate to enforce §3.2 instead of discovering overflow after a lossy cast.
+pub(crate) fn dequantize_rotation_wide(largest: i64, bins: &[i64], step: f64) -> [f64; 4] {
     let largest = largest.clamp(0, 3) as usize;
     let mut rest = [0.0f64; 3];
     for (i, slot) in rest.iter_mut().enumerate() {
@@ -283,12 +292,7 @@ pub fn dequantize_rotation(largest: i64, bins: &[i64], step: f64) -> [f32; 4] {
     out[largest] = (1.0 - sum_sq).max(0.0).sqrt();
     let norm = (out.iter().map(|v| v * v).sum::<f64>()).sqrt();
     let norm = if norm == 0.0 { 1.0 } else { norm };
-    [
-        (out[0] / norm) as f32,
-        (out[1] / norm) as f32,
-        (out[2] / norm) as f32,
-        (out[3] / norm) as f32,
-    ]
+    [out[0] / norm, out[1] / norm, out[2] / norm, out[3] / norm]
 }
 
 /// The forward smallest-three transform: `(largest index, three residual bins)`.

@@ -1824,7 +1824,8 @@ pub(crate) fn read_chunk_with_limit<R: Readable + ?Sized>(
         &scene.windows,
         scene.header.cutoff,
         decode_budget,
-    )?;
+    )
+    .map_err(|error| error.at_record("Chunk record", entry.chunk_offset))?;
     let observed = u64::try_from(decoded.count).map_err(|_| {
         Error::UnsupportedOperation("decoded Chunk row count does not fit in u64".into())
     })?;

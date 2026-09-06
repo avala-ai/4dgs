@@ -20,7 +20,7 @@ use fourdgs::records::{
     AudioData, AudioSource, AudioSourceKeyframe, ChunkIndexEntry, Footer, Header, Quantization,
     WindowTable, FLAG_HAS_AUDIO,
 };
-use fourdgs::serialization::{put_record, MAGIC, RECORD_HEADER_SIZE};
+use fourdgs::serialization::{put_record, Records, MAGIC, RECORD_HEADER_SIZE};
 
 /// Read the identifier the way C does: a pointer and a length, never a C string.
 ///
@@ -131,6 +131,56 @@ fn indexed_state_status(bytes: &[u8]) -> c_int {
     // SAFETY: the pointer came from the successful open and is freed once.
     unsafe { fourdgs_scene_free(scene) };
     status
+}
+
+fn decoded_f32_overflow_file() -> Vec<u8> {
+    let gaussians = fourdgs::GaussianSet {
+        positions: vec![0.0, 0.0, 0.0],
+        scales: vec![2.0, 1.0, 1.0],
+        rotations: vec![1.0, 0.0, 0.0, 0.0],
+        colors: vec![0.5, 0.5, 0.5, 1.0],
+        motions: vec![0.0, 0.0, 0.0],
+        mu_t: vec![0.5],
+        sigma_t: vec![0.25],
+        win_lo: vec![0.0],
+        win_hi: vec![1.0],
+        ..Default::default()
+    };
+    let mut bytes =
+        fourdgs::write_to_vec(&gaussians, 1.0, &Default::default(), &Default::default())
+            .expect("the fixture encodes");
+    let record = Records::new(&bytes, MAGIC.len())
+        .map(|record| record.unwrap())
+        .find(|record| record.opcode == op::QUANTIZATION)
+        .unwrap();
+    let at = record.offset;
+    let old_len = RECORD_HEADER_SIZE + record.content.len();
+    let mut quantization = Quantization::parse(record.content).unwrap();
+    quantization.step_scale_log = f64::MAX;
+    let encoded = quantization.encode(&[]);
+    assert_eq!(encoded.len(), old_len);
+    bytes[at..at + old_len].copy_from_slice(&encoded);
+    bytes
+}
+
+#[test]
+fn decoded_f32_overflow_crosses_both_c_read_paths_by_name() {
+    let bytes = decoded_f32_overflow_file();
+    for read in [
+        open_memory_sequential as fn(&[u8]) -> c_int,
+        indexed_state_status,
+    ] {
+        assert_eq!(read(&bytes), FOURDGS_STATUS_MALFORMED);
+        assert_eq!(
+            last_refusal_code().as_deref(),
+            Some(refusal::DECODED_F32_OVERFLOW),
+            "{}",
+            last_error()
+        );
+        let message = last_error();
+        assert!(message.contains("Chunk record at byte"), "{message}");
+        assert!(message.contains("attribute scale component 0"), "{message}");
+    }
 }
 
 /// A file whose Header and Quantization record are valid apart from the two names this

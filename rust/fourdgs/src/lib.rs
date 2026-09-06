@@ -37,6 +37,7 @@
 pub mod capi;
 pub mod chunk;
 pub mod codec;
+pub(crate) mod decoded_f32;
 pub mod error;
 pub mod indexed_reader;
 pub mod keyframe_delta;
