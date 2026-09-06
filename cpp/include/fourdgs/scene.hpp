@@ -63,6 +63,16 @@ enum class ReadMode {
   kIndexed = 2,
 };
 
+/// Resource policy for a collecting read.
+///
+/// The ceiling counts peak simultaneous library-owned decoded gaussian state and its decode
+/// working storage. Encoded input, front matter, and state already yielded to caller ownership
+/// are outside this boundary. Exactly the configured number of bytes is allowed.
+struct ReadOptions {
+  /// The shared compatibility default: 512 MiB.
+  std::uint64_t maxDecodedStateBytes = 536870912;
+};
+
 /// An open `.4dgs` scene.
 ///
 /// A scene has a working set — the gaussians currently decoded. `loadAll()` fills it with
@@ -82,9 +92,17 @@ class Scene {
   /// bytes a decode actually transferred.
   static Result<std::unique_ptr<Scene>> openPath(const std::string& path,
                                                  ReadMode mode = ReadMode::kAuto);
+  static Result<std::unique_ptr<Scene>> openPath(const std::string& path,
+                                                 const ReadOptions& options,
+                                                 ReadMode mode = ReadMode::kAuto);
   static Result<std::unique_ptr<Scene>> openMemory(Span<const std::uint8_t> bytes,
                                                    ReadMode mode = ReadMode::kAuto);
+  static Result<std::unique_ptr<Scene>> openMemory(Span<const std::uint8_t> bytes,
+                                                   const ReadOptions& options,
+                                                   ReadMode mode = ReadMode::kAuto);
   static Result<std::unique_ptr<Scene>> open(Readable& source, ReadMode mode = ReadMode::kAuto);
+  static Result<std::unique_ptr<Scene>> open(Readable& source, const ReadOptions& options,
+                                             ReadMode mode = ReadMode::kAuto);
 
   ~Scene();
   Scene(const Scene&) = delete;
@@ -147,6 +165,8 @@ class Scene {
   /// caps spherical harmonics: the bands above it are never transferred (spec §5.7). Pass 0
   /// for none and 3 for all.
   Result<void> loadAll(int maxShBand);
+  /// Options-bearing whole-scene collection. A zero decoded-state ceiling is a caller error.
+  Result<void> loadAll(int maxShBand, const ReadOptions& options);
   Result<void> loadAt(double t, int maxShBand);
 
   /// The resident gaussians. Valid until the next load on this scene.
@@ -223,6 +243,8 @@ Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes);
 /// Decode a keyframe-delta file to its canonical states JSON. `indexed` chooses the read
 /// path: `false` composes front to back, `true` walks each instant's chain through the index.
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed);
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                            const ReadOptions& options);
 
 }  // namespace fourdgs
 

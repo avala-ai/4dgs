@@ -10,6 +10,15 @@
 
 namespace fourdgs {
 
+namespace {
+
+Result<void> validateReadOptions(const ReadOptions& options) {
+  if (options.maxDecodedStateBytes != 0) return Result<void>();
+  return Error(ErrorCode::kInvalidArgument, "maxDecodedStateBytes must be greater than zero");
+}
+
+}  // namespace
+
 State::State(std::unique_ptr<detail::StateHandle> handle) : handle_(std::move(handle)) {}
 
 State::~State() = default;
@@ -31,22 +40,46 @@ Scene::Scene(std::unique_ptr<detail::Handle> handle) : handle_(std::move(handle)
 Scene::~Scene() = default;
 
 Result<std::unique_ptr<Scene>> Scene::openPath(const std::string& path, ReadMode mode) {
+  return openPath(path, ReadOptions(), mode);
+}
+
+Result<std::unique_ptr<Scene>> Scene::openPath(const std::string& path, const ReadOptions& options,
+                                               ReadMode mode) {
+  Result<void> valid = validateReadOptions(options);
+  if (!valid) return valid.error();
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
-  Result<void> opened = detail::openPath(*handle, path, static_cast<int>(mode));
+  Result<void> opened =
+      detail::openPath(*handle, path, static_cast<int>(mode), options.maxDecodedStateBytes);
   if (!opened) return opened.error();
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
 
 Result<std::unique_ptr<Scene>> Scene::openMemory(Span<const std::uint8_t> bytes, ReadMode mode) {
+  return openMemory(bytes, ReadOptions(), mode);
+}
+
+Result<std::unique_ptr<Scene>> Scene::openMemory(Span<const std::uint8_t> bytes,
+                                                 const ReadOptions& options, ReadMode mode) {
+  Result<void> valid = validateReadOptions(options);
+  if (!valid) return valid.error();
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
-  Result<void> opened = detail::openMemory(*handle, bytes, static_cast<int>(mode));
+  Result<void> opened =
+      detail::openMemory(*handle, bytes, static_cast<int>(mode), options.maxDecodedStateBytes);
   if (!opened) return opened.error();
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
 
 Result<std::unique_ptr<Scene>> Scene::open(Readable& source, ReadMode mode) {
+  return open(source, ReadOptions(), mode);
+}
+
+Result<std::unique_ptr<Scene>> Scene::open(Readable& source, const ReadOptions& options,
+                                           ReadMode mode) {
+  Result<void> valid = validateReadOptions(options);
+  if (!valid) return valid.error();
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
-  Result<void> opened = detail::openReadable(*handle, source, static_cast<int>(mode));
+  Result<void> opened =
+      detail::openReadable(*handle, source, static_cast<int>(mode), options.maxDecodedStateBytes);
   if (!opened) return opened.error();
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
@@ -198,7 +231,13 @@ Result<AudioTrack> Scene::readAudioTrack() {
   return track;
 }
 
-Result<void> Scene::loadAll(int maxShBand) { return detail::loadAll(*handle_, maxShBand); }
+Result<void> Scene::loadAll(int maxShBand) { return loadAll(maxShBand, ReadOptions()); }
+
+Result<void> Scene::loadAll(int maxShBand, const ReadOptions& options) {
+  Result<void> valid = validateReadOptions(options);
+  if (!valid) return valid;
+  return detail::loadAll(*handle_, maxShBand, options.maxDecodedStateBytes);
+}
 
 Result<void> Scene::loadAt(double t, int maxShBand) {
   return detail::loadAt(*handle_, t, maxShBand);
@@ -224,7 +263,14 @@ Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes) {
 }
 
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed) {
-  return detail::keyframeDeltaStatesJson(bytes, indexed);
+  return keyframeDeltaStatesJson(bytes, indexed, ReadOptions());
+}
+
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                            const ReadOptions& options) {
+  Result<void> valid = validateReadOptions(options);
+  if (!valid) return valid.error();
+  return detail::keyframeDeltaStatesJson(bytes, indexed, options.maxDecodedStateBytes);
 }
 
 }  // namespace fourdgs

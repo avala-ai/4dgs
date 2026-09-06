@@ -28,9 +28,11 @@ Handle::~Handle() { closeScene(*this); }
 
 StateHandle::~StateHandle() { closeState(*this); }
 
-Result<void> openPath(Handle&, const std::string&, int) { return notImplemented(); }
-Result<void> openMemory(Handle&, Span<const std::uint8_t>, int) { return notImplemented(); }
-Result<void> openReadable(Handle&, Readable&, int) { return notImplemented(); }
+Result<void> openPath(Handle&, const std::string&, int, std::uint64_t) { return notImplemented(); }
+Result<void> openMemory(Handle&, Span<const std::uint8_t>, int, std::uint64_t) {
+  return notImplemented();
+}
+Result<void> openReadable(Handle&, Readable&, int, std::uint64_t) { return notImplemented(); }
 Result<std::uint64_t> validateKeyframeDelta(
     Readable&, int, const std::function<Result<void>(std::uint64_t, std::uint32_t)>&,
     std::optional<std::uint64_t>*) {
@@ -71,7 +73,7 @@ std::string audioCodec(Handle&) { return std::string(); }
 std::uint64_t audioSize(const Handle&) { return 0; }
 Result<void> readAudio(Handle&, std::uint64_t, Span<std::uint8_t>) { return notImplemented(); }
 
-Result<void> loadAll(Handle&, int) { return notImplemented(); }
+Result<void> loadAll(Handle&, int, std::uint64_t) { return notImplemented(); }
 Result<void> loadAt(Handle&, double, int) { return notImplemented(); }
 GaussianView loadedGaussians(const Handle&) { return GaussianView(); }
 
@@ -101,7 +103,7 @@ Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(Span<const Keyfram
 }
 
 Result<std::string> peekTemporalModel(Span<const std::uint8_t>) { return notImplemented(); }
-Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t>, bool) {
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t>, bool, std::uint64_t) {
   return notImplemented();
 }
 Result<std::string> provenanceJson(Handle&) { return notImplemented(); }

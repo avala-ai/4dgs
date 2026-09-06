@@ -35,6 +35,8 @@ enum class ErrorCode : std::int32_t {
   /// Neither the file nor the call is wrong, so a caller that meets this skips rather than
   /// fails.
   kUnsupportedMode = 11,
+  /// A supported collecting operation crossed the caller's decoded-state resource ceiling.
+  kResourceLimit = 12,
 };
 
 const char* toString(ErrorCode code) noexcept;

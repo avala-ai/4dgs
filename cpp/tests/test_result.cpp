@@ -93,6 +93,8 @@ void refusalIsOptionalAndTravelsWithTheError() {
 void codesHaveNames() {
   CHECK_EQ(std::string(fourdgs::toString(ErrorCode::kBadMagic)), std::string("kBadMagic"));
   CHECK_EQ(std::string(fourdgs::toString(ErrorCode::kOk)), std::string("kOk"));
+  CHECK_EQ(std::string(fourdgs::toString(ErrorCode::kResourceLimit)),
+           std::string("kResourceLimit"));
 }
 
 void runTests() {

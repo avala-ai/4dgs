@@ -52,6 +52,8 @@ ErrorCode translate(int status) {
       return ErrorCode::kInvalidArgument;
     case FOURDGS_STATUS_UNSUPPORTED_MODE:
       return ErrorCode::kUnsupportedMode;
+    case FOURDGS_STATUS_RESOURCE_LIMIT:
+      return ErrorCode::kResourceLimit;
     case FOURDGS_STATUS_INTERNAL:
     default:
       return ErrorCode::kInternal;
@@ -179,23 +181,28 @@ Handle::~Handle() { closeScene(*this); }
 
 StateHandle::~StateHandle() { closeState(*this); }
 
-Result<void> openPath(Handle& handle, const std::string& path, int mode) {
+Result<void> openPath(Handle& handle, const std::string& path, int mode,
+                      std::uint64_t maxDecodedStateBytes) {
   fourdgs_scene* scene = nullptr;
-  const int status = fourdgs_open_path_ex(path.c_str(), mode, &scene);
+  const int status =
+      fourdgs_open_path_with_options(path.c_str(), mode, maxDecodedStateBytes, &scene);
   if (status != FOURDGS_STATUS_OK) return failure(status);
   handle.scene = scene;
   return Result<void>();
 }
 
-Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes, int mode) {
+Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes, int mode,
+                        std::uint64_t maxDecodedStateBytes) {
   fourdgs_scene* scene = nullptr;
-  const int status = fourdgs_open_memory_ex(bytes.data(), bytes.size(), mode, &scene);
+  const int status = fourdgs_open_memory_with_options(bytes.data(), bytes.size(), mode,
+                                                      maxDecodedStateBytes, &scene);
   if (status != FOURDGS_STATUS_OK) return failure(status);
   handle.scene = scene;
   return Result<void>();
 }
 
-Result<void> openReadable(Handle& handle, Readable& source, int mode) {
+Result<void> openReadable(Handle& handle, Readable& source, int mode,
+                          std::uint64_t maxDecodedStateBytes) {
   ReadableBridge* bridge = new (std::nothrow) ReadableBridge();
   if (bridge == nullptr) return Error(ErrorCode::kInternal, "out of memory opening a scene");
   bridge->source = &source;
@@ -209,7 +216,7 @@ Result<void> openReadable(Handle& handle, Readable& source, int mode) {
   reader.release = &bridgeRelease;
 
   fourdgs_scene* scene = nullptr;
-  const int status = fourdgs_open_reader_ex(reader, mode, &scene);
+  const int status = fourdgs_open_reader_with_options(reader, mode, maxDecodedStateBytes, &scene);
   if (status != FOURDGS_STATUS_OK) return failure(status);
   handle.scene = scene;
   return Result<void>();
@@ -351,8 +358,9 @@ Result<void> readAudio(Handle& handle, std::uint64_t offset, Span<std::uint8_t> 
   return check(fourdgs_scene_audio_read(asScene(handle.scene), offset, into.size(), into.data()));
 }
 
-Result<void> loadAll(Handle& handle, int maxShBand) {
-  return check(fourdgs_scene_load_all(asScene(handle.scene), static_cast<std::uint8_t>(maxShBand)));
+Result<void> loadAll(Handle& handle, int maxShBand, std::uint64_t maxDecodedStateBytes) {
+  return check(fourdgs_scene_load_all_with_options(
+      asScene(handle.scene), static_cast<std::uint8_t>(maxShBand), maxDecodedStateBytes));
 }
 
 Result<void> loadAt(Handle& handle, double t, int maxShBand) {
@@ -936,13 +944,14 @@ Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes) {
   return ownedStringCall(&fourdgs_peek_temporal_model, bytes);
 }
 
-Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed) {
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                            std::uint64_t maxDecodedStateBytes) {
   const char* data = nullptr;
   std::size_t length = 0;
   // Sequenced deliberately, like every two-out-parameter call: the status is read first, the
   // out parameters only after it is OK.
-  const int status = fourdgs_keyframe_delta_states_json(bytes.data(), bytes.size(), indexed ? 1 : 0,
-                                                        &data, &length);
+  const int status = fourdgs_keyframe_delta_states_json_with_options(
+      bytes.data(), bytes.size(), indexed ? 1 : 0, maxDecodedStateBytes, &data, &length);
   if (status != FOURDGS_STATUS_OK) return failure(status).error();
   std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
   fourdgs_string_free(data, length);
