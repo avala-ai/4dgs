@@ -1,9 +1,11 @@
-# Proposal: front matter ends at the first Chunk
+# Decision record: front matter ends at the first state record
 
-**Status: proposed, not normative, not implemented.** This document resolves
-[#78](https://github.com/avala-ai/4dgs/issues/78). It proposes one rule, states the spec text that
-would carry it, and names the conformance variant that would stop the next implementation guessing.
-Nothing here is in force until it is folded into [the specification](../index.md).
+**Status: accepted and folded into [the specification](../index.md); SDK and corpus implementation
+remain tracked in [#78](https://github.com/avala-ai/4dgs/issues/78).** This document is the decision
+record and supporting audit. The normative rule is now spec §4: every defined front-matter record
+precedes the first state record, where a state record is a Chunk or Delta Chunk. The proposal text
+below retains its original first-Chunk wording where it describes the implementations and evidence
+that informed the decision; the specification controls if the two differ.
 
 The question in #78 is short and the answer decides geometry: **may a provenance-family record
 (`0x20`–`0x2F`) appear after the first `Chunk`?** Auditing the two read paths exposes the same

@@ -8,6 +8,24 @@ cleanly with a message naming it, rather than guess.
 
 ---
 
+## Record placement classes
+
+These are the specification-defined top-level records whose placement affects bounded indexed open.
+The list is closed: defining a future opcode does not place it in either class implicitly.
+
+| class        | opcodes                                                                                                                                                                                                                      |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| front matter | Header `0x01`; Quantization `0x03`; Window Table `0x04`; legacy Audio `0x09`; Camera `0x0A`; Metadata `0x0B`; Attachment `0x0D`; Audio Source `0x11`; Audio Data `0x12`; Coordinate Frame through Object Track `0x20`–`0x25` |
+| state        | Chunk `0x05`; Delta Chunk `0x10`                                                                                                                                                                                             |
+
+Spec §4 requires every defined front-matter record to precede the first state record. A streamed
+reader or validator that encounters one late uses the stable refusal identifier
+`late-front-matter-record`, with the physical opcode and byte-offset diagnosis §4 defines. An
+indexed range opener may stop at the first state record and is not required to scan later gaps.
+Unknown and private opcodes have no placement class and retain §4.2's skip rule.
+
+---
+
 ## Attribute ids
 
 Used by the Attribute Stream structure (`0x06`), which lives bare inside a Chunk rather than as a

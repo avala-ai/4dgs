@@ -445,6 +445,20 @@ other side: it reconstructs `exp(0) = 1` and prevents a decoder from replacing t
 an undeclared Quantization-parameter ceiling. The `never_fades` flag's specified `sigma_t = +inf` is
 the legal sentinel control and must not be refused.
 
+Spec §4 likewise defines `late-front-matter-record` before the corpus carries a witness. It applies
+when a streamed reader or validator encounters any defined front-matter opcode after the first Chunk
+or Delta Chunk, including a late duplicate Header, Quantization or Window Table. The diagnostic
+names the late opcode and its physical byte plus the first state record and its physical byte; a
+generic duplicate or parse refusal does not prove this ordering rule.
+
+When late-front-matter variants are activated, they are applicable to streamed runners and
+validators, not universally to both decode paths. An indexed range opener may stop framing at the
+first state record and need not scan unrelated gaps, so the harness must record those invalid
+variants as streamed-only rather than treating an indexed skip as a missing refusal. An indexed
+implementation that does scan far enough may return the same refusal. This exception is specific to
+the late-placement family; all eleven invalid variants in the current corpus remain applicable to
+both read paths, and the counts and eight-identifier table above therefore do not change yet.
+
 For the current invalid corpus, only an error carrying the expected one of those eight identifiers
 is a refusal answer. More generally, a named refusal is an answer only when the expectation names
 it. If decoding fails without one — a truncated transport, an I/O error, an ordinary parse failure —
