@@ -1867,6 +1867,45 @@ void indexedCoreSummaryMemoryIsBounded() {
   CHECK(fourdgs::tool::summaryFitsValidationMemory(std::nullopt));
 }
 
+void indexedChunkResourceCeilingsMakeValidationIncomplete() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* index = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
+  CHECK(index != nullptr);
+  if (index == nullptr || index->length < 40) return;
+
+  // The core checks this implementation ceiling before asking the transport for the range,
+  // so a small witness can exercise the taxonomy without allocating the declared 512 MiB.
+  constexpr std::uint64_t kOverCoreStateRecordLimit = 512ULL * 1024ULL * 1024ULL + 1;
+  const std::size_t chunkLength =
+      static_cast<std::size_t>(index->offset + fourdgs::tool::kRecordHeaderSize + 24);
+  writeU64(&bytes, chunkLength, kOverCoreStateRecordLimit);
+  resealSummary(&bytes);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(!report.complete);
+  bool namedLimit = false;
+  bool calledLimitInvalid = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("chunk payload validation reached a bounded decoder limit") !=
+            std::string::npos &&
+        finding.message.find(std::to_string(kOverCoreStateRecordLimit)) != std::string::npos) {
+      namedLimit = true;
+      calledLimitInvalid = finding.severity == Severity::kError;
+    }
+  }
+  CHECK(namedLimit);
+  CHECK(!calledLimitInvalid);
+}
+
 void undersizedChunkIndexesNameTheirDeclaredSize() {
   if (corpusMissing()) return;
   if (noDecoder()) return;
@@ -2539,6 +2578,7 @@ void runTests() {
   modernAudioAfterStateIsRejected();
   reservedHeaderFlagBitsAreRejected();
   indexedCoreSummaryMemoryIsBounded();
+  indexedChunkResourceCeilingsMakeValidationIncomplete();
   undersizedChunkIndexesNameTheirDeclaredSize();
   summaryPlacementIsCheckedWithoutAChecksum();
   modelSpecificAndBareStructureOpcodesAreRejected();
