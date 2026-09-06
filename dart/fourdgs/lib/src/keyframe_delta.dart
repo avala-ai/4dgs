@@ -989,8 +989,22 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
   final chunks = <KeyframeDeltaChunk>[];
   final byOffset = <int, KeyframeDeltaChunk>{};
+  int? firstStateOpcode;
+  int? firstStateOffset;
 
   for (final record in iterRecords(data, fourdgsMagic.length)) {
+    if (firstStateOffset != null && isFrontMatterOpcode(record.opcode)) {
+      throw lateFrontMatterRecord(
+        lateOpcode: record.opcode,
+        lateOffset: record.offset,
+        firstStateOpcode: firstStateOpcode!,
+        firstStateOffset: firstStateOffset,
+      );
+    }
+    if (firstStateOffset == null && isStateOpcode(record.opcode)) {
+      firstStateOpcode = record.opcode;
+      firstStateOffset = record.offset;
+    }
     switch (record.opcode) {
       case opHeader:
         header = FourdgsHeader.parse(

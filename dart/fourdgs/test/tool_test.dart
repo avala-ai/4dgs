@@ -593,23 +593,25 @@ void main() {
       );
     });
 
-    test(
-      'post-chunk auxiliary records are parsed from the complete walk',
-      () async {
-        final FourdgsValidation report = await validateFourdgs(
-          FourdgsBytes(
-            _keyframeDelta(afterChunk: _record(opObjectTable, Uint8List(3))),
+    test('post-chunk object records are refused before body parsing', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _keyframeDelta(afterChunk: _record(opObjectTable, Uint8List(3))),
+        ),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(
+          allOf(
+            startsWith('ObjectTable record (opcode 0x24) at byte'),
+            contains('appears after the first state record'),
           ),
-        );
-        expect(report.ok, isFalse);
-        expect(
-          _messages(report, FourdgsSeverity.error),
-          contains(startsWith('the ObjectTable record at byte')),
-        );
-      },
-    );
+        ),
+      );
+    });
 
-    test('post-chunk Camera records are parsed, not only framed', () async {
+    test('post-chunk Camera records are refused before body parsing', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(
           _keyframeDelta(afterChunk: _record(opCamera, Uint8List(3))),
@@ -618,7 +620,12 @@ void main() {
       expect(report.ok, isFalse);
       expect(
         _messages(report, FourdgsSeverity.error),
-        contains(startsWith('the Camera record at byte')),
+        contains(
+          allOf(
+            startsWith('Camera record (opcode 0x0A) at byte'),
+            contains('appears after the first state record'),
+          ),
+        ),
       );
     });
 
@@ -645,21 +652,29 @@ void main() {
       );
     });
 
-    test('post-chunk Metadata records are parsed, not only framed', () async {
-      final FourdgsValidation report = await validateFourdgs(
-        FourdgsBytes(
-          _keyframeDelta(afterChunk: _record(opMetadata, Uint8List(3))),
-        ),
-      );
-      expect(report.ok, isFalse);
-      expect(
-        _messages(report, FourdgsSeverity.error),
-        contains(startsWith('the Metadata record at byte')),
-      );
-    });
+    test(
+      'post-chunk Metadata records are refused before body parsing',
+      () async {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(
+            _keyframeDelta(afterChunk: _record(opMetadata, Uint8List(3))),
+          ),
+        );
+        expect(report.ok, isFalse);
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(
+            allOf(
+              startsWith('Metadata record (opcode 0x0B) at byte'),
+              contains('appears after the first state record'),
+            ),
+          ),
+        );
+      },
+    );
 
     test(
-      'post-chunk Attachment headers are parsed without their payload',
+      'post-chunk Attachment records are refused before body parsing',
       () async {
         final FourdgsValidation report = await validateFourdgs(
           FourdgsBytes(
@@ -669,7 +684,12 @@ void main() {
         expect(report.ok, isFalse);
         expect(
           _messages(report, FourdgsSeverity.error),
-          contains(startsWith('the Attachment record at byte')),
+          contains(
+            allOf(
+              startsWith('Attachment record (opcode 0x0D) at byte'),
+              contains('appears after the first state record'),
+            ),
+          ),
         );
       },
     );
@@ -920,26 +940,28 @@ void main() {
       );
     });
 
-    test(
-      'every legacy Audio record is parsed and duplicates are rejected',
-      () async {
-        final Uint8List audio = _record(
-          opAudio,
-          (BytesBuilder()
-                ..add(_string('wav'))
-                ..add(_f64(0.0))
-                ..add(_u64(0)))
-              .toBytes(),
-        );
-        final FourdgsValidation report = await validateFourdgs(
-          FourdgsBytes(_keyframeDelta(beforeChunk: audio, afterChunk: audio)),
-        );
-        expect(
-          _messages(report, FourdgsSeverity.error),
-          contains('the file carries more than one legacy Audio record'),
-        );
-      },
-    );
+    test('late legacy Audio wins over duplicate semantics', () async {
+      final Uint8List audio = _record(
+        opAudio,
+        (BytesBuilder()
+              ..add(_string('wav'))
+              ..add(_f64(0.0))
+              ..add(_u64(0)))
+            .toBytes(),
+      );
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDelta(beforeChunk: audio, afterChunk: audio)),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(
+          allOf(
+            startsWith('Audio record (opcode 0x09) at byte'),
+            contains('appears after the first state record'),
+          ),
+        ),
+      );
+    });
 
     test(
       'embedded and reserved opcodes are not legal top-level records',

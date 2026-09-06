@@ -107,6 +107,34 @@ const Map<int, String> _opcodeNames = <int, String>{
 /// this build does not implement, and both are skipped rather than refused.
 bool isSpecifiedOpcode(int opcode) => _opcodeNames.containsKey(opcode);
 
+/// True for the closed set of records spec section 4 places before state.
+///
+/// Do not express this as an opcode range. The specified records are separated
+/// by state, summary, and reserved opcodes, and `0x26`-`0x2F` remain undefined:
+/// a future or private record has no placement class until its own revision
+/// assigns one.
+bool isFrontMatterOpcode(int opcode) => switch (opcode) {
+  opHeader ||
+  opQuantization ||
+  opWindowTable ||
+  opAudio ||
+  opCamera ||
+  opMetadata ||
+  opAttachment ||
+  opAudioSource ||
+  opAudioData ||
+  opCoordinateFrame ||
+  opSensorCalibration ||
+  opRigTrajectory ||
+  opGeodeticAnchor ||
+  opObjectTable ||
+  opObjectTrack => true,
+  _ => false,
+};
+
+/// True for either top-level record that begins decoded gaussian state.
+bool isStateOpcode(int opcode) => opcode == opChunk || opcode == opDeltaChunk;
+
 /// True when a specified opcode is itself a top-level record.
 ///
 /// Attribute Stream is an embedded structure inside a Chunk or delta group,

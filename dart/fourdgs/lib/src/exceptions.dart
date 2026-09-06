@@ -1,6 +1,8 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
+import 'opcode.dart';
+
 /// The file does not begin with the 4dgs magic.
 const String refusalMagicMismatch = 'magic-mismatch';
 
@@ -26,6 +28,9 @@ const String refusalWindowIndexOutOfRange = 'window-index-out-of-range';
 /// A reconstructed floating attribute cannot be represented as finite f32.
 const String refusalDecodedF32Overflow = 'decoded-f32-overflow';
 
+/// Defined front matter appears after the first Chunk or Delta Chunk.
+const String refusalLateFrontMatterRecord = 'late-front-matter-record';
+
 /// A Chunk Index count disagrees with decoded content it describes.
 const String refusalIndexRecordMismatch = 'index-record-mismatch';
 
@@ -44,6 +49,7 @@ const Set<String> fourdgsRefusalCodes = <String>{
   refusalUnknownStreamCodec,
   refusalWindowIndexOutOfRange,
   refusalDecodedF32Overflow,
+  refusalLateFrontMatterRecord,
   refusalIndexRecordMismatch,
 };
 
@@ -121,6 +127,31 @@ class FourdgsReaderLimit extends FourdgsException {
 /// missing, an attribute absent from a chunk, a field out of range.
 class FourdgsMalformedFile extends FourdgsException {
   const FourdgsMalformedFile(super.message, {super.refusalCode});
+}
+
+/// The placement refusal at the point both physical record sites are known.
+///
+/// Kept beside the refusal vocabulary so both streamed temporal-model readers
+/// and the validator use one sentence. [lateOffset] and [firstStateOffset] name
+/// opcode bytes, not record content, which is the physical provenance spec
+/// section 4 requires.
+FourdgsMalformedFile lateFrontMatterRecord({
+  required int lateOpcode,
+  required int lateOffset,
+  required int firstStateOpcode,
+  required int firstStateOffset,
+}) {
+  String hex(int opcode) =>
+      '0x${opcode.toRadixString(16).padLeft(2, '0').toUpperCase()}';
+
+  return FourdgsMalformedFile(
+    '${opcodeName(lateOpcode)} record (opcode ${hex(lateOpcode)}) at byte '
+    '$lateOffset appears after the first state record, '
+    '${opcodeName(firstStateOpcode)} (opcode ${hex(firstStateOpcode)}) at byte '
+    '$firstStateOffset; expected every defined front-matter record before the '
+    'first Chunk or Delta Chunk',
+    refusalCode: refusalLateFrontMatterRecord,
+  );
 }
 
 /// The refusal a `window_index` outside the Window Table gets, wherever it is

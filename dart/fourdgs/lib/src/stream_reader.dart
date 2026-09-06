@@ -161,11 +161,25 @@ FourdgsScene readFourdgsBytes(
   bool truncated = false;
   bool sawFooter = false;
   bool sawWindowTable = false;
+  int? firstStateOpcode;
+  int? firstStateOffset;
   final provenance = FourdgsProvenance();
   final objects = FourdgsObjectLayer();
 
   try {
     for (final record in iterRecords(data, fourdgsMagic.length)) {
+      if (firstStateOffset != null && isFrontMatterOpcode(record.opcode)) {
+        throw lateFrontMatterRecord(
+          lateOpcode: record.opcode,
+          lateOffset: record.offset,
+          firstStateOpcode: firstStateOpcode!,
+          firstStateOffset: firstStateOffset,
+        );
+      }
+      if (firstStateOffset == null && isStateOpcode(record.opcode)) {
+        firstStateOpcode = record.opcode;
+        firstStateOffset = record.offset;
+      }
       switch (record.opcode) {
         case opHeader:
           if (header != null) {
@@ -255,11 +269,6 @@ FourdgsScene readFourdgsBytes(
             startSec: a.startSec,
           );
         case opAudioSource:
-          if (chunks.isNotEmpty) {
-            throw const FourdgsMalformedFile(
-              'an Audio Source record appears after the first Chunk',
-            );
-          }
           final source = FourdgsAudioSourceRecord.parse(record.content);
           firstAudioRecord ??= _ObservedAudioRecord(
             'Audio Source',
@@ -273,11 +282,6 @@ FourdgsScene readFourdgsBytes(
           }
           audioDescriptors[source.sourceId] = source;
         case opAudioData:
-          if (chunks.isNotEmpty) {
-            throw const FourdgsMalformedFile(
-              'an Audio Data record appears after the first Chunk',
-            );
-          }
           final payload = FourdgsAudioData.parse(record.content);
           firstAudioRecord ??= _ObservedAudioRecord(
             'Audio Data',
@@ -324,13 +328,8 @@ FourdgsScene readFourdgsBytes(
             provenance.trajectories.add(trajectory);
           }
         case opObjectTable:
-          // Read wherever it appears. Section 5.15 is explicit that these
-          // records are "skipped and dispatched by opcode, not by position", so
-          // a table or track after a Chunk is a legal file — and dropping one
-          // loses the post-track state its gaussians require. The indexed
-          // opener's front-matter walk stops at the first Chunk and so cannot
-          // see them; that asymmetry is a gap in the indexed reader, not a
-          // licence for this path to discard data the format allows.
+          // Relative order within front matter is free. The placement check
+          // above has already established that this table is not after state.
           if (objects.table != null) {
             throw FourdgsMalformedFile(
               'the file carries a second Object Table; a scene has one '
