@@ -458,6 +458,137 @@ fn populated_sample_at(t0: f64) -> fourdgs::keyframe_delta_file::Sample {
     }
 }
 
+fn two_state_delta_file() -> Vec<u8> {
+    let mut second = populated_sample_at(1.0);
+    second.gaussians.positions[0] = 0.25;
+    fourdgs::keyframe_delta_file::write_sequence(
+        &[populated_sample_at(0.0), second],
+        2.0,
+        &fourdgs::keyframe_delta_file::KeyframeDeltaOptions::default(),
+    )
+    .expect("encode one keyframe and one delta")
+}
+
+fn minimum_positive_limit(mut succeeds: impl FnMut(usize) -> bool) -> usize {
+    let mut low = 1usize;
+    let mut high = 1usize << 20;
+    assert!(succeeds(high), "the fixture fits comfortably in one MiB");
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if succeeds(middle) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
+}
+
+#[test]
+fn aggregate_decoded_state_budget_reaches_both_keyframe_delta_collectors() {
+    use fourdgs::keyframe_delta_file::{
+        decode_indexed, decode_indexed_with_options, decode_streamed, decode_streamed_with_options,
+    };
+
+    let bytes = two_state_delta_file();
+    let options = fourdgs::ReadOptions {
+        max_decoded_state_bytes: 1,
+        ..Default::default()
+    };
+
+    for (path, error) in [
+        (
+            "streamed",
+            decode_streamed_with_options(&bytes, &options)
+                .expect_err("one byte cannot retain the streamed sequence"),
+        ),
+        (
+            "indexed",
+            decode_indexed_with_options(&bytes, &options)
+                .expect_err("one byte cannot retain the indexed sequence"),
+        ),
+    ] {
+        assert!(error.is_resource_limit(), "{path}: {error}");
+        assert_eq!(error.refusal_code(), None, "{path}: {error}");
+        let message = error.to_string();
+        assert!(message.contains("decoded-state"), "{path}: {message}");
+        assert!(
+            message.contains("configured limit is 1 bytes"),
+            "{path}: {message}"
+        );
+        assert!(message.contains(path), "{path}: {message}");
+        assert!(
+            message.contains("at least") || message.contains("minimum required"),
+            "{path}: {message}"
+        );
+    }
+
+    assert_eq!(decode_streamed(&bytes).unwrap().chunks.len(), 2);
+    assert_eq!(decode_indexed(&bytes).unwrap().0.chunks.len(), 2);
+}
+
+#[test]
+fn prior_keyframe_delta_states_remain_charged_during_collection_and_composition() {
+    use fourdgs::keyframe_delta_file::{
+        decode_indexed_with_options, decode_streamed_with_options, write_sequence,
+        KeyframeDeltaOptions,
+    };
+
+    let one = write_sequence(
+        &[populated_sample_at(0.0)],
+        2.0,
+        &KeyframeDeltaOptions::default(),
+    )
+    .unwrap();
+    let two = two_state_delta_file();
+    let options = |limit| fourdgs::ReadOptions {
+        max_decoded_state_bytes: limit,
+        ..Default::default()
+    };
+
+    let streamed_one =
+        minimum_positive_limit(|limit| decode_streamed_with_options(&one, &options(limit)).is_ok());
+    let streamed_two =
+        minimum_positive_limit(|limit| decode_streamed_with_options(&two, &options(limit)).is_ok());
+    assert!(
+        streamed_two > streamed_one,
+        "the earlier streamed state is charged"
+    );
+    let streamed = decode_streamed_with_options(&two, &options(streamed_two - 1)).unwrap_err();
+    assert!(streamed.is_resource_limit(), "{streamed}");
+    assert!(
+        streamed.to_string().contains("Delta composition"),
+        "{streamed}"
+    );
+
+    let indexed_one =
+        minimum_positive_limit(|limit| decode_indexed_with_options(&one, &options(limit)).is_ok());
+    let indexed_two =
+        minimum_positive_limit(|limit| decode_indexed_with_options(&two, &options(limit)).is_ok());
+    assert!(
+        indexed_two > indexed_one,
+        "the earlier indexed state is charged"
+    );
+    let indexed = decode_indexed_with_options(&two, &options(indexed_two - 1)).unwrap_err();
+    assert!(indexed.is_resource_limit(), "{indexed}");
+    assert!(indexed.to_string().contains("composition"), "{indexed}");
+}
+
+#[test]
+fn zero_keyframe_delta_budget_is_a_caller_error_before_magic() {
+    use fourdgs::keyframe_delta_file::{decode_indexed_with_options, decode_streamed_with_options};
+    let options = fourdgs::ReadOptions {
+        max_decoded_state_bytes: 0,
+        ..Default::default()
+    };
+    for error in [
+        decode_streamed_with_options(&[], &options).unwrap_err(),
+        decode_indexed_with_options(&[], &options).unwrap_err(),
+    ] {
+        assert!(matches!(error, fourdgs::Error::InvalidInput(_)), "{error}");
+    }
+}
+
 fn writer_timeline_error(t0s: &[f64], duration_sec: f64) -> String {
     use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions};
 

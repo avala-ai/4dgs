@@ -48,6 +48,8 @@ pub const AUDIO_KEYFRAMES: usize = 4;
 pub enum Failure {
     /// A refusal this reader can name. The identifier is compared across every SDK.
     Refused(&'static str),
+    /// A supported collecting operation exceeded the caller's decoded-state ceiling.
+    ResourceLimit,
     /// Anything else. Goes to stderr with a non-zero exit, as before.
     Message(String),
 }
@@ -59,6 +61,9 @@ impl Failure {
     /// violation — is still a failure here. Reporting it as a refusal would let a decoder
     /// pass the invalid corpus by falling over in the right place.
     pub fn from_error(path: &str, error: &fourdgs::Error) -> Failure {
+        if error.is_resource_limit() {
+            return Failure::ResourceLimit;
+        }
         match error.refusal_code() {
             Some(code) => Failure::Refused(code),
             None => Failure::Message(format!("{path}: {error}")),

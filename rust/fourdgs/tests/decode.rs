@@ -68,6 +68,116 @@ fn minimal_file_with_step_time(step_time: f64) -> Vec<u8> {
     out
 }
 
+fn one_gaussian_file() -> Vec<u8> {
+    let gaussians = fourdgs::GaussianSet {
+        positions: vec![0.1, 0.2, 0.3],
+        scales: vec![0.01, 0.01, 0.01],
+        rotations: vec![0.0, 0.0, 0.0, 1.0],
+        colors: vec![0.5, 0.5, 0.5, 0.75],
+        motions: vec![0.0, 0.0, 0.0],
+        mu_t: vec![0.5],
+        sigma_t: vec![0.1],
+        win_lo: vec![0.0],
+        win_hi: vec![1.0],
+        ..Default::default()
+    };
+    fourdgs::write_to_vec(
+        &gaussians,
+        1.0,
+        &fourdgs::WriteOptions {
+            max_depth: 0,
+            min_chunk_gaussians: 1,
+            ..Default::default()
+        },
+        &fourdgs::SceneExtras::default(),
+    )
+    .expect("encode one gaussian")
+}
+
+fn assert_decoded_state_limit(error: Error, limit: usize, phase: &str) {
+    assert!(error.is_resource_limit(), "{error}");
+    assert_eq!(error.refusal_code(), None, "{error}");
+    let message = error.to_string();
+    assert!(message.contains("decoded-state"), "{message}");
+    assert!(
+        message.contains(&format!("configured limit is {limit} bytes")),
+        "{message}"
+    );
+    assert!(message.contains(phase), "{message}");
+    assert!(
+        message.contains("at least") || message.contains("minimum required"),
+        "{message}"
+    );
+}
+
+#[test]
+fn aggregate_decoded_state_budget_reaches_both_gaussian_collectors() {
+    assert_eq!(
+        fourdgs::ReadOptions::default().max_decoded_state_bytes,
+        536_870_912
+    );
+    let bytes = one_gaussian_file();
+    let options = fourdgs::ReadOptions {
+        max_decoded_state_bytes: 1,
+        ..Default::default()
+    };
+
+    let streamed = fourdgs::read_bytes_with_options(&bytes, &options)
+        .expect_err("one decoded gaussian cannot fit in one byte");
+    assert_decoded_state_limit(streamed, 1, "streamed gaussian-birth");
+
+    let sequential = fourdgs::SceneReader::open_with_mode_and_options(
+        fourdgs::BytesReadable::new(&bytes),
+        fourdgs::reader::OpenMode::Sequential,
+        &options,
+    )
+    .err()
+    .expect("a sequential SceneReader collects while it opens");
+    assert_decoded_state_limit(sequential, 1, "streamed gaussian-birth");
+
+    let source = fourdgs::BytesReadable::new(&bytes);
+    let mut indexed = fourdgs::SceneReader::open_with_mode_and_options(
+        source,
+        fourdgs::reader::OpenMode::Indexed,
+        &options,
+    )
+    .expect("indexed open retains no decoded state");
+    let indexed = indexed
+        .load_all(3)
+        .expect_err("the indexed collector enforces the same one-byte ceiling");
+    assert_decoded_state_limit(indexed, 1, "indexed gaussian-birth");
+
+    assert_eq!(
+        fourdgs::read_bytes(&bytes)
+            .expect("the compatibility wrapper supplies the shared default")
+            .gaussians
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn zero_decoded_state_budget_is_a_caller_error_before_input_or_io() {
+    let options = fourdgs::ReadOptions {
+        max_decoded_state_bytes: 0,
+        ..Default::default()
+    };
+    let streamed = fourdgs::read_bytes_with_options(&[], &options)
+        .expect_err("zero is not a resource-exhaustion result");
+    assert!(matches!(streamed, Error::InvalidInput(_)), "{streamed}");
+
+    let indexed =
+        fourdgs::SceneReader::open_with_options(fourdgs::BytesReadable::new(&[]), &options)
+            .err()
+            .expect("the option is checked before probing the source");
+    assert!(matches!(indexed, Error::InvalidInput(_)), "{indexed}");
+
+    let path = std::path::Path::new("this-aggregate-budget-test-path-does-not-exist.4dgs");
+    let path_error = fourdgs::read_path_with_options(path, &options)
+        .expect_err("the caller error precedes opening the path");
+    assert!(matches!(path_error, Error::InvalidInput(_)), "{path_error}");
+}
+
 #[test]
 fn a_non_positive_birth_time_grid_is_refused_by_name_on_both_read_paths() {
     for step_time in [0.0, -0.0, -0.004] {

@@ -26,6 +26,9 @@ use crate::serialization::{Crc32, Cursor, MAGIC, MAX_STREAM_BYTES, RECORD_HEADER
 use crate::sh::merge_chunk_bands;
 use crate::stream::{decode_stream_with_limit, DecodedStream};
 
+/// Default aggregate ceiling for library-owned decoded state and its working storage.
+pub const DEFAULT_MAX_DECODED_STATE_BYTES: usize = 536_870_912;
+
 /// What a streamed read may be told to do differently.
 #[derive(Debug, Clone, Copy)]
 pub struct ReadOptions {
@@ -35,6 +38,9 @@ pub struct ReadOptions {
     /// Highest SH band to decode. A streamed reader cannot decline the bytes — it has
     /// already been sent them — but it can decline the work.
     pub max_sh_band: u8,
+    /// Aggregate bytes library-owned decoded state and its working storage may retain.
+    /// Exactly this many bytes are allowed; zero is a caller argument error.
+    pub max_decoded_state_bytes: usize,
 }
 
 impl Default for ReadOptions {
@@ -42,7 +48,57 @@ impl Default for ReadOptions {
         ReadOptions {
             recover_truncated: true,
             max_sh_band: 3,
+            max_decoded_state_bytes: DEFAULT_MAX_DECODED_STATE_BYTES,
         }
+    }
+}
+
+pub(crate) fn validate_decoded_state_limit(limit: usize) -> Result<()> {
+    if limit == 0 {
+        return Err(Error::InvalidInput(
+            "max_decoded_state_bytes must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_decoded_state_limit(required: usize, limit: usize, phase: &str) -> Result<()> {
+    if required > limit {
+        return Err(Error::decoded_state_resource_limit(
+            limit,
+            phase,
+            Some(required),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn checked_decoded_state_add(
+    current: usize,
+    added: usize,
+    limit: usize,
+    phase: &str,
+) -> Result<usize> {
+    let required = current
+        .checked_add(added)
+        .ok_or_else(|| Error::decoded_state_resource_limit(limit, phase, None))?;
+    check_decoded_state_limit(required, limit, phase)?;
+    Ok(required)
+}
+
+pub(crate) fn decoded_state_operation_error(
+    error: Error,
+    limit: usize,
+    phase: &str,
+    configured_budget_binds: bool,
+) -> Error {
+    match error {
+        Error::UnsupportedOperation(message) if configured_budget_binds => {
+            Error::ResourceLimit(format!(
+                "decoded-state resource limit during {phase}: the minimum required bytes exceed the budget; configured limit is {limit} bytes; {message}"
+            ))
+        }
+        other => other,
     }
 }
 
@@ -589,6 +645,7 @@ fn read_from_with_limits<R: Read>(
     retained_limit: usize,
     record_limit: usize,
 ) -> Result<Scene> {
+    validate_decoded_state_limit(options.max_decoded_state_bytes)?;
     let mut source = io::BufReader::new(source);
 
     let mut magic = [0u8; MAGIC.len()];
@@ -1372,16 +1429,60 @@ fn read_from_with_limits<R: Read>(
                 })?;
             let expected_channels = 3 * (2 * band as usize + 1);
             let mut cursor = Cursor::new(&content);
-            let values =
-                decode_streamed_sh_values(&mut cursor, chunk.count, expected_channels, live_bytes)
-                    .map_err(|error| error.at_record("SH Band Stream record", offset))?;
+            let global_remaining =
+                MAX_DECODED_SCENE_BYTES
+                    .checked_sub(live_bytes)
+                    .ok_or_else(|| {
+                        Error::UnsupportedOperation(
+                            "streamed SH decoding exhausted the aggregate decoded-scene budget"
+                                .into(),
+                        )
+                    })?;
+            let user_live = decoded_bytes.checked_add(band_node_bytes).ok_or_else(|| {
+                Error::decoded_state_resource_limit(
+                    options.max_decoded_state_bytes,
+                    "streamed gaussian-birth SH decoding",
+                    None,
+                )
+            })?;
+            let user_remaining = options
+                .max_decoded_state_bytes
+                .checked_sub(user_live)
+                .ok_or_else(|| {
+                    Error::decoded_state_resource_limit(
+                        options.max_decoded_state_bytes,
+                        "streamed gaussian-birth SH decoding",
+                        Some(user_live),
+                    )
+                })?;
+            let user_budget_binds = user_remaining <= global_remaining;
+            let values = decode_streamed_sh_values(
+                &mut cursor,
+                chunk.count,
+                expected_channels,
+                user_remaining.min(global_remaining),
+            )
+            .map_err(|error| {
+                decoded_state_operation_error(
+                    error,
+                    options.max_decoded_state_bytes,
+                    "streamed gaussian-birth SH decoding",
+                    user_budget_binds,
+                )
+                .at_record("SH Band Stream record", offset)
+            })?;
             drop(content);
             let added = decoded_stream_resident_bytes(&values)?
                 .checked_add(band_node_bytes)
                 .ok_or_else(|| {
                     Error::UnsupportedOperation("streamed SH retained bytes overflow".into())
                 })?;
-            decoded_bytes = add_decoded_scene_bytes(decoded_bytes, added)?;
+            decoded_bytes = checked_decoded_state_add(
+                decoded_bytes,
+                added,
+                options.max_decoded_state_bytes,
+                "streamed gaussian-birth SH retention",
+            )?;
             ensure_streamed_scene_bytes(retained_record_bytes, decoded_bytes, offset)?;
             chunk_bands
                 .last_mut()
@@ -1453,11 +1554,27 @@ fn read_from_with_limits<R: Read>(
                         "the Chunk at byte {offset} retains {encoded_bytes} encoded bytes, past the {remaining} bytes remaining in the streamed decode working-set budget"
                     ))
                 })?;
-                let blob = crate::chunk::chunk_stream_bytes_with_limit(
-                    &chunk_head,
-                    streams,
-                    after_encoded,
-                )?;
+                let user_remaining = options
+                    .max_decoded_state_bytes
+                    .checked_sub(decoded_bytes)
+                    .ok_or_else(|| {
+                        Error::decoded_state_resource_limit(
+                            options.max_decoded_state_bytes,
+                            "streamed gaussian-birth Chunk decoding",
+                            Some(decoded_bytes),
+                        )
+                    })?;
+                let unpack_limit = after_encoded.min(user_remaining);
+                let blob =
+                    crate::chunk::chunk_stream_bytes_with_limit(&chunk_head, streams, unpack_limit)
+                        .map_err(|error| {
+                            decoded_state_operation_error(
+                                error,
+                                options.max_decoded_state_bytes,
+                                "streamed gaussian-birth Chunk decompression",
+                                user_remaining <= after_encoded,
+                            )
+                        })?;
                 let unpacked_bytes = match &blob {
                     std::borrow::Cow::Borrowed(_) => 0,
                     std::borrow::Cow::Owned(bytes) => bytes.capacity(),
@@ -1467,6 +1584,15 @@ fn read_from_with_limits<R: Read>(
                         "the Chunk at byte {offset} retains {unpacked_bytes} unpacked bytes, past the {after_encoded} bytes remaining after its encoded record"
                     ))
                 })?;
+                let user_decode_budget =
+                    user_remaining.checked_sub(unpacked_bytes).ok_or_else(|| {
+                        Error::decoded_state_resource_limit(
+                            options.max_decoded_state_bytes,
+                            "streamed gaussian-birth Chunk decoding",
+                            decoded_bytes.checked_add(unpacked_bytes),
+                        )
+                    })?;
+                let effective_decode_budget = decode_budget.min(user_decode_budget);
                 let cutoff = header
                     .as_ref()
                     .map(|h| h.cutoff)
@@ -1478,13 +1604,26 @@ fn read_from_with_limits<R: Read>(
                     &quantization.pos_origin,
                     &scene.windows,
                     cutoff,
-                    decode_budget,
+                    effective_decode_budget,
                 )
-                .map_err(|error| error.at_record("Chunk record", offset))?;
+                .map_err(|error| {
+                    decoded_state_operation_error(
+                        error,
+                        options.max_decoded_state_bytes,
+                        "streamed gaussian-birth Chunk decoding",
+                        user_decode_budget <= decode_budget,
+                    )
+                    .at_record("Chunk record", offset)
+                })?;
                 drop(blob);
                 drop(content);
                 let added = decoded_chunk_resident_bytes(&chunk, &BTreeMap::new())?;
-                decoded_bytes = add_decoded_scene_bytes(decoded_bytes, added)?;
+                decoded_bytes = checked_decoded_state_add(
+                    decoded_bytes,
+                    added,
+                    options.max_decoded_state_bytes,
+                    "streamed gaussian-birth Chunk retention",
+                )?;
                 ensure_streamed_scene_bytes(retained_record_bytes, decoded_bytes, offset)?;
                 decoded_bytes = push_streamed_decoded_value(
                     &mut chunks,
@@ -1493,6 +1632,7 @@ fn read_from_with_limits<R: Read>(
                     retained_record_bytes,
                     "decoded Chunk collection",
                     offset,
+                    options.max_decoded_state_bytes,
                 )?;
                 decoded_bytes = push_streamed_decoded_value(
                     &mut chunk_bands,
@@ -1501,6 +1641,7 @@ fn read_from_with_limits<R: Read>(
                     retained_record_bytes,
                     "decoded SH-map collection",
                     offset,
+                    options.max_decoded_state_bytes,
                 )?;
                 decoded_bytes = push_streamed_decoded_value(
                     &mut chunk_band_masks,
@@ -1509,6 +1650,7 @@ fn read_from_with_limits<R: Read>(
                     retained_record_bytes,
                     "decoded band-mask collection",
                     offset,
+                    options.max_decoded_state_bytes,
                 )?;
                 decoded_bytes = push_streamed_decoded_value(
                     &mut decoded_chunk_offsets,
@@ -1517,6 +1659,7 @@ fn read_from_with_limits<R: Read>(
                     retained_record_bytes,
                     "decoded Chunk offset collection",
                     offset,
+                    options.max_decoded_state_bytes,
                 )?;
                 retained_record_bytes = push_streamed_retained_value(
                     &mut scene.chunk_intervals,
@@ -1953,12 +2096,14 @@ fn read_from_with_limits<R: Read>(
         .ok_or_else(|| {
             Error::UnsupportedOperation("assembly retained-byte count overflows".into())
         })?;
-    scene.gaussians = assemble_with_retained(
+    scene.gaussians = assemble_with_budgets(
         &chunks,
         &chunk_bands,
         &scene.windows,
         &header,
         assembly_retained,
+        decoded_collection_bytes,
+        options.max_decoded_state_bytes,
     )?;
     scene.duration_sec = header.duration_sec;
     scene.header = header;
@@ -2094,6 +2239,7 @@ fn push_streamed_decoded_value<T>(
     retained: usize,
     what: &str,
     offset: u64,
+    max_decoded_state_bytes: usize,
 ) -> Result<usize> {
     let before = vector_bytes(values)?;
     if values.len() == values.capacity() {
@@ -2113,17 +2259,12 @@ fn push_streamed_decoded_value<T>(
                     "the {what} allocation bytes overflow at byte {offset}"
                 ))
             })?;
-        let planned_added = target_bytes.checked_sub(before).ok_or_else(|| {
-            Error::Malformed(format!(
-                "the internal {what} planned capacity underflows at byte {offset}"
-            ))
-        })?;
-        let planned_decoded = current.checked_add(planned_added).ok_or_else(|| {
-            Error::UnsupportedOperation(format!(
-                "the {what} decoded-byte count overflows at byte {offset}"
-            ))
-        })?;
-        ensure_streamed_scene_bytes(retained, planned_decoded, offset)?;
+        // Vec growth may keep the old backing alive while the allocator reserves and
+        // copies into the replacement. Charge both capacities at that peak; after the
+        // reserve only the new backing remains in `total` below.
+        let growth_peak =
+            checked_decoded_state_add(current, target_bytes, max_decoded_state_bytes, what)?;
+        ensure_streamed_scene_bytes(retained, growth_peak, offset)?;
         values
             .try_reserve_exact(target_capacity - values.len())
             .map_err(|error| {
@@ -2139,11 +2280,7 @@ fn push_streamed_decoded_value<T>(
             "the internal {what} capacity accounting underflows at byte {offset}"
         ))
     })?;
-    let total = current.checked_add(added).ok_or_else(|| {
-        Error::UnsupportedOperation(format!(
-            "the {what} decoded-byte count overflows at byte {offset}"
-        ))
-    })?;
+    let total = checked_decoded_state_add(current, added, max_decoded_state_bytes, what)?;
     ensure_streamed_scene_bytes(retained, total, offset)?;
     values.push(value);
     Ok(total)
@@ -2194,29 +2331,37 @@ fn decode_streamed_sh_values(
     cursor: &mut Cursor<'_>,
     count: usize,
     expected_channels: usize,
-    decoded_bytes: usize,
+    max_output_bytes: usize,
 ) -> Result<DecodedStream> {
-    let remaining = MAX_DECODED_SCENE_BYTES
-        .checked_sub(decoded_bytes)
-        .ok_or_else(|| {
-            Error::UnsupportedOperation(
-                "streamed SH decoding exhausted the aggregate decoded-scene budget".into(),
-            )
-        })?;
-    let (_, values) =
-        decode_stream_with_limit(cursor, Some(count), Some(expected_channels), remaining)?;
+    let (_, values) = decode_stream_with_limit(
+        cursor,
+        Some(count),
+        Some(expected_channels),
+        max_output_bytes,
+    )?;
     Ok(values)
 }
 
 /// Decode a whole file already in memory.
 pub fn read_bytes(data: &[u8]) -> Result<Scene> {
-    read_from(io::Cursor::new(data), &ReadOptions::default())
+    read_bytes_with_options(data, &ReadOptions::default())
+}
+
+/// Decode a whole in-memory file with caller-selected collection limits.
+pub fn read_bytes_with_options(data: &[u8], options: &ReadOptions) -> Result<Scene> {
+    read_from(io::Cursor::new(data), options)
 }
 
 /// Decode a file from disk, one record at a time.
 pub fn read_path<P: AsRef<Path>>(path: P) -> Result<Scene> {
+    read_path_with_options(path, &ReadOptions::default())
+}
+
+/// Decode a file from disk with caller-selected collection limits.
+pub fn read_path_with_options<P: AsRef<Path>>(path: P, options: &ReadOptions) -> Result<Scene> {
+    validate_decoded_state_limit(options.max_decoded_state_bytes)?;
     let file = std::fs::File::open(path)?;
-    read_from(file, &ReadOptions::default())
+    read_from(file, options)
 }
 
 /// Keep the longest prefix of chunks whose spherical harmonic bands all match the first
@@ -2395,6 +2540,26 @@ pub(crate) fn assemble_with_retained(
     header: &rec::Header,
     retained_elsewhere: usize,
 ) -> Result<GaussianSet> {
+    assemble_with_budgets(
+        chunks,
+        chunk_bands,
+        windows,
+        header,
+        retained_elsewhere,
+        0,
+        DEFAULT_MAX_DECODED_STATE_BYTES,
+    )
+}
+
+pub(crate) fn assemble_with_budgets(
+    chunks: &[DecodedChunk],
+    chunk_bands: &[BTreeMap<u8, DecodedStream>],
+    windows: &[(f64, f64)],
+    header: &rec::Header,
+    retained_elsewhere: usize,
+    decoded_retained_elsewhere: usize,
+    max_decoded_state_bytes: usize,
+) -> Result<GaussianSet> {
     let table = window_table_or_default(windows);
     if chunks.len() != chunk_bands.len() {
         return Err(Error::Malformed(format!(
@@ -2426,6 +2591,21 @@ pub(crate) fn assemble_with_retained(
         .checked_add(retained_elsewhere)
         .and_then(|bytes| bytes.checked_add(planned_count_bytes))
         .ok_or_else(|| Error::UnsupportedOperation("Chunk count-vector peak overflows".into()))?;
+    let decoded_preflight_peak = retained_bytes
+        .checked_add(decoded_retained_elsewhere)
+        .and_then(|bytes| bytes.checked_add(planned_count_bytes))
+        .ok_or_else(|| {
+            Error::decoded_state_resource_limit(
+                max_decoded_state_bytes,
+                "gaussian-birth scene assembly preflight",
+                None,
+            )
+        })?;
+    check_decoded_state_limit(
+        decoded_preflight_peak,
+        max_decoded_state_bytes,
+        "gaussian-birth scene assembly preflight",
+    )?;
     if preflight_peak > MAX_DECODED_SCENE_BYTES {
         return Err(Error::UnsupportedOperation(format!(
             "assembling {} Chunks needs {planned_count_bytes} count-vector bytes beside {retained_bytes} decoded Chunk bytes and {retained_elsewhere} other retained bytes, past the {MAX_DECODED_SCENE_BYTES} byte scene ceiling",
@@ -2466,6 +2646,22 @@ pub(crate) fn assemble_with_retained(
         .and_then(|bytes| bytes.checked_add(counts_bytes))
         .and_then(|bytes| bytes.checked_add(retained_elsewhere))
         .ok_or_else(|| Error::UnsupportedOperation("assembled scene peak bytes overflow".into()))?;
+    let decoded_peak_bytes = retained_bytes
+        .checked_add(output_bytes)
+        .and_then(|bytes| bytes.checked_add(counts_bytes))
+        .and_then(|bytes| bytes.checked_add(decoded_retained_elsewhere))
+        .ok_or_else(|| {
+            Error::decoded_state_resource_limit(
+                max_decoded_state_bytes,
+                "gaussian-birth scene assembly",
+                None,
+            )
+        })?;
+    check_decoded_state_limit(
+        decoded_peak_bytes,
+        max_decoded_state_bytes,
+        "gaussian-birth scene assembly",
+    )?;
     if peak_bytes > MAX_DECODED_SCENE_BYTES {
         return Err(Error::UnsupportedOperation(format!(
             "assembling {total} gaussians needs at least {peak_bytes} resident bytes across decoded Chunks and scene output, past the {MAX_DECODED_SCENE_BYTES} byte scene ceiling"
@@ -3035,6 +3231,7 @@ mod tests {
             MAX_DECODED_SCENE_BYTES - first_capacity_bytes + 1,
             "decoded Chunk collection",
             71,
+            DEFAULT_MAX_DECODED_STATE_BYTES,
         )
         .expect_err("one byte below the planned backing allocation must refuse");
         assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
@@ -3051,9 +3248,49 @@ mod tests {
             0,
             "decoded Chunk collection",
             71,
+            DEFAULT_MAX_DECODED_STATE_BYTES,
         )
         .expect("the exact scene ceiling is admitted");
         assert_eq!(chunks.capacity(), 4);
+    }
+
+    #[test]
+    fn decoded_collection_growth_charges_old_and_new_backing_at_the_copy_peak() {
+        let mut chunks = Vec::with_capacity(4);
+        chunks.extend((0..4).map(|_| DecodedChunk::default()));
+        let row = std::mem::size_of::<DecodedChunk>();
+        let current = 4 * row;
+        let final_bytes = 8 * row;
+        let peak_bytes = current + final_bytes;
+
+        let error = push_streamed_decoded_value(
+            &mut chunks,
+            DecodedChunk::default(),
+            current,
+            0,
+            "decoded Chunk collection",
+            73,
+            final_bytes,
+        )
+        .expect_err("the replacement backing coexists with the old allocation");
+        assert!(error.is_resource_limit(), "{error}");
+        assert_eq!(chunks.capacity(), 4, "the peak check precedes allocation");
+
+        let retained = push_streamed_decoded_value(
+            &mut chunks,
+            DecodedChunk::default(),
+            current,
+            0,
+            "decoded Chunk collection",
+            73,
+            peak_bytes,
+        )
+        .expect("the exact copy peak is admitted");
+        assert_eq!(
+            retained, final_bytes,
+            "the old backing is released afterward"
+        );
+        assert_eq!(chunks.capacity(), 8);
     }
 
     #[test]
@@ -3466,9 +3703,7 @@ mod tests {
         .expect("three-row width-one SH stream");
         assert_eq!(encoded[1], 1);
         let mut cursor = Cursor::new(&encoded);
-        let decoded_bytes = MAX_DECODED_SCENE_BYTES - 168;
-
-        let error = decode_streamed_sh_values(&mut cursor, 3, 9, decoded_bytes).unwrap_err();
+        let error = decode_streamed_sh_values(&mut cursor, 3, 9, 168).unwrap_err();
         assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
         assert!(error.to_string().contains("27 raw bytes"), "{error}");
         assert!(

@@ -43,6 +43,10 @@ pub enum Error {
     /// chunk by index, for instance. Neither the file nor the caller is malformed; the
     /// operation simply belongs to the other path.
     UnsupportedOperation(String),
+    /// A supported operation exceeded a caller-configured implementation resource
+    /// ceiling. The file remains conforming and the same operation may succeed with a
+    /// larger budget or an incremental API.
+    ResourceLimit(String),
     /// A caller handed the encoder a scene it cannot write a conforming file from — a
     /// non-finite position, for instance, which would land in a quantization grid the
     /// specification forbids (§5.3). The mirror of `Malformed`: that describes a file that
@@ -98,6 +102,7 @@ impl fmt::Display for Error {
             Error::UnsupportedModel(m) => write!(f, "{m}"),
             Error::BoundViolation(m) => write!(f, "bound violation: {m}"),
             Error::UnsupportedOperation(m) => write!(f, "unsupported operation: {m}"),
+            Error::ResourceLimit(m) => write!(f, "resource limit: {m}"),
             Error::InvalidInput(m) => write!(f, "invalid input: {m}"),
             Error::Io(e) => write!(f, "io: {e}"),
             // Deferred to the kind so that naming a refusal did not reword it.
@@ -245,6 +250,7 @@ impl Error {
             Error::UnsupportedModel(message) => Error::UnsupportedModel(context(message)),
             Error::BoundViolation(message) => Error::BoundViolation(context(message)),
             Error::UnsupportedOperation(message) => Error::UnsupportedOperation(context(message)),
+            Error::ResourceLimit(message) => Error::ResourceLimit(context(message)),
             Error::InvalidInput(message) => Error::InvalidInput(context(message)),
             Error::Refused {
                 code,
@@ -300,6 +306,26 @@ impl Error {
                     ..
                 }
         )
+    }
+
+    /// True when a supported operation exceeded a caller-selected resource ceiling.
+    pub fn is_resource_limit(&self) -> bool {
+        matches!(self, Error::ResourceLimit(_))
+    }
+
+    /// Build the shared aggregate decoded-state resource diagnosis.
+    pub(crate) fn decoded_state_resource_limit(
+        limit: usize,
+        phase: &str,
+        required: Option<usize>,
+    ) -> Error {
+        let detail = required.map_or_else(
+            || "the required byte count cannot be represented".to_string(),
+            |bytes| format!("at least {bytes} bytes are required"),
+        );
+        Error::ResourceLimit(format!(
+            "decoded-state resource limit during {phase}: {detail}; configured limit is {limit} bytes"
+        ))
     }
 
     /// The identifier for a refusal this reader can name, or `None` for everything else.
