@@ -20,6 +20,7 @@ import json
 import os
 import struct
 import sys
+import zlib
 from decimal import InvalidOperation
 from types import SimpleNamespace
 
@@ -63,6 +64,51 @@ def test_non_positive_step_time_refusal_witnesses_change_only_the_field():
         changed = [index for index, pair in enumerate(zip(base, mutated, strict=True)) if pair[0] != pair[1]]
         assert changed
         assert set(changed) <= set(range(field, field + 8))
+
+
+def test_index_count_refusal_witnesses_change_only_the_claim_and_repair_summary_crc():
+    name, base, _expectation = next(
+        item for item in generate.build_keyframe_delta_corpus() if item[0] == invalid.INDEX_COUNT_BASE
+    )
+    assert name == invalid.INDEX_COUNT_BASE
+    chunk_offset, gaussian_field, live_field = invalid._delta_index_count_offsets(base)
+    crc_field, summary_start, footer_start, base_crc = invalid._summary_crc_fields(base)
+    decoded = kdf.decode_streamed(base)
+    chunk = next(item for item in decoded.chunks if item.offset == chunk_offset)
+    operations = chunk.update_count + chunk.birth_count + chunk.death_count
+    population = len(chunk.state.ids)
+
+    assert operations != population, "the witness must distinguish operation cost from live population"
+    assert struct.unpack_from("<I", base, gaussian_field) == (operations,)
+    assert struct.unpack_from("<Q", base, live_field) == (population,)
+    assert zlib.crc32(base[summary_start:footer_start]) & 0xFFFFFFFF == base_crc
+    assert {refusal.code for refusal in invalid.INDEX_COUNT_REFUSALS} == {"index-record-mismatch"}
+    assert {refusal.name for refusal in invalid.INDEX_COUNT_REFUSALS}.isdisjoint(
+        refusal.name for refusal in invalid.REFUSALS
+    ), "the witnesses stay staged until all SDK layers can pass the all-or-none invalid corpus"
+    assert "index-record-mismatch" in invalid.CODES
+
+    witnesses = {refusal.name: refusal.mutate(base) for refusal in invalid.INDEX_COUNT_REFUSALS}
+    assert witnesses == {refusal.name: refusal.mutate(base) for refusal in invalid.INDEX_COUNT_REFUSALS}
+    assert struct.unpack_from("<I", witnesses["WrongIndexGaussianCount"], gaussian_field) == (operations + 1,)
+    assert struct.unpack_from("<Q", witnesses["WrongIndexGaussianCount"], live_field) == (population,)
+    assert struct.unpack_from("<I", witnesses["WrongIndexLiveCount"], gaussian_field) == (operations,)
+    assert struct.unpack_from("<Q", witnesses["WrongIndexLiveCount"], live_field) == (population + 1,)
+
+    count_fields = {
+        "WrongIndexGaussianCount": set(range(gaussian_field, gaussian_field + 4)),
+        "WrongIndexLiveCount": set(range(live_field, live_field + 8)),
+    }
+    crc_bytes = set(range(crc_field, crc_field + 4))
+    for witness_name, mutated in witnesses.items():
+        changed = {index for index, pair in enumerate(zip(base, mutated, strict=True)) if pair[0] != pair[1]}
+        assert changed & count_fields[witness_name]
+        assert changed & crc_bytes
+        assert changed <= count_fields[witness_name] | crc_bytes
+        _, mutated_start, mutated_end, declared_crc = invalid._summary_crc_fields(mutated)
+        assert (mutated_start, mutated_end) == (summary_start, footer_start)
+        assert declared_crc != base_crc
+        assert zlib.crc32(mutated[mutated_start:mutated_end]) & 0xFFFFFFFF == declared_crc
 
 
 class TestExactAggregateTransition:

@@ -148,13 +148,16 @@ def test_only_a_registered_identifier_is_an_answer():
 
     The unregistered case has no cheap file to make — every identifier the reference
     reader produces for a small broken file is one the corpus knows — so it is asked of
-    the classifier directly. `index-record-mismatch` is a refusal this library names and
-    the invalid corpus does not register; answering with it would put an identifier into
-    the corpus that no expectation was written against.
+    the classifier directly. `index-record-mismatch` is staged vocabulary for the two
+    count witnesses, while `depth-mismatch` remains outside this corpus family.
     """
     assert refusal_answer(TruncatedFile("file is shorter than the magic")) is None
-    assert refusal_answer(MalformedFile("bad index", code="index-record-mismatch")) is None
-    assert "index-record-mismatch" not in CODES
+    assert refusal_answer(MalformedFile("bad depth", code="depth-mismatch")) is None
+    assert "depth-mismatch" not in CODES
+    assert "index-record-mismatch" in CODES
+    assert json.loads(refusal_answer(MalformedFile("bad index", code="index-record-mismatch"))) == {
+        "refused": "index-record-mismatch"
+    }
     assert json.loads(refusal_answer(MalformedFile("bad magic", code="magic-mismatch"))) == {
         "refused": "magic-mismatch"
     }
