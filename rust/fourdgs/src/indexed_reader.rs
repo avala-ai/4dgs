@@ -1825,6 +1825,18 @@ pub(crate) fn read_chunk_with_limit<R: Readable + ?Sized>(
         scene.header.cutoff,
         decode_budget,
     )?;
+    let observed = u64::try_from(decoded.count).map_err(|_| {
+        Error::UnsupportedOperation("decoded Chunk row count does not fit in u64".into())
+    })?;
+    if u64::from(entry.gaussian_count) != observed {
+        return Err(Error::index_record_mismatch(
+            entry.chunk_offset,
+            "gaussian_count",
+            u64::from(entry.gaussian_count),
+            observed,
+            "the decoded Chunk's validated gaussian row count",
+        ));
+    }
     drop(unpacked);
     drop(blob);
 
@@ -4509,6 +4521,7 @@ mod tests {
         let sh_offset = bytes.len() as u64;
         bytes.extend_from_slice(&sh);
         let mut entry = entry_for_chunk(&chunk);
+        entry.gaussian_count = COUNT as u32;
         entry.bands.push((1, sh_offset, sh.len() as u64));
         let scene = IndexedScene {
             header: rec::Header {
@@ -4590,6 +4603,7 @@ mod tests {
         let sh_offset = bytes.len() as u64;
         bytes.extend_from_slice(&sh);
         let mut entry = entry_for_chunk(&chunk);
+        entry.gaussian_count = COUNT as u32;
         entry.bands.push((1, sh_offset, sh.len() as u64));
         let scene = IndexedScene {
             header: rec::Header {

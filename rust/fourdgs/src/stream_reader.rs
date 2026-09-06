@@ -600,6 +600,7 @@ fn read_from_with_limits<R: Read>(
     let mut quant: Option<rec::Quantization> = None;
     let mut saw_window_table = false;
     let mut chunks: Vec<DecodedChunk> = Vec::new();
+    let mut decoded_chunk_offsets: Vec<u64> = Vec::new();
     let mut chunk_bands: Vec<BTreeMap<u8, DecodedStream>> = Vec::new();
     let mut chunk_band_masks: Vec<u8> = Vec::new();
     let mut decoded_bytes = 0usize;
@@ -1493,6 +1494,14 @@ fn read_from_with_limits<R: Read>(
                     "decoded band-mask collection",
                     offset,
                 )?;
+                decoded_bytes = push_streamed_decoded_value(
+                    &mut decoded_chunk_offsets,
+                    offset,
+                    decoded_bytes,
+                    retained_record_bytes,
+                    "decoded Chunk offset collection",
+                    offset,
+                )?;
                 retained_record_bytes = push_streamed_retained_value(
                     &mut scene.chunk_intervals,
                     (chunk_head.t0, chunk_head.t1),
@@ -1700,6 +1709,26 @@ fn read_from_with_limits<R: Read>(
             op::CHUNK_INDEX => {
                 let entry = rec::ChunkIndexEntry::parse(&content)
                     .map_err(|error| error.at_record("Chunk Index record", offset))?;
+                if let Some(chunk) = decoded_chunk_offsets
+                    .binary_search(&entry.chunk_offset)
+                    .ok()
+                    .and_then(|index| chunks.get(index))
+                {
+                    let observed = u64::try_from(chunk.count).map_err(|_| {
+                        Error::UnsupportedOperation(
+                            "decoded Chunk row count does not fit in u64".into(),
+                        )
+                    })?;
+                    if u64::from(entry.gaussian_count) != observed {
+                        return Err(Error::index_record_mismatch(
+                            entry.chunk_offset,
+                            "gaussian_count",
+                            u64::from(entry.gaussian_count),
+                            observed,
+                            "the decoded Chunk's validated gaussian row count",
+                        ));
+                    }
+                }
                 retained_record_bytes = push_streamed_retained_value(
                     &mut scene.chunk_index,
                     entry,
@@ -1891,11 +1920,13 @@ fn read_from_with_limits<R: Read>(
         )));
     }
 
-    // Band masks are needed only while records arrive.  Release them before assembly;
-    // the two outer decoded collections remain live beside the assembled output and are
+    // Band masks and physical offsets are needed only while records arrive. Release them
+    // before assembly. The two outer decoded collections remain live beside the assembled
+    // output and are
     // charged separately from the per-Chunk column buffers `assemble_with_retained`
     // measures itself.
     drop(chunk_band_masks);
+    drop(decoded_chunk_offsets);
     let decoded_collection_bytes = vector_bytes(&chunks)?
         .checked_add(vector_bytes(&chunk_bands)?)
         .ok_or_else(|| {

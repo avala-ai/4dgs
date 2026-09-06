@@ -147,6 +147,8 @@ pub mod refusal {
     pub const UNKNOWN_STREAM_CODEC: &str = "unknown-stream-codec";
     /// A gaussian's `window_index` names a row the Window Table does not have.
     pub const WINDOW_INDEX_OUT_OF_RANGE: &str = "window-index-out-of-range";
+    /// A Chunk Index count disagrees with the state record a reader decoded.
+    pub const INDEX_RECORD_MISMATCH: &str = "index-record-mismatch";
 }
 
 impl Error {
@@ -163,6 +165,24 @@ impl Error {
             kind,
             message,
         }
+    }
+
+    /// Refuse one count in a decoded Chunk Index entry with the shared diagnostic shape.
+    pub(crate) fn index_record_mismatch(
+        entry_offset: u64,
+        field: &str,
+        declared: u64,
+        observed: u64,
+        observation: &str,
+    ) -> Error {
+        Error::refused(
+            refusal::INDEX_RECORD_MISMATCH,
+            RefusalKind::Malformed,
+            format!(
+                "the chunk index entry at {entry_offset} declares {field} {declared}; \
+                 {observation} is {observed}"
+            ),
+        )
     }
 
     /// Add the outer record and byte to a parser error without changing its taxonomy or
