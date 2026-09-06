@@ -303,7 +303,7 @@ and no decoding difference, because each representable profile is the existing a
 | value      | status                          | notes                                                                                                                                                                  |
 | ---------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `gaussian` | representable                   | The usual soft temporal fade: opacity follows the marginal, a bell centred on `mu_t` with width `sigma_t`                                                              |
-| `box`      | representable                   | Full opacity across the whole validity window and absent outside it, with no fade. Reached with the never-fades flag plus the window                                   |
+| `box`      | representable                   | Full opacity across the effective existence interval and absent outside it, with no fade; a `gaussian-birth` Chunk bounds that interval (spec §5.5)                    |
 | `flat-top` | **reserved, not representable** | A plateau at full opacity over a core interval with smooth shoulders either side. Distinct from `box`, whose edges are hard, and from `gaussian`, which has no plateau |
 
 `flat-top` is reserved rather than defined because the version-1 wire model **cannot express it**: a
