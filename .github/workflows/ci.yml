@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Total tree size under 10.5 MB
+      - name: Total tree size under 11 MB
         # Raised from 8192 once the inspect-and-validate tools landed: #191 brought the
         # Dart validator and #188 the Swift one, and the tree they leave measures 8696 KiB.
         # The gate went red on the merge itself rather than on either pull request, because
@@ -41,11 +41,17 @@ jobs:
         # results/submission page, and governance text add 40 KiB. The same 512 KiB step
         # used above leaves room for the first catalog entries without weakening any of
         # the per-language source budgets below.
+        #
+        # Raised to 11264 after the aggregate decoded-state budgets and structured
+        # late-front-matter diagnostics landed across Rust, the C ABI, and Python. Their
+        # concurrently merged tree measures 10764 KiB — 12 KiB over the previous cap —
+        # while every per-language budget remains green. The established 512 KiB step
+        # restores merge headroom without weakening those narrower vendoring guards.
         run: |
           size_kb=$(du -s --exclude=.git . | cut -f1)
           echo "tree: ${size_kb} KiB"
-          if [ "$size_kb" -gt 10752 ]; then
-            echo "::error::tree is ${size_kb} KiB, over the 10752 KiB budget"
+          if [ "$size_kb" -gt 11264 ]; then
+            echo "::error::tree is ${size_kb} KiB, over the 11264 KiB budget"
             exit 1
           fi
       - name: Conformance data under 2.5 MB
