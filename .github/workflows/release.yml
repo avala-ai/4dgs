@@ -54,9 +54,9 @@ jobs:
       # so the token that publishes has no more reach than it did before.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -127,9 +127,9 @@ jobs:
       # For the release step alone, as in the Python job.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -202,14 +202,14 @@ jobs:
       # For the release step alone. No id-token: nothing here authenticates to anything.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Not shallow: the resolution check below has SwiftPM clone this checkout as if
           # it were the remote, and a clone of a depth-1 repository is a different and
           # much less useful thing to be testing against.
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -333,11 +333,11 @@ jobs:
       # For the release step alone, as in the Python job.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dart-lang/setup-dart@v1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -429,16 +429,16 @@ jobs:
       # For the release step alone, as in the Python job.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Node 22.14 or newer, because that is what npm 11.5.1 needs, and 11.5.1
       # is the first npm that can exchange an OIDC token for a publish.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -589,9 +589,9 @@ jobs:
       # For the release step alone. No id-token: nothing here publishes anywhere.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 

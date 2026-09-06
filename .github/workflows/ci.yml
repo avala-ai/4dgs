@@ -11,7 +11,7 @@ jobs:
     # are in the skeleton brief; this gate is the total.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Total tree size under 10 MB
         # Raised from 8192 once the inspect-and-validate tools landed: #191 brought the
         # Dart validator and #188 the Swift one, and the tree they leave measures 8696 KiB.
@@ -303,7 +303,7 @@ jobs:
     # The corpus is generated. A committed .4dgs means someone bypassed the generator.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           if git ls-files '*.4dgs' | grep -q .; then
             echo "::error::.4dgs files must not be committed; the generator reconstructs them"
@@ -328,8 +328,8 @@ jobs:
         # One declaration here rather than `shell: bash` on every step.
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       # The dev extra brings pytest and ruff, so the job installs what it runs
       # rather than assuming the runner already has it.
@@ -363,8 +363,8 @@ jobs:
     # answer the same question at the cost of a second heavyweight install.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pip install -e './python/fourdgs[dev,usd]'
       - name: The USD bridge's tests run, rather than skipping into a green nothing
@@ -380,8 +380,8 @@ jobs:
   markdown:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: "20" }
       - run: npx --yes prettier@3 --check "**/*.md"
       - run: npx --yes cspell@8 --config cspell.config.yaml "**/*.md"
@@ -398,10 +398,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: "22" }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
 
       # The package manager is the one the root package.json declares.
@@ -446,10 +446,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "22" }
 
       - name: Corpus and build
@@ -492,10 +492,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "22" }
 
       - name: Corpus and build
@@ -522,8 +522,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: rustup component add rustfmt clippy
 
@@ -663,8 +663,8 @@ jobs:
       # same three commands serve every leg.
       FOURDGS_CMAKE_CONFIG: ${{ matrix.os == 'windows-latest' && 'Release' || 'Debug' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
 
       # Pinned, because clang-format's output changes between releases and an unpinned
@@ -1009,12 +1009,12 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The floor the package declares, not the newest SDK. A package whose CI only ever
       # ran on the latest Dart is a package whose lower bound is a guess.
       - uses: dart-lang/setup-dart@v1
         with: { sdk: "3.13.1" }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: dart --version
 
@@ -1089,7 +1089,7 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: swift --version
       # Style comes from swift/.swift-format, so this is the same command a contributor
       # runs locally: `swift format --in-place --recursive` fixes what this reports.
@@ -1201,7 +1201,7 @@ jobs:
     # Rust staticlib is proved to cross-compile for those platforms at all.
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: swift --version
       # No cache here, and that is a measured decision rather than an oversight. The
       # macOS runner already ships Rust, so there is no toolchain to fetch, and the crate
