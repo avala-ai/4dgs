@@ -129,7 +129,7 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 2048 ] || { echo "::error::rust is ${size_kb} KiB, over the 2048 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 1280 KB
+      - name: TypeScript sources under 1344 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -184,11 +184,15 @@ jobs:
         # pages would have been blank. The licence is 11 KiB and there are four packages,
         # which is 44 of the 60 KiB this adds. Dart and Python already ship a package-local
         # copy for the same reason. The tree measures 1244, so 1280 leaves 36.
+        # Raised to 1344 KiB by the decoded binary32 range guard: every reconstructed
+        # floating lane is checked on streamed, indexed and keyframe-delta paths, with
+        # physical-row diagnostics and regression fixtures. CI measures 1296 KiB; 1344
+        # is the next 64 KiB step and leaves 48 KiB without hiding a vendored dependency.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 1280 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1280 KiB budget"; exit 1; }
-      - name: Dart sources under 1536 KB
+          [ "$size_kb" -le 1344 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1344 KiB budget"; exit 1; }
+      - name: Dart sources under 1600 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -257,10 +261,14 @@ jobs:
         # raise called out and declined to repeat. The added source is the refusal, its
         # four splice tests, and the changelog entry. 1536 is the next 64 KiB step and
         # leaves 60.
+        # Raised to 1600 KiB for the same decoded binary32 range contract in Dart. The
+        # decoder checks both temporal models and its tests pin the refusal context and
+        # legal sentinel controls. The clean source tree measures 1576 KiB, so the next
+        # 64 KiB step leaves 24 KiB of explicit headroom.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 1536 ] || { echo "::error::dart is ${size_kb} KiB, over the 1536 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1600 ] || { echo "::error::dart is ${size_kb} KiB, over the 1600 KiB budget"; exit 1; }
       - name: C++ sources under 896 KB
         # New, and the reason it is new is worth stating: every other SDK has had a
         # sub-budget here for some time and C++ never did, so the whole-tree gate above was
