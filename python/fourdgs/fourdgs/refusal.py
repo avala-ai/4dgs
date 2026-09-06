@@ -40,7 +40,7 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import FourdgsError, MalformedFile
+from .exceptions import FourdgsError, MalformedFile, check_front_matter_placement
 from .serialization import MAGIC, check_magic
 
 _RECORD_HEADER = struct.Struct("<BQ")
@@ -318,6 +318,17 @@ class ChunkRefusal:
     site: Site | None
 
 
+def _record_placement(where: Walk) -> ChunkRefusal | None:
+    """The first late defined front-matter record, from framing alone."""
+    first_state: tuple[int, int] | None = None
+    for frame in where.intact_records():
+        try:
+            first_state = check_front_matter_placement(frame.opcode, frame.offset, first_state)
+        except FourdgsError as exc:
+            return ChunkRefusal(exc, Site(frame.offset, f"the {op.name(frame.opcode)} record"))
+    return None
+
+
 #: Every band a chunk declares. `read_chunk` caps the spherical-harmonic bands it fetches,
 #: which is right for a *renderer* — coefficients do not enter reconstructed state, so a
 #: consumer that will not use them should not pay for them. It is wrong for a validator: an
@@ -346,6 +357,11 @@ def scan_chunks(data: bytes, where: Walk | None = None) -> ChunkRefusal | None:
     from .indexed_reader import open_indexed, read_chunk
     from .readable import BytesReadable
 
+    where = where if where is not None else walk(data)
+    misplaced = _record_placement(where)
+    if misplaced is not None:
+        return misplaced
+
     source = BytesReadable(data)
     try:
         scene = open_indexed(source)
@@ -353,7 +369,7 @@ def scan_chunks(data: bytes, where: Walk | None = None) -> ChunkRefusal | None:
         return ChunkRefusal(exc, None)
 
     if not scene.index:
-        return scan_front_to_back(data, where if where is not None else walk(data))
+        return scan_front_to_back(data, where)
 
     for i, entry in enumerate(scene.index):
         try:
@@ -408,6 +424,10 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
     identifier with no byte at all, because "every chunk or none" was the only answer a
     whole-file decode could give.
     """
+    misplaced = _record_placement(where)
+    if misplaced is not None:
+        return misplaced
+
     from .quantization import DEFAULT_CUTOFF
     from .serialization import Cursor, decode_stream
     from .stream_reader import check_sh_codes, chunk_stream_bytes, decode_streams, steps_from

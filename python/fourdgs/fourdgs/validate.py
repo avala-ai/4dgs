@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from . import opcode as op
 from . import records as rec
 from . import refusal
-from .exceptions import ExceedsReaderLimit, FourdgsError
+from .exceptions import ExceedsReaderLimit, FourdgsError, check_front_matter_placement
 from .object_layer import ObjectLayer
 from .provenance import LENGTH_UNIT_METRES, Provenance
 from .quantization import sh_bound, sh_step
@@ -288,6 +288,19 @@ def validate(data: bytes) -> Report:
         walk = refusal.walk(data, retain_records=False)
     except FourdgsError as exc:
         report.refused("", exc)
+        return report
+
+    # Placement is a framing rule, so prove it before parsing any body. Besides giving a
+    # late malformed record the required ordering refusal, this pass examines the whole
+    # file while retaining no record-sized payload or record list.
+    first_state: tuple[int, int] | None = None
+    placement_site: Site | None = None
+    try:
+        for frame in walk.intact_records():
+            placement_site = Site(frame.offset, f"the {op.name(frame.opcode)} record")
+            first_state = check_front_matter_placement(frame.opcode, frame.offset, first_state)
+    except FourdgsError as exc:
+        report.refused("stopped reading: ", exc, walk, placement_site)
         return report
 
     if not data.endswith(MAGIC):
@@ -871,13 +884,11 @@ def _check_compatibility_records(
     report: Report,
     expected_model: str,
 ) -> bool:
-    """Gate every Header and Quantization record, including copies after the first Chunk.
+    """Gate every Header and Quantization record that the placement preflight permits.
 
-    Indexed openers stop reading front matter at the first state record. Validation walks
-    the whole file, so a later record must not be allowed to smuggle in a model or scheme
-    that a front-to-back reader would refuse. The selected model is checked too: a known
-    value for the other decoder is malformed here, while an unknown value keeps its named
-    registry refusal.
+    The selected model is checked too: a known value for the other decoder is malformed
+    here, while an unknown value keeps its named registry refusal. The framing-only
+    placement pass has already rejected any copy after state before this parses a body.
     """
     from .registry import check_quantization_scheme, check_temporal_model
 

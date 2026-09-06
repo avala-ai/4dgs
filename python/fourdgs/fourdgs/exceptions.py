@@ -11,6 +11,8 @@ ours and broken.
 
 from __future__ import annotations
 
+from . import opcode as op
+
 
 class FourdgsError(Exception):
     """Base class for every error raised by this library.
@@ -71,6 +73,30 @@ def duplicate_structural_record(name: str, offset: int) -> MalformedFile:
         f"a second {name} record at byte {offset}; a file carries exactly one, and "
         f"nothing says which of two copies a reader should believe",
     )
+
+
+def check_front_matter_placement(
+    opcode: int,
+    offset: int,
+    first_state: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """Observe one physical record and enforce spec section 4's placement classes.
+
+    Returning the first state site keeps callers' scans constant-space. The check is
+    intentionally made before they parse or dispatch the current record: once state has
+    begun, placement controls even when the late record is also a duplicate or malformed.
+    """
+    if first_state is not None and opcode in op.FRONT_MATTER_OPCODES:
+        first_opcode, first_offset = first_state
+        raise MalformedFile(
+            f"the defined front-matter {op.name(opcode)} record (opcode 0x{opcode:02X}) at byte {offset} "
+            f"appears after the first state {op.name(first_opcode)} record (opcode 0x{first_opcode:02X}) "
+            f"at byte {first_offset}; every defined front-matter record must precede the first state record",
+            code="late-front-matter-record",
+        )
+    if first_state is None and opcode in op.STATE_OPCODES:
+        return opcode, offset
+    return first_state
 
 
 class UnsupportedCodec(FourdgsError):

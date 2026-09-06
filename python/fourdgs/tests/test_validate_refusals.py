@@ -647,7 +647,7 @@ class TestKeyframeDelta:
         named = [f.refusal for f in report.findings if f.refusal is not None]
         assert any(n.code == "unknown-quantization-scheme" and n.site is not None for n in named), report.findings
 
-    def test_every_header_is_checked_on_the_selected_keyframe_delta_path(self):
+    def test_a_later_header_is_rejected_before_its_model_is_checked(self):
         data = _keyframe_file(write_index=False)
         original = _first_record(data, op.HEADER)
         wrong = rec.Header.parse(original.content)
@@ -655,7 +655,8 @@ class TestKeyframeDelta:
         wrong_first = data[: original.offset] + wrong.encode() + data[original.offset + 9 + len(original.content) :]
         report = validate(_splice(wrong_first, original))
         assert not report.ok
-        assert any("contains a Header declaring" in finding.message for finding in report.findings)
+        named = [f.refusal for f in report.findings if f.refusal is not None]
+        assert any(n.code == "late-front-matter-record" and n.site is not None for n in named), report.findings
 
     def test_an_indexless_sequence_requires_every_declared_sh_band(self):
         data = _patch_sh_degree(_single_keyframe_file(write_index=False), 1)
@@ -1043,15 +1044,18 @@ class TestKeyframeDelta:
         assert not report.ok
         assert any("window index" in f.message for f in report.findings), report.findings
 
-    def test_indexless_validation_uses_the_last_window_table_like_reconstruction(self):
+    def test_indexless_reconstruction_and_validation_refuse_a_later_window_table(self):
         data = _keyframe_file(two_windows=True, write_index=False)
         second = next(iter_records(rec.WindowTable(windows=[(0.0, 8.0)]).encode()))
         data = _splice(data, second)
-        assert len(kdf.decode_streamed(data).windows) == 1
+        with pytest.raises(MalformedFile) as caught:
+            kdf.decode_streamed(data)
+        assert caught.value.code == "late-front-matter-record"
 
         report = validate(data)
         assert not report.ok
-        assert any("window index" in f.message for f in report.findings), report.findings
+        named = [f.refusal for f in report.findings if f.refusal is not None]
+        assert any(n.code == "late-front-matter-record" and n.site is not None for n in named), report.findings
 
     def test_the_state_chunks_must_cover_the_whole_timeline(self):
         """§11.1 is three rules, and adjacency is only the middle one: "the first `t0` is
@@ -1580,21 +1584,19 @@ class TestWholeFileCompatibilityGates:
             rec.Header.parse(malformed.content)
 
     @pytest.mark.parametrize(
-        ("opcode", "mutate", "code"),
+        ("opcode", "mutate"),
         [
             (
                 op.HEADER,
                 lambda value: setattr(value, "temporal_model", "future-model"),
-                "unknown-temporal-model",
             ),
             (
                 op.QUANTIZATION,
                 lambda value: setattr(value, "scheme", "uniform-v9"),
-                "unknown-quantization-scheme",
             ),
         ],
     )
-    def test_a_later_gaussian_birth_compatibility_record_is_still_gated(self, opcode, mutate, code):
+    def test_late_placement_precedes_a_gaussian_birth_compatibility_refusal(self, opcode, mutate):
         data = _real_file()
         original = _first_record(data, opcode)
         value = rec.Header.parse(original.content) if opcode == op.HEADER else rec.Quantization.parse(original.content)
@@ -1602,7 +1604,7 @@ class TestWholeFileCompatibilityGates:
         later = next(iter_records(value.encode()))
         report = validate(_splice(data, later))
         named = [f.refusal for f in report.findings if f.refusal is not None]
-        refusal_ = next(item for item in named if item.code == code)
+        refusal_ = next(item for item in named if item.code == "late-front-matter-record")
         assert refusal_.site is not None
         assert refusal_.site.offset != original.offset
 
