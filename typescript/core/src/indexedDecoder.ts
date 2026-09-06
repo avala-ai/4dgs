@@ -23,6 +23,7 @@ import {
   stepsFrom,
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
+import { DecodedStateBudget, decodedChunkStateBytes } from "./decodedStateBudget.js";
 import {
   duplicateStructuralRecord,
   ExceedsReaderLimit,
@@ -81,8 +82,8 @@ import {
   readRecord,
 } from "./records.js";
 import { Cursor } from "./cursor.js";
-import { MAX_SH_DEGREE, mergeBands, type ShCoefficients } from "./sh.js";
-import { decodeStream, frameOneStream } from "./streams.js";
+import { MAX_SH_DEGREE, coefficientsForDegree, mergeBands, type ShCoefficients } from "./sh.js";
+import { decodedStreamWorkingBytes, decodeStream, frameOneStream } from "./streams.js";
 
 /**
  * One read of this size from the front covers the header records of every scene measured
@@ -177,6 +178,8 @@ export interface OpenIndexedOptions {
 export interface ReadChunkOptions {
   /** Highest SH band to transfer. 0 fetches no band bytes at all. */
   readonly maxShBand?: number;
+  /** Shared accounting for an adapter that retains several incremental reads. */
+  readonly decodedStateBudget?: DecodedStateBudget;
 }
 
 /** One chunk's gaussians plus whichever SH bands the caller paid to transfer. */
@@ -846,6 +849,16 @@ export class IndexedDecoder {
       );
     }
     const parsed = parseChunk(record.content);
+    const highestBand = entry.bands.reduce(
+      (highest, band) => (band.band <= maxShBand ? Math.max(highest, band.band) : highest),
+      0,
+    );
+    const shBytesPerGaussian = highestBand === 0 ? 0 : 15 * coefficientsForDegree(highestBand);
+    options.decodedStateBudget?.check(
+      BigInt(parsed.header.count) * BigInt(512 + shBytesPerGaussian) +
+        BigInt(parsed.header.uncompressedSize) * 2n,
+      `indexed Chunk decode at byte ${entry.chunkOffset}`,
+    );
     const streamBytes = await chunkStreamBytes(parsed, this.codecs);
     const gaussians = await decodeChunkStreams(streamBytes, parsed.header.count, {
       ...this.chunkOptions(),
@@ -859,6 +872,8 @@ export class IndexedDecoder {
     );
 
     const bands = new Map<number, Int32Array>();
+    const chunkStateBytes = decodedChunkStateBytes(gaussians);
+    let decodedBandBytes = 0;
     for (const band of entry.bands) {
       if (band.band > maxShBand) continue;
       const bandBlob = await this.readRange(band.offset, band.length, `index band ${band.band}`);
@@ -875,10 +890,35 @@ export class IndexedDecoder {
           `index says band ${band.band}, the record says band ${parsedBand.band}`,
         );
       }
-      bands.set(band.band, await decodeStream(frameOneStream(parsedBand.cursor), this.codecs));
+      const stream = frameOneStream(parsedBand.cursor);
+      options.decodedStateBudget?.check(
+        BigInt(chunkStateBytes) + BigInt(decodedBandBytes) + decodedStreamWorkingBytes(stream),
+        `indexed SH band ${band.band} decode at byte ${band.offset}`,
+      );
+      const values = await decodeStream(stream, this.codecs);
+      bands.set(band.band, values);
+      decodedBandBytes += values.byteLength;
     }
 
+    const presentBands = [...bands.keys()]
+      .filter((band) => band <= MAX_SH_DEGREE)
+      .sort((a, b) => a - b);
+    // `mergeBands` diagnoses a gap before allocating. Preserve that malformed verdict;
+    // only budget the output once the band set is known to describe a whole degree.
+    if (presentBands.every((band, i) => band === i + 1)) {
+      const degree = presentBands.length;
+      const mergedShBytes =
+        degree === 0 ? 0n : BigInt(gaussians.count) * BigInt(3 * coefficientsForDegree(degree));
+      options.decodedStateBudget?.check(
+        BigInt(chunkStateBytes) + BigInt(decodedBandBytes) + mergedShBytes,
+        `indexed Chunk SH assembly after byte ${entry.chunkOffset}`,
+      );
+    }
     const sh = bands.size > 0 ? mergeBands(gaussians.count, bands, MAX_SH_DEGREE) : null;
+    options.decodedStateBudget?.retain(
+      chunkStateBytes + (sh?.values.byteLength ?? 0),
+      `indexed Chunk collection after byte ${entry.chunkOffset}`,
+    );
     return { entry, gaussians, sh };
   }
 

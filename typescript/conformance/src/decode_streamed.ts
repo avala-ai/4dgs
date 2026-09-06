@@ -11,6 +11,8 @@
  */
 
 import {
+  DEFAULT_MAX_DECODED_STATE_BYTES,
+  ExceedsReaderLimit,
   FourdgsError,
   MAGIC,
   Opcode,
@@ -22,6 +24,7 @@ import {
   parseHeader,
   type IReadable,
   type Scene,
+  validateMaxDecodedStateBytes,
 } from "@4dgs/core";
 import { FileHandleReadable } from "@4dgs/nodejs";
 
@@ -34,8 +37,8 @@ const BLOCK_SIZE = 8 * 1024;
 /** How much of the front is read to learn the temporal model without decoding gaussians. */
 const HEADER_PROBE_BYTES = 64 * 1024;
 
-function decode(readable: IReadable): Promise<Scene> {
-  return decodeScene(readable, { blockSize: BLOCK_SIZE });
+function decode(readable: IReadable, maxDecodedStateBytes: number): Promise<Scene> {
+  return decodeScene(readable, { blockSize: BLOCK_SIZE, maxDecodedStateBytes });
 }
 
 /** The Header's temporal model, read from a bounded prefix. */
@@ -48,7 +51,10 @@ async function temporalModel(source: IReadable, size: number): Promise<string | 
   return null;
 }
 
-export async function run(path: string): Promise<string> {
+export async function run(
+  path: string,
+  maxDecodedStateBytes = DEFAULT_MAX_DECODED_STATE_BYTES,
+): Promise<string> {
   const source = await FileHandleReadable.open(path);
   try {
     const size = Number(await source.size());
@@ -59,17 +65,22 @@ export async function run(path: string): Promise<string> {
       // Truncation recovery is a gaussian-birth check: the states canonical is a different
       // statement and a cut file is a different file.
       const data = await source.read(0n, BigInt(size));
-      return canonical(keyframeDeltaStatesJson(await decodeKeyframeDeltaStreamed(data)));
+      return canonical(
+        keyframeDeltaStatesJson(await decodeKeyframeDeltaStreamed(data, { maxDecodedStateBytes })),
+      );
     }
 
     const payloads = new AudioPayloadDigests();
     const scene = await decodeScene(source, {
       blockSize: BLOCK_SIZE,
+      maxDecodedStateBytes,
       onAudioData: payloads.consume,
     });
 
     checkStreamedRecords(scene, size);
-    await checkTruncationRecovery(source, size, scene, decode);
+    await checkTruncationRecovery(source, size, scene, (readable) =>
+      decode(readable, maxDecodedStateBytes),
+    );
 
     return canonical(
       summarize({
@@ -92,26 +103,45 @@ export async function run(path: string): Promise<string> {
   }
 }
 
-const path = process.argv[2];
-if (path === undefined) {
-  process.stderr.write("usage: decode_streamed.js <file.4dgs>\n");
+const argv = process.argv.slice(2);
+const injected = argv[0] === "--max-decoded-state-bytes";
+const path = injected ? argv[2] : argv[0];
+const limitArgument = injected ? argv[1] : undefined;
+const maxDecodedStateBytes =
+  limitArgument !== undefined && /^[0-9]+$/.test(limitArgument)
+    ? Number(limitArgument)
+    : injected
+      ? Number.NaN
+      : DEFAULT_MAX_DECODED_STATE_BYTES;
+if (
+  path === undefined ||
+  (injected ? argv.length !== 3 : argv.length !== 1) ||
+  !Number.isSafeInteger(maxDecodedStateBytes) ||
+  maxDecodedStateBytes <= 0
+) {
+  process.stderr.write("usage: decode_streamed.js [--max-decoded-state-bytes N] <file.4dgs>\n");
   process.exit(2);
 }
+validateMaxDecodedStateBytes(maxDecodedStateBytes);
 try {
-  process.stdout.write((await run(path)) + "\n");
+  process.stdout.write((await run(path, maxDecodedStateBytes)) + "\n");
 } catch (error) {
-  // Only this library's own errors are answers. Anything else — a bug in the runner, a
-  // failed check in checks.ts — stays a crash, because a decoder must not be able to
-  // pass the invalid corpus by falling over in roughly the right place.
-  if (!(error instanceof FourdgsError)) throw error;
-  // And not even all of those: an error the refusal table cannot name is a failed
-  // invocation, not a refusal. It goes to stderr with a non-zero exit, because printing
-  // an empty identifier and exiting 0 would claim a valid answer for a failure no
-  // expectation can check. See `refusalAnswer`.
-  const answer = refusalAnswer(error);
-  if (answer === null) {
-    process.stderr.write(`${path}: ${error.message}\n`);
-    process.exit(1);
+  if (error instanceof ExceedsReaderLimit) {
+    process.stdout.write('{"unsupported":"resource-limit"}\n');
+  } else {
+    // Only this library's own errors are answers. Anything else — a bug in the runner, a
+    // failed check in checks.ts — stays a crash, because a decoder must not be able to
+    // pass the invalid corpus by falling over in roughly the right place.
+    if (!(error instanceof FourdgsError)) throw error;
+    // And not even all of those: an error the refusal table cannot name is a failed
+    // invocation, not a refusal. It goes to stderr with a non-zero exit, because printing
+    // an empty identifier and exiting 0 would claim a valid answer for a failure no
+    // expectation can check. See `refusalAnswer`.
+    const answer = refusalAnswer(error);
+    if (answer === null) {
+      process.stderr.write(`${path}: ${error.message}\n`);
+      process.exit(1);
+    }
+    process.stdout.write(answer + "\n");
   }
-  process.stdout.write(answer + "\n");
 }

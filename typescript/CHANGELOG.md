@@ -8,8 +8,22 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Added
+
+- **Collecting decoders now enforce a configurable aggregate decoded-state budget.** `decodeScene`,
+  `decodeKeyframeDeltaStreamed`, and `decodeKeyframeDeltaIndexed` accept `maxDecodedStateBytes`,
+  defaulting to 536,870,912 bytes. Retained typed-array capacity and the next decode, composition,
+  SH merge, or final assembly working set share one ceiling; exhaustion is the non-refusal
+  `ExceedsReaderLimit` result. Indexed adapters can pass a shared `DecodedStateBudget` through
+  `readChunk` and `assembleGaussians` without making ordinary incremental reads accumulate
+  caller-owned results.
+
 ### Fixed
 
+- **Keyframe-delta decoders skip unknown attribute payloads by length.** Reserved and private
+  attributes no longer invoke a codec or materialize constant expansions the version-1 reader does
+  not understand. Defined attribute widths are checked before payload decode, keeping malformed
+  shapes from allocating outside the collecting budget before their diagnosis.
 - **Derived floating attributes are range-checked before binary32 narrowing.** Gaussian-birth and
   keyframe-delta readers now refuse a non-finite or out-of-range reconstructed lane as
   `decoded-f32-overflow`, attributed to the physical Chunk or Delta Chunk row that first produces it

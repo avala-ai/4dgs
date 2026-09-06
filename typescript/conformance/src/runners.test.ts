@@ -31,7 +31,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { lateFrontMatterRecord, MalformedFile, Refusal } from "@4dgs/core";
+import { encodeScene, lateFrontMatterRecord, MalformedFile, Refusal } from "@4dgs/core";
 
 import { refusalAnswer } from "./canonical.js";
 
@@ -84,10 +84,12 @@ function runner(name: string): string {
 }
 
 /** `data` on disk in a directory the test owns, decoded by `name` in its own process. */
-function decode(name: string, data: Uint8Array): Run {
+function decode(name: string, data: Uint8Array, ...options: string[]): Run {
   const path = join(mkdtempSync(join(tmpdir(), "fourdgs-runner-")), "input.4dgs");
   writeFileSync(path, data);
-  const result = spawnSync(process.execPath, [runner(name), path], { encoding: "utf8" });
+  const result = spawnSync(process.execPath, [runner(name), ...options, path], {
+    encoding: "utf8",
+  });
   assert.equal(result.error, undefined, `could not run ${name}`);
   return { code: result.status ?? -1, out: result.stdout, err: result.stderr };
 }
@@ -106,5 +108,37 @@ for (const name of RUNNERS) {
     assert.equal(done.code, 0, `${name} failed the invocation for a refusal it named: ${done.err}`);
     assert.deepEqual(JSON.parse(done.out), { refused: "magic-mismatch" });
     assert.equal(done.err, "");
+  });
+
+  test(`${name}: an injected decoded-state limit is a resource result`, async () => {
+    const data = await encodeScene(
+      {
+        count: 1,
+        positions: [0, 0, 0],
+        scales: [0.01, 0.01, 0.01],
+        rotations: [0, 0, 0, 1],
+        colors: [0.5, 0.5, 0.5, 1],
+        motions: [0, 0, 0],
+        muT: [0.5],
+        sigmaT: [Number.POSITIVE_INFINITY],
+        winLo: [0],
+        winHi: [1],
+      },
+      1,
+      { maxDepth: 0, minChunkGaussians: 1 },
+    );
+    const done = decode(name, data, "--max-decoded-state-bytes", "1");
+    assert.equal(done.code, 0, `${name} did not classify its resource limit: ${done.err}`);
+    assert.equal(done.out, '{"unsupported":"resource-limit"}\n');
+    assert.equal(done.err, "");
+  });
+
+  test(`${name}: decoded-state limits use strict decimal syntax`, () => {
+    for (const argument of ["0x1", "1e0", "+1", "1.0"]) {
+      const done = decode(name, NAMED, "--max-decoded-state-bytes", argument);
+      assert.equal(done.code, 2, `${name} accepted ${argument}`);
+      assert.equal(done.out, "");
+      assert.match(done.err, /^usage: /);
+    }
   });
 }

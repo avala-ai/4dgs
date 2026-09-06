@@ -36,6 +36,14 @@ export {
 } from "./errors.js";
 
 export {
+  DEFAULT_MAX_DECODED_STATE_BYTES,
+  DecodedStateBudget,
+  decodedChunkStateBytes,
+  gaussianSetAssemblyBytes,
+  validateMaxDecodedStateBytes,
+} from "./decodedStateBudget.js";
+
+export {
   Attribute,
   ATTRIBUTE_CHANNELS,
   FROZEN_OPCODES,
@@ -228,7 +236,13 @@ export {
   windowTableOrDefault,
 } from "./chunk.js";
 
-export { GaussianSet, type GaussianState, assembleGaussians, marginalAt } from "./gaussians.js";
+export {
+  GaussianSet,
+  type AssembleGaussiansOptions,
+  type GaussianState,
+  assembleGaussians,
+  marginalAt,
+} from "./gaussians.js";
 
 export { type GaussianInput, type WriteOptions, encodeScene } from "./writer.js";
 
@@ -264,6 +278,7 @@ export {
   KeyframeDeltaState,
   type Interval,
   type KeyframeDeltaChunkInfo,
+  type KeyframeDeltaDecodeOptions,
   type KeyframeDeltaGaussians,
   type KeyframeDeltaIndexedResult,
   type KeyframeDeltaSequence,

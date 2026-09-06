@@ -19,6 +19,9 @@ import { audioSourceStateAt, decodeScene, IndexedDecoder } from "@4dgs/core";
 
 // Front to back: works on a pipe, on a file with no index, and on a truncated file.
 const scene = await decodeScene(readable, {
+  // Collecting calls retain decoded state; the shared default is 512 MiB and callers can
+  // choose a smaller or larger positive safe-integer ceiling.
+  maxDecodedStateBytes: 536_870_912,
   // Each awaited call receives at most one input block. Consume it here; decodeScene
   // retains only the source descriptors.
   onAudioData({ sourceId, offset, bytes, final }) {

@@ -19,6 +19,11 @@ import {
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
 import {
+  DEFAULT_MAX_DECODED_STATE_BYTES,
+  DecodedStateBudget,
+  decodedChunkStateBytes,
+} from "./decodedStateBudget.js";
+import {
   duplicateStructuralRecord,
   ExceedsReaderLimit,
   lateFrontMatterRecord,
@@ -64,9 +69,9 @@ import {
   parseWindowTable,
 } from "./records.js";
 import { type IReadable, BytesReadable } from "./readable.js";
-import { MAX_SH_DEGREE, mergeBands, type ShCoefficients } from "./sh.js";
+import { MAX_SH_DEGREE, coefficientsForDegree, mergeBands, type ShCoefficients } from "./sh.js";
 import { StreamDecoder, type StreamedRecordPart } from "./streamDecoder.js";
-import { decodeStream, frameOneStream } from "./streams.js";
+import { decodedStreamWorkingBytes, decodeStream, frameOneStream } from "./streams.js";
 
 /** Everything a `.4dgs` file describes, decoded. */
 export interface Scene {
@@ -115,6 +120,8 @@ export interface Scene {
 export interface DecodeOptions {
   /** Decompressors by codec id. Defaults to deflate only; zstd is opt-in. */
   readonly codecs?: CodecRegistry;
+  /** Aggregate ceiling for decoded state retained by this collecting call. */
+  readonly maxDecodedStateBytes?: number;
   /** Highest SH band to decode. 0 skips spherical harmonics entirely. */
   readonly maxShBand?: number;
   /** Bytes per read from the resource. Bounds how much is in flight, not what fits. */
@@ -206,6 +213,13 @@ export async function decodeScene(
   source: IReadable | Uint8Array,
   options: DecodeOptions = {},
 ): Promise<Scene> {
+  // Validate configuration before constructing or touching the input abstraction. A bad
+  // caller argument is independent of what bytes, transport, or error the input carries.
+  const decodedStateBudget = new DecodedStateBudget(
+    options.maxDecodedStateBytes === undefined
+      ? DEFAULT_MAX_DECODED_STATE_BYTES
+      : options.maxDecodedStateBytes,
+  );
   const readable = source instanceof Uint8Array ? new BytesReadable(source) : source;
   const codecs = options.codecs ?? DEFAULT_CODECS;
   const maxShBand = options.maxShBand ?? MAX_SH_DEGREE;
@@ -352,11 +366,19 @@ export async function decodeScene(
             codecs,
           };
           const parsed = parseChunk(content);
+          decodedStateBudget.check(
+            BigInt(parsed.header.count) * 512n + BigInt(parsed.header.uncompressedSize) * 2n,
+            `streamed Chunk decode at byte ${record.offset}`,
+          );
           const streamBytes = await chunkStreamBytes(parsed, codecs);
           const decoded = await decodeChunkStreams(streamBytes, parsed.header.count, {
             ...chunkOptions,
             recordOffset: record.offset,
           });
+          decodedStateBudget.retain(
+            decodedChunkStateBytes(decoded),
+            `streamed Chunk collection after byte ${record.offset}`,
+          );
           chunks.push(decoded);
           decodedChunkRows.set(record.offset, decoded.count);
           chunkBands.push(new Map());
@@ -366,8 +388,20 @@ export async function decodeScene(
           if (maxShBand <= 0 || chunks.length === 0) break;
           const { band, cursor } = parseShBandRecord(content);
           if (band > maxShBand) break;
-          const values = await decodeStream(frameOneStream(cursor), codecs);
-          chunkBands[chunkBands.length - 1]!.set(band, values);
+          const stream = frameOneStream(cursor);
+          decodedStateBudget.check(
+            decodedStreamWorkingBytes(stream),
+            `streamed SH band ${band} decode at byte ${record.offset}`,
+          );
+          const values = await decodeStream(stream, codecs);
+          const bands = chunkBands[chunkBands.length - 1]!;
+          const previous = bands.get(band);
+          decodedStateBudget.retain(
+            values.byteLength,
+            `streamed SH band ${band} collection after byte ${record.offset}`,
+          );
+          bands.set(band, values);
+          if (previous !== undefined) decodedStateBudget.release(previous.byteLength);
           break;
         }
         case Opcode.AudioSource: {
@@ -505,16 +539,21 @@ export async function decodeScene(
     truncated,
   );
 
+  const mergedShBytes = mergedShStateBytes(chunks, chunkBands, maxShBand);
+  // `mergeChunkBands` temporarily owns per-chunk merged arrays as well as its final array.
+  decodedStateBudget.check(mergedShBytes * 2n, "gaussian-birth SH band assembly");
+  const sh = mergeChunkBands(chunks, chunkBands, maxShBand);
+  if (sh !== null) {
+    decodedStateBudget.retain(sh.values.byteLength, "gaussian-birth SH band collection");
+  }
+
   return {
     header,
     quantization,
     windows,
-    gaussians: assembleGaussians(
-      chunks,
-      windows,
-      header.shDegree,
-      mergeChunkBands(chunks, chunkBands, maxShBand),
-    ),
+    gaussians: assembleGaussians(chunks, windows, header.shDegree, sh, {
+      decodedStateBudget,
+    }),
     audioSources,
     camera,
     metadata,
@@ -913,4 +952,22 @@ function mergeChunkBands(
     at += part.values.length;
   }
   return { degree, coefficients, count, values, bands: withBands[0]!.bands };
+}
+
+/** Capacity of the final SH buffer implied by the retained per-chunk band maps. */
+function mergedShStateBytes(
+  chunks: readonly ChunkGaussians[],
+  bands: readonly ReadonlyMap<number, Int32Array>[],
+  degreeCap: number,
+): bigint {
+  let highest = 0;
+  for (const chunkBands of bands) {
+    for (const band of chunkBands.keys()) {
+      if (band <= degreeCap) highest = Math.max(highest, band);
+    }
+  }
+  if (highest === 0) return 0n;
+  let count = 0n;
+  for (const chunk of chunks) count += BigInt(chunk.count);
+  return count * BigInt(3 * coefficientsForDegree(highest));
 }
