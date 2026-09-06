@@ -30,6 +30,7 @@ namespace {
 
 using fourdgs::Error;
 using fourdgs::ErrorCode;
+using fourdgs::LateFrontMatterRecords;
 using fourdgs::Span;
 using fourdgs::tool::Named;
 using fourdgs::tool::Report;
@@ -242,6 +243,47 @@ std::string expectedRefusal(const std::filesystem::path& json) {
   return text.substr(open + 1, close - open - 1);
 }
 
+struct ExpectedRecordSite {
+  std::uint8_t opcode = 0;
+  std::uint64_t offset = 0;
+};
+
+ExpectedRecordSite expectedRecordSite(const std::filesystem::path& json,
+                                      const std::string& member) {
+  std::ifstream stream(json);
+  if (!stream) return {};
+  const std::string text((std::istreambuf_iterator<char>(stream)),
+                         std::istreambuf_iterator<char>());
+  ExpectedRecordSite result;
+  const std::size_t object = text.find("\"" + member + "\"");
+  const std::size_t close = object == std::string::npos ? object : text.find('}', object);
+  const std::size_t atKey = object == std::string::npos ? object : text.find("\"at\"", object);
+  const std::size_t atColon = atKey == std::string::npos ? atKey : text.find(':', atKey);
+  const std::size_t atOpen = atColon == std::string::npos ? atColon : text.find('"', atColon);
+  const std::size_t atClose = atOpen == std::string::npos ? atOpen : text.find('"', atOpen + 1);
+  const std::size_t opcodeKey =
+      object == std::string::npos ? object : text.find("\"opcode\"", object);
+  const std::size_t opcodeColon =
+      opcodeKey == std::string::npos ? opcodeKey : text.find(':', opcodeKey);
+  CHECK(object != std::string::npos);
+  CHECK(close != std::string::npos);
+  CHECK(atKey < close);
+  CHECK(atColon < close);
+  CHECK(atOpen < close);
+  CHECK(atClose < close);
+  CHECK(opcodeKey < close);
+  CHECK(opcodeColon < close);
+  if (object == std::string::npos || close == std::string::npos || atKey >= close ||
+      atColon >= close || atOpen >= close || atClose >= close || opcodeKey >= close ||
+      opcodeColon >= close) {
+    return result;
+  }
+  result.offset = std::strtoull(text.substr(atOpen + 1, atClose - atOpen - 1).c_str(), nullptr, 10);
+  result.opcode =
+      static_cast<std::uint8_t>(std::strtoul(text.c_str() + opcodeColon + 1, nullptr, 10));
+  return result;
+}
+
 std::vector<std::filesystem::path> variants(const std::filesystem::path& directory) {
   std::vector<std::filesystem::path> out;
   if (!std::filesystem::is_directory(directory)) return out;
@@ -307,6 +349,48 @@ void everyInvalidVariantIsRefusedByItsOwnIdentifier() {
     if (!result.outContains("refusal " + code + " at byte ")) {
       std::fprintf(stderr, "  %s said: %s", file.filename().string().c_str(), result.out.c_str());
     }
+  }
+}
+
+/// The validator's own bounded framing walk proves both physical sites for the full family.
+void everyLateFrontMatterWitnessCarriesBothSites() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  const std::filesystem::path directory = corpusDirectory() / "invalid" / "late-front-matter";
+  const std::vector<std::filesystem::path> files = variants(directory);
+  CHECK_EQ(files.size(), static_cast<std::size_t>(18));
+  for (const std::filesystem::path& file : files) {
+    const std::filesystem::path expectation =
+        std::filesystem::path(file).replace_extension(".json");
+    const ExpectedRecordSite late = expectedRecordSite(expectation, "lateRecord");
+    const ExpectedRecordSite first = expectedRecordSite(expectation, "firstStateRecord");
+    const std::vector<std::uint8_t> bytes = readBytes(file);
+    CHECK(!bytes.empty());
+    if (bytes.empty()) continue;
+
+    const Report report =
+        fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+    const Named* refusal = nullptr;
+    for (const fourdgs::tool::Finding& finding : report.findings) {
+      if (finding.refusal.has_value() && finding.refusal->code == "late-front-matter-record") {
+        refusal = &*finding.refusal;
+        break;
+      }
+    }
+    CHECK(refusal != nullptr);
+    if (refusal == nullptr) continue;
+    CHECK(refusal->lateFrontMatterRecords.has_value());
+    if (!refusal->lateFrontMatterRecords.has_value()) continue;
+    const LateFrontMatterRecords& actual = *refusal->lateFrontMatterRecords;
+    CHECK_EQ(actual.lateRecord.opcode, late.opcode);
+    CHECK_EQ(actual.lateRecord.offset, late.offset);
+    CHECK_EQ(actual.firstStateRecord.opcode, first.opcode);
+    CHECK_EQ(actual.firstStateRecord.offset, first.offset);
+
+    const Run result = run({"validate", file.string()});
+    CHECK_EQ(result.code, fourdgs::tool::kExitFailed);
+    CHECK(result.outContains("refusal late-front-matter-record at byte " +
+                             std::to_string(late.offset)));
   }
 }
 
@@ -1773,10 +1857,15 @@ void decodeFrontMatterAfterStateIsRejected() {
       fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
   bool rejected = false;
   for (const fourdgs::tool::Finding& finding : report.findings) {
-    if (finding.message.find("Quantization record at byte " + std::to_string(chunks[1].offset) +
-                             " appears after the first Chunk record") != std::string::npos) {
-      rejected = true;
-    }
+    if (!finding.refusal.has_value() || finding.refusal->code != "late-front-matter-record" ||
+        !finding.refusal->lateFrontMatterRecords.has_value())
+      continue;
+    const LateFrontMatterRecords& sites = *finding.refusal->lateFrontMatterRecords;
+    CHECK_EQ(sites.lateRecord.opcode, fourdgs::tool::op::kQuantization);
+    CHECK_EQ(sites.lateRecord.offset, chunks[1].offset);
+    CHECK_EQ(sites.firstStateRecord.opcode, fourdgs::tool::op::kChunk);
+    CHECK_EQ(sites.firstStateRecord.offset, chunks[0].offset);
+    rejected = true;
   }
   CHECK(rejected);
 }
@@ -1811,10 +1900,14 @@ void modernAudioAfterStateIsRejected() {
       fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
   bool rejected = false;
   for (const fourdgs::tool::Finding& finding : report.findings) {
-    if (finding.message.find("Audio Source record at byte " + std::to_string(late->offset) +
-                             " appears after the first Chunk record") != std::string::npos) {
-      rejected = true;
-    }
+    if (!finding.refusal.has_value() || finding.refusal->code != "late-front-matter-record" ||
+        !finding.refusal->lateFrontMatterRecords.has_value())
+      continue;
+    const LateFrontMatterRecords& sites = *finding.refusal->lateFrontMatterRecords;
+    CHECK_EQ(sites.lateRecord.opcode, fourdgs::tool::op::kAudioSource);
+    CHECK_EQ(sites.lateRecord.offset, late->offset);
+    CHECK_EQ(sites.firstStateRecord.opcode, fourdgs::tool::op::kChunk);
+    rejected = true;
   }
   CHECK(rejected);
 }
@@ -2536,6 +2629,7 @@ void commasMatchThePythonToolsThousandsSeparator() {
 
 void runTests() {
   everyInvalidVariantIsRefusedByItsOwnIdentifier();
+  everyLateFrontMatterWitnessCarriesBothSites();
   aConformingCaptureIsValid();
   aConformingKeyframeDeltaFileIsNotMisclassified();
   zeroBirthDeltaBandCompletenessIsLeftToTheModelValidator();

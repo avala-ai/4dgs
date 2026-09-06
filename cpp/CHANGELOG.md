@@ -8,6 +8,12 @@ All notable changes to the C++ package are documented here, following
 
 ### Changed
 
+- **Streamed readers and the validator diagnose every late defined front-matter record.** The public
+  `Error` carries typed `lateRecord` and `firstStateRecord` sites without changing existing result
+  codes, exceptions or catch behavior. The streamed gaussian-birth and keyframe-delta runners now
+  prove all 18 shared witnesses, covering all 15 defined front-matter opcodes, while indexed opens
+  retain the specification's stop-at-first-state exemption. The validator derives both sites from
+  its bounded framing walk and gives this placement rule precedence over body and duplicate checks.
 - **Collecting readers expose a configurable aggregate decoded-state budget.** `ReadOptions`
   defaults `maxDecodedStateBytes` to 512 MiB and is accepted by all three scene openers, `loadAll`,
   and `keyframeDeltaStatesJson`; the existing entry points remain default wrappers. Exhaustion is

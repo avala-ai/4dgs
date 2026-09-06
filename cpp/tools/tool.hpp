@@ -198,6 +198,9 @@ struct Named {
   /// The identifier the specification and the conformance corpus use.
   std::string code;
   std::optional<Site> site;
+  /// Both typed record sites for the structured placement refusal. Empty for every other
+  /// refusal; callers never recover these values by parsing `Error::message` or `toString()`.
+  std::optional<LateFrontMatterRecords> lateFrontMatterRecords;
 
   /// `refusal unknown-temporal-model at byte 8 (the Header record)`.
   std::string toString() const;
