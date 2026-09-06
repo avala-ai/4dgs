@@ -315,6 +315,86 @@ void aConformingKeyframeDeltaFileIsNotMisclassified() {
   }
 }
 
+void zeroBirthDeltaBandCompletenessIsLeftToTheModelValidator() {
+  // A Delta Chunk's SH rows describe births, not updates or the live population. Every delta in
+  // this fixture has birth_count 0, so none would carry a band even if the Header declared SH.
+  // Give the file such a declaration to make the generic index check exercise that distinction.
+  // The keyframes intentionally remain without bands, so exhaustive model validation must still
+  // reject the file; this test is specifically that the generic gaussian-birth precheck does not
+  // also invent a missing-band error for a zero-birth delta.
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(
+      corpusDirectory() / "keyframe" / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs");
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+
+  std::vector<fourdgs::tool::Frame> deltas;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 if (complete && frame.opcode == fourdgs::tool::op::kDeltaChunk)
+                                   deltas.push_back(frame);
+                               });
+  CHECK(walked.ok());
+  CHECK(!deltas.empty());
+  if (!walked || deltas.empty()) return;
+  fourdgs::tool::BorrowedReadable source(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  fourdgs::Result<std::vector<fourdgs::tool::IndexEntry>> parsedIndex =
+      fourdgs::tool::chunkIndexEntries(source, *walked);
+  CHECK(parsedIndex.ok());
+  if (!parsedIndex) return;
+
+  // Fixed Delta Chunk fields through update_count occupy 43 bytes; birth_count is the next u32
+  // (spec section 5.18). Pin that the chosen entry is the zero-birth shape this regression names.
+  constexpr std::size_t kDeltaBirthCountOffset = 8 + 8 + 4 + 1 + 8 + 8 + 2 + 4;
+  const fourdgs::tool::Frame& delta = deltas.front();
+  const std::size_t birthCountAt = static_cast<std::size_t>(
+      delta.offset + fourdgs::tool::kRecordHeaderSize + kDeltaBirthCountOffset);
+  CHECK_EQ(readU32(bytes, birthCountAt), static_cast<std::uint32_t>(0));
+  const auto indexed =
+      std::find_if(parsedIndex->begin(), parsedIndex->end(),
+                   [&](const auto& entry) { return entry.offset == delta.offset; });
+  CHECK(indexed != parsedIndex->end());
+  if (indexed == parsedIndex->end()) return;
+  const std::size_t deltaIndex = static_cast<std::size_t>(indexed - parsedIndex->begin());
+  CHECK(indexed->bands.empty());
+
+  const fourdgs::tool::Frame* header = walked->firstIntact(fourdgs::tool::op::kHeader);
+  CHECK(header != nullptr);
+  if (header == nullptr) return;
+  std::size_t shDegreeAt =
+      static_cast<std::size_t>(header->offset + fourdgs::tool::kRecordHeaderSize);
+  for (int field = 0; field < 2; ++field) shDegreeAt += 4 + readU32(bytes, shDegreeAt);
+  shDegreeAt += 8 + 8 + 8;                       // duration_sec, gaussian_count, cutoff
+  shDegreeAt += 4 + readU32(bytes, shDegreeAt);  // temporal_model
+  shDegreeAt += 6 * 8;                           // aabb
+  CHECK(shDegreeAt < bytes.size());
+  if (shDegreeAt >= bytes.size()) return;
+  CHECK_EQ(bytes[shDegreeAt], static_cast<std::uint8_t>(0));
+  bytes[shDegreeAt] = 1;
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(!report.ok());
+  bool modelValidatorRan = false;
+  const std::string invented =
+      "chunk index entry " + std::to_string(deltaIndex) + " omits SH band 1";
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    CHECK(finding.message.find(invented) == std::string::npos);
+    if (finding.message.find("keyframe-delta sequential validation refused this file") !=
+            std::string::npos &&
+        finding.message.find("require bands [1]") != std::string::npos) {
+      modelValidatorRan = true;
+    }
+  }
+  if (!modelValidatorRan) {
+    for (const fourdgs::tool::Finding& finding : report.findings)
+      std::fprintf(stderr, "  zero-birth SH fixture said: %s\n", finding.message.c_str());
+  }
+  CHECK(modelValidatorRan);
+}
+
 void keyframeDeltaHeaderCountIsTheLifetimeDistinctIdentityCount() {
   if (corpusMissing()) return;
   if (noDecoder()) return;
@@ -2400,6 +2480,7 @@ void runTests() {
   everyInvalidVariantIsRefusedByItsOwnIdentifier();
   aConformingCaptureIsValid();
   aConformingKeyframeDeltaFileIsNotMisclassified();
+  zeroBirthDeltaBandCompletenessIsLeftToTheModelValidator();
   keyframeDeltaHeaderCountIsTheLifetimeDistinctIdentityCount();
   identitySinkIoIsNotCalledAnInputReadFailure();
   validatorToolFailuresNameTheirActualCause();

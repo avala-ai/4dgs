@@ -834,7 +834,15 @@ Report validate(Readable& source) {
       wantedBands[range.offset].push_back(at);
       indexedBandOffsets.insert(range.offset);
     }
-    if (headerShape != nullptr) {
+    // Under gaussian-birth every state row carries every declared SH band, so the index can
+    // prove completeness from the Header alone. A keyframe-delta entry is different: a Delta
+    // Chunk's band rows describe births only, and a zero-birth delta correctly has no bands even
+    // when the Header declares SH. The generic index shape has only the total operation count,
+    // not birth_count, so it cannot decide completeness without parsing the state record. The
+    // exhaustive keyframe-delta validator below does parse it and applies that model-specific
+    // rule on both sequential and indexed paths; keep the generic range, duplicate, framing and
+    // ownership checks above, and leave only completeness to that validator.
+    if (headerShape != nullptr && !keyframeDelta) {
       for (std::uint16_t band = 1; band <= headerShape->shDegree; ++band) {
         if (entryBands.find(static_cast<std::uint8_t>(band)) == entryBands.end()) {
           error(&report, "chunk index entry " + std::to_string(i) + " omits SH band " +
