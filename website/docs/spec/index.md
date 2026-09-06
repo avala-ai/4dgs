@@ -161,7 +161,7 @@ read paths attribute the same bytes to the same physical state record.
 [<Camera record>]
 [<Metadata record> ...]
 [<Attachment record> ...]
-<Chunk record> ...               -- the gaussian data
+(<Chunk record> | <Delta Chunk record>) ...  -- state records; the gaussian data
 <Chunk Index record> ...         -- one per chunk, THE SUMMARY starts here
 [<Statistics record>]
 [<Summary Offset record> ...]
@@ -169,9 +169,40 @@ read paths attribute the same bytes to the same physical state record.
 <magic>
 ```
 
-Order is normative only where stated: the Header MUST be the first record, the Footer MUST be the
-last, and the summary MUST be contiguous (§4.5). The magic appears at both ends so a reader that has
-only the tail of a file can still identify it and locate the Footer.
+For record-placement purposes, a **state record** is a Chunk (`0x05`) or a Delta Chunk (`0x10`). The
+format's defined **front matter** is the Header (`0x01`), Quantization (`0x03`), Window Table
+(`0x04`), legacy Audio (`0x09`), Camera (`0x0A`), Metadata (`0x0B`), Attachment (`0x0D`), Audio
+Source (`0x11`), Audio Data (`0x12`), and every defined provenance-family record (`0x20`–`0x25`).
+The [registry](./registry.md#record-placement-classes) records the same closed set.
+
+**Every defined front-matter record MUST precede the first state record.** Within front matter,
+records remain dispatched by opcode rather than by relative position, except where another rule
+constrains them: the Header MUST be first, Audio Source/Data dependencies apply (§5.17), and the
+provenance-family references resolve as §5.15 requires. The Footer MUST be last and the summary MUST
+be contiguous (§4.5). The magic appears at both ends so a reader that has only the tail of a file
+can still identify it and locate the Footer.
+
+A streamed reader or validator that encounters a defined front-matter record after state has begun
+MUST refuse the file with the identifier `late-front-matter-record`. The diagnosis MUST name the
+late record and opcode, the byte of its opcode, and the first state record and the byte of that
+record's opcode; those physical records make clear what appeared where and what ordering was
+expected. If the late record is also a forbidden duplicate — including a second Header, Quantization
+or Window Table — this positional refusal controls once state has begun.
+
+A validator MUST examine every top-level record through the Footer for this ordering rule; it cannot
+claim the indexed-opener exemption below. That scan remains bounded because the validator frames and
+skips record bodies by their declared lengths rather than retaining them.
+
+An indexed range opener MAY stop framing front matter at the first state record and is not required
+to scan unrelated later records to discover this violation. If it does encounter the late record, it
+MUST issue the same refusal. This asymmetry preserves bounded indexed open while making all
+conforming files unambiguous: the paths agree on every file a writer is allowed to emit, and a path
+that already observes the malformed order names it.
+
+The rule applies only to opcodes the specification has defined as front matter. It does not override
+§4.2: an unknown or private record is still skipped by `content_length`, wherever it appears. A
+future record acquires a positional rule only when its defining revision assigns it a placement
+class.
 
 Multiplicity is normative where the diagram shows it. The records drawn without a repetition marker
 — Header, Quantization, Window Table — appear **exactly once**, and **a reader MUST refuse a file
@@ -338,6 +369,10 @@ u8      sh_depth_count     -- number of per-band SH bit depths; the field is abs
         sh_depth_count × u8   -- band b's bit depth, 3..8, band 1 first (see §6.5)
 ```
 
+Quantization is front matter and therefore precedes the first state record under §4. A state record
+cannot be reconstructed without its grids, and an indexed opener discovers those grids before it
+seeks through the Chunk Index.
+
 The `bounds` keys are `pos`, `scale_rel`, `rot`, `rgb`, `alpha`, `motion`, `time`, `sigma_rel` and
 `sh`, plus `sh_band1`, `sh_band2` and `sh_band3` on a file that declares per-band SH bit depths.
 `scale_rel` and `sigma_rel` are relative deviations in the log domain; the rest are absolute, in the
@@ -440,6 +475,9 @@ defined in §6.3.
 u32  count
      count × { f64 lo; f64 hi }
 ```
+
+The Window Table is front matter and therefore precedes the first state record under §4. This lets
+an indexed opener resolve every gaussian's `window_index` without scanning state-record gaps.
 
 A file with no Window Table record, or one whose `count` is 0, is read as though it declared exactly
 one window `(0, 0)`. Every gaussian then references index 0 and has an empty validity window, which
@@ -684,9 +722,10 @@ poses **in** a frame, and `0x20` is the record that names that frame. Geodetic A
 because it was defined after them, not because it belongs last — a registry grows by taking the next
 free number, and an opcode is not something a later revision gets to renumber for tidiness.
 
-Nothing requires a reader to see these in any order; records are skipped and dispatched by opcode,
-not by position. But a writer that emits them in ascending opcode order produces a file whose front
-matter reads close to the order a human would explain it.
+Within front matter, nothing requires a reader to see these in any relative order; records are
+skipped and dispatched by opcode, not by position. Section 4 does require the family as a whole to
+precede the first state record. A writer that also emits the family in ascending opcode order
+produces front matter that reads close to the order a human would explain it.
 
 Every record in the family is **optional**. A file may carry a frame and nothing else, a rig
 trajectory alone, object membership without a table, or a track for an object the table does not
@@ -719,7 +758,8 @@ treat absence as an error or a warning. A file with no georeference is not an in
 
 **These are not summary records** (§4.5). They carry content, and trajectories are unbounded — a
 ten-minute capture logged at 100 Hz is sixty thousand samples. They belong with the other content
-records ahead of the chunks, for exactly the reason attachments do.
+records ahead of state, for exactly the reason attachments do; §4 makes that position normative
+rather than customary.
 
 #### 5.15.2 Coordinate Frame — opcode `0x20`
 
@@ -1064,9 +1104,9 @@ bytes  data
 Exactly one Audio Data record MUST match every Audio Source record, and vice versa; **a reader MUST
 refuse a file with an Audio Data record that matches no Audio Source, or an Audio Source that
 matches no Audio Data**, naming the unmatched `source_id`. Its payload length MUST equal the
-descriptor's `data_length`. Each pair MUST appear before the first Chunk so an indexed reader can
-frame every source and range-read its encoded bytes without fetching a gaussian chunk or the payload
-itself.
+descriptor's `data_length`. As front matter (§4), each pair MUST appear before the first state
+record so an indexed reader can frame every source and range-read its encoded bytes without fetching
+a gaussian state record or the payload itself.
 
 ### 5.18 Delta Chunk — opcode `0x10`
 
@@ -1718,6 +1758,7 @@ and the text was the bug.
 | §5.3 added: `step_time` MUST be strictly positive and a reader refuses a non-positive value                                               | rule added                |
 | §5.8 added: decoded Chunk Index counts MUST agree with parsed operations and the composed population                                      | clarification, rule added |
 | §3.2/§5.3 added: derived binary32 attributes MUST stay finite and in range; finite quantization has no global cap                         | clarification, rule added |
+| §4 added: defined front matter MUST precede the first state record; an observed late record is `late-front-matter-record`                 | clarification, rule added |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
 opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append
@@ -1784,6 +1825,14 @@ binary32 value, because the same large step is harmless beside a zero bin and in
 whose value cannot fit. That makes `decoded-f32-overflow` a malformed-file result without inventing
 a declaration ceiling, and keeps `sigma_t = +inf` exclusively as the value selected by the existing
 `never_fades` bit.
+
+The §4 front-matter row is a deliberate compatibility tightening, not a new wire field. It makes
+malformed an abstract shape the earlier positional wording permitted: a defined front-matter record
+after the first Chunk or Delta Chunk. No conformance variant and no writer in this repository emits
+that shape, and no third-party producer is known to do so. Keeping it legal would instead require an
+indexed opener to scan the gaps between state records, making open cost O(chunks) range requests in
+the worst case. The bounded indexed guarantee wins; streamed readers and validators, which already
+observe the late bytes, owe the stable refusal at no additional I/O cost.
 
 The two §6.5 rows are the same kind of change from opposite directions, and neither moves a byte in
 any file that exists.
