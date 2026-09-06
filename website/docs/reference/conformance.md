@@ -177,7 +177,8 @@ argument. It must exit zero and print one JSON object:
   "refusals": true,
   "declines": ["WithObjects"],
   "exactAggregates": true,
-  "canonicalStateOrder": true
+  "canonicalStateOrder": true,
+  "aggregateDecodedBudget": true
 }
 ```
 
@@ -189,8 +190,10 @@ slash. `refusals` defaults to false and says whether the runner answers all elev
 features the runner does not implement. `exactAggregates` and `canonicalStateOrder` default to false
 and opt into strict comparison of exact root/state totals and composed-state samples. During the
 stacked transition, false omits only those fields; it never skips a variant or relaxes another
-field. A malformed declaration, a non-zero exit, or a command that cannot start fails the run; it is
-not silently treated as an implementation that supports nothing.
+field. `aggregateDecodedBudget` defaults to false and opts into the separate injected-limit gate
+below; false makes no memory claim and skips only that gate. A malformed declaration, a non-zero
+exit, or a command that cannot start fails the run; it is not silently treated as an implementation
+that supports nothing.
 
 Pass one `--runner-cmd` per read path. The harness does not infer or manufacture the other path, and
 it does not require a pair, so the command list is also the record of which paths were actually
@@ -199,9 +202,10 @@ Unix and `CommandLineToArgvW`-compatible quoting on Windows.
 
 ### Invocation
 
-The harness spawns the runner as a child process once per variant that the harness says it supports,
-and appends exactly one argument to its command line: the path of the `.4dgs` file to read. An
-unsupported variant is skipped before the process starts. Nothing else is passed.
+For an ordinary corpus comparison, the harness spawns the runner as a child process once per variant
+that the harness says it supports and appends exactly one argument to its command line: the path of
+the `.4dgs` file to read. An unsupported variant is skipped before the process starts. The aggregate
+decoded-budget capability adds one explicitly described invocation; nothing else is passed.
 
 The path is absolute, so the runner's working directory is irrelevant — deliberately, because the
 harness does not set one, and a runner that resolved a relative path would work only when the suite
@@ -480,6 +484,40 @@ and the feature matrix is where that shows up publicly. An out-of-tree runner ma
 with `"refusals": true` in its capabilities object, so it needs no harness edit and is held to all
 eleven or none of them.
 
+### Aggregate decoded-budget gate
+
+Aggregate decoded-state exhaustion is not part of the invalid corpus. The same valid file succeeds
+under the shared default and can fail under a smaller caller-selected budget, so classifying it as a
+malformed-file refusal would make file validity depend on the machine or API call.
+
+A runner that declares `"aggregateDecodedBudget": true` receives one additional invocation before
+the ordinary corpus comparisons:
+
+```text
+<runner> --max-decoded-state-bytes 1 <absolute-path>/OneGaussian-UseChunkIndex-UseCrc.4dgs
+```
+
+The final argument is the same absolute generated corpus path used by ordinary invocations. The
+positive decimal argument before it is the aggregate decoded-state byte ceiling the runner MUST pass
+unchanged to the collecting SDK operation exercised by its normal path. With a one-byte limit, one
+decoded gaussian cannot fit under any conforming representation. The runner MUST catch its SDK's
+resource-limit result, print exactly one JSON document, and exit zero:
+
+```json
+{ "unsupported": "resource-limit" }
+```
+
+The `unsupported` key is deliberately not `refused`: `resource-limit` is the registry's portable
+reader-result category and carries no refusal identifier. A non-zero exit, malformed JSON, any other
+result key/value, or successful scene summary fails this capability by name. The ordinary invocation
+of the same variant carries no injected option and must still decode under the 536,870,912-byte
+default.
+
+Built-in families opt in through `AGGREGATE_DECODED_BUDGET_FAMILIES` only after both maintained read
+paths implement the flag. An external runner opts in through the capabilities object. The gate uses
+an existing tiny valid file, changes no corpus expectation or checksum, and proves configuration
+plumbing plus error classification without allocating hundreds of megabytes.
+
 The Python and Rust **indexed** runners inspect the version prefix before Header dispatch. If it is
 the exact version-1 magic, they read through the Header's length-prefixed `profile` and `library`
 fields to choose the gaussian-birth or keyframe-delta indexed decoder. If the prefix differs —
@@ -606,13 +644,13 @@ tokens losslessly, so even a total beyond binary64 remains a checked number rath
 to infinity.
 
 A runner therefore materializes every gaussian and sorts them, which is precisely what the SDK
-underneath it must never do. The runner is not the SDK: bounded memory is a property the decoder has
-to hold for arbitrary input, and the canonical summary is by definition a whole-population statement
-— aggregates over every gaussian, in an order derived from every gaussian's decoded values. What
-keeps that honest is the corpus rather than the runner: sixty files under a 2.5 MB total budget, the
-largest of them under 100 KiB, generated rather than supplied. A runner is allowed to be slow and
-fat over that. The library it calls is not, and nothing here exercises the library's memory
-behaviour — that is what each SDK's own tests are for.
+underneath it must never do without a ceiling. The runner is not the SDK: bounded memory is a
+property the decoder has to hold for arbitrary input, and the canonical summary is by definition a
+whole-population statement — aggregates over every gaussian, in an order derived from every
+gaussian's decoded values. The ordinary corpus keeps runner cost small: its files stay under a 2.5
+MB total budget and the largest is under 100 KiB. The aggregate decoded-budget capability separately
+proves that a runner can inject a tiny SDK ceiling and observe the portable resource result; exact
+accounting and large-boundary cases remain each SDK's focused tests.
 
 **Bulk payloads become digests.** Spherical-harmonic coefficients, attachment contents and audio
 payloads are summarized as a CRC-32 over the bytes in content order, rendered as a decimal string.

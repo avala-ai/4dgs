@@ -138,6 +138,20 @@ REFUSAL_FAMILIES = frozenset({"python", "rust", "typescript", "cpp", "swift", "d
 EXACT_AGGREGATE_FAMILIES = frozenset({"dart", "python", "rust", "typescript"})
 CANONICAL_STATE_ORDER_FAMILIES = frozenset({"dart", "python", "rust", "typescript"})
 
+# Aggregate decoded-state budgeting is an API capability rather than a file feature. A
+# family enters this set only after both of its runners can inject the tiny budget below
+# into the collecting API and report the registered resource result. The shared-contract
+# layer intentionally claims no implementation.
+AGGREGATE_DECODED_BUDGET_FAMILIES: frozenset[str] = frozenset()
+
+# The resource gate reuses one tiny valid corpus file. One decoded gaussian cannot fit in
+# one byte under any SDK representation, so the test is independent of allocator overhead
+# and needs no giant fixture.
+AGGREGATE_BUDGET_ARG = "--max-decoded-state-bytes"
+AGGREGATE_BUDGET_PROBE_BYTES = 1
+AGGREGATE_BUDGET_PROBE_VARIANT = "OneGaussian-UseChunkIndex-UseCrc"
+AGGREGATE_BUDGET_RESULT = {"unsupported": "resource-limit"}
+
 
 #: Record families a language has not implemented, by the variant-name flags that carry
 #: them. A partial implementation is a supported state — the feature matrix is where it
@@ -215,6 +229,9 @@ class Capabilities:
     exact_aggregates: bool = False
     #: Whether composed state samples use portable emitted-value ordering.
     canonical_state_order: bool = False
+    #: Whether this runner passes a caller-injected limit to its collecting decoder and
+    #: reports aggregate decoded-state exhaustion as the registered resource result.
+    aggregate_decoded_budget: bool = False
 
 
 def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
@@ -232,6 +249,7 @@ def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
         declines=tuple(FAMILY_DECLINES.get(family, ())),
         exact_aggregates=family in EXACT_AGGREGATE_FAMILIES,
         canonical_state_order=family in CANONICAL_STATE_ORDER_FAMILIES,
+        aggregate_decoded_budget=family in AGGREGATE_DECODED_BUDGET_FAMILIES,
     )
 
 
@@ -503,6 +521,9 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     canonical_state_order = doc.get("canonicalStateOrder", False)
     if not isinstance(canonical_state_order, bool):
         raise ProtocolError(f"declares canonicalStateOrder {canonical_state_order!r}; expected true or false")
+    aggregate_decoded_budget = doc.get("aggregateDecodedBudget", False)
+    if not isinstance(aggregate_decoded_budget, bool):
+        raise ProtocolError(f"declares aggregateDecodedBudget {aggregate_decoded_budget!r}; expected true or false")
 
     return Capabilities(
         family=family,
@@ -512,6 +533,7 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
         declines=tuple(declines),
         exact_aggregates=exact_aggregates,
         canonical_state_order=canonical_state_order,
+        aggregate_decoded_budget=aggregate_decoded_budget,
     )
 
 
@@ -637,6 +659,27 @@ def runner_document(text: str):
         return None, exc
 
 
+def aggregate_budget_problem(command: list[str], timeout: float) -> str | None:
+    """Run the one-byte collecting-API probe, returning a bounded failure diagnosis."""
+    path = os.path.join(DATA, f"{AGGREGATE_BUDGET_PROBE_VARIANT}.4dgs")
+    outcome = invoke(
+        command,
+        [AGGREGATE_BUDGET_ARG, str(AGGREGATE_BUDGET_PROBE_BYTES), path],
+        timeout,
+    )
+    if outcome.error:
+        return f"runner {outcome.error}"
+    if outcome.returncode != 0:
+        detail = outcome.stderr.strip()[:2000] or outcome.stdout.strip()[:2000]
+        return f"runner exited {outcome.returncode}: {detail}"
+    actual, parse_error = runner_document(outcome.stdout.strip())
+    if parse_error is not None:
+        return f"stdout is not one JSON document ({parse_error})"
+    if actual != AGGREGATE_BUDGET_RESULT:
+        return f"expected {AGGREGATE_BUDGET_RESULT!r}, got {actual!r}"
+    return None
+
+
 def builtin_jobs(family_filter: str | None) -> Iterator[tuple[Capabilities, list[str]]]:
     """Every built-in runner that is present on this machine.
 
@@ -680,7 +723,9 @@ def external_jobs(commands: list[str], timeout: float) -> list[tuple[Capabilitie
         declines = ", ".join(caps.declines) if caps.declines else "nothing"
         print(
             f"{caps.name}: protocol {PROTOCOL_VERSION}, {'indexed' if caps.indexed else 'streamed'} read path, "
-            f"refusals {'answered' if caps.refusals else 'declined'}, declines {declines}"
+            f"refusals {'answered' if caps.refusals else 'declined'}, "
+            f"aggregate budget {'claimed' if caps.aggregate_decoded_budget else 'unclaimed'}, "
+            f"declines {declines}"
         )
         jobs.append((caps, command))
     return jobs
@@ -739,6 +784,19 @@ def main(argv=None) -> int:
     executed = [0] * len(jobs)
     for job, (caps, command) in enumerate(jobs):
         ran_families.add(caps.family)
+        if caps.aggregate_decoded_budget:
+            if not supports(caps, AGGREGATE_BUDGET_PROBE_VARIANT):
+                problem = (
+                    "capability claims the budget gate but declines its ordinary "
+                    f"{AGGREGATE_BUDGET_PROBE_VARIANT} control"
+                )
+            else:
+                problem = aggregate_budget_problem(command, args.timeout)
+            if problem is None:
+                print(f"PASS {caps.name} aggregate-decoded-budget")
+            else:
+                failed += 1
+                print(f"FAIL {caps.name} aggregate-decoded-budget: {problem}")
         for variant in names:
             if not supports(caps, variant):
                 skipped += 1

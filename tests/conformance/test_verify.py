@@ -304,6 +304,90 @@ class TestExactAggregateTransition:
         ) != json_compare.for_capabilities(expected, exact_aggregates=False, canonical_state_order=False)
 
 
+class TestAggregateDecodedBudgetGate:
+    @staticmethod
+    def _capabilities(**extra):
+        return {
+            "protocol": 1,
+            "name": "outside/decode_streamed",
+            "family": "outside",
+            "readPath": "streamed",
+            **extra,
+        }
+
+    def test_capability_defaults_to_unclaimed(self, monkeypatch):
+        monkeypatch.setattr(
+            conformance_run,
+            "invoke",
+            lambda _command, _args, _timeout: conformance_run.Outcome(0, json.dumps(self._capabilities()), ""),
+        )
+
+        caps = conformance_run.declared_capabilities(["runner"], 1.0)
+
+        assert not caps.aggregate_decoded_budget
+
+    def test_capability_accepts_only_a_boolean(self, monkeypatch):
+        def answer(value):
+            monkeypatch.setattr(
+                conformance_run,
+                "invoke",
+                lambda _command, _args, _timeout: conformance_run.Outcome(
+                    0,
+                    json.dumps(self._capabilities(aggregateDecodedBudget=value)),
+                    "",
+                ),
+            )
+            return conformance_run.declared_capabilities(["runner"], 1.0)
+
+        assert answer(True).aggregate_decoded_budget
+        with pytest.raises(conformance_run.ProtocolError, match=r"aggregateDecodedBudget.*true or false"):
+            answer(1)
+
+    def test_probe_injects_one_byte_into_the_existing_tiny_variant(self, monkeypatch):
+        calls = []
+
+        def invoke(command, args, timeout):
+            calls.append((command, args, timeout))
+            return conformance_run.Outcome(0, '{"unsupported":"resource-limit"}\n', "")
+
+        monkeypatch.setattr(conformance_run, "invoke", invoke)
+
+        assert conformance_run.aggregate_budget_problem(["runner"], 7.0) is None
+        assert calls == [
+            (
+                ["runner"],
+                [
+                    "--max-decoded-state-bytes",
+                    "1",
+                    os.path.join(
+                        conformance_run.DATA,
+                        "OneGaussian-UseChunkIndex-UseCrc.4dgs",
+                    ),
+                ],
+                7.0,
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        ("outcome", "message"),
+        [
+            (conformance_run.Outcome(1, "", "too small"), "runner exited 1: too small"),
+            (
+                conformance_run.Outcome(0, '{"refused":"resource-limit"}', ""),
+                "expected {'unsupported': 'resource-limit'}",
+            ),
+            (conformance_run.Outcome(0, "not json", ""), "stdout is not one JSON document"),
+        ],
+    )
+    def test_probe_rejects_crash_refusal_and_non_json(self, monkeypatch, outcome, message):
+        monkeypatch.setattr(conformance_run, "invoke", lambda _command, _args, _timeout: outcome)
+
+        assert message in conformance_run.aggregate_budget_problem(["runner"], 1.0)
+
+    def test_shared_contract_claims_no_sdk_before_its_language_layer(self):
+        assert conformance_run.AGGREGATE_DECODED_BUDGET_FAMILIES == frozenset()
+
+
 class TestTheHarnessCanSeeASignedZero:
     """`run.py`'s blind spot, and the only place in the suite that could see it.
 

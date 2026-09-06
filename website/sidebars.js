@@ -62,6 +62,11 @@ const sidebars = {
           id: "spec/proposals/canonical-states-order",
           label: "canonical states order",
         },
+        {
+          type: "doc",
+          id: "spec/proposals/aggregate-decoded-budget",
+          label: "aggregate decoded-state budgets",
+        },
       ],
     },
   ],

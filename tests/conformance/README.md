@@ -84,6 +84,15 @@ is where that shows up publicly. A runner from outside this repository does not 
 and does not need to: it says `"refusals": true` in its own declaration (see
 [below](#running-a-runner-that-lives-outside-this-repository)) and is scored on all eleven.
 
+### Aggregate decoded-state budget is a capability, not invalid data
+
+A runner that claims `"aggregateDecodedBudget": true` is additionally invoked as
+`--max-decoded-state-bytes 1 <OneGaussian path>`. It passes that one-byte ceiling to its collecting
+SDK API and must print `{"unsupported":"resource-limit"}` with exit status 0. The same valid file
+still decodes in the ordinary invocation under the 512 MiB default. This proves a configurable
+finite aggregate budget and its public result category without a huge fixture; it does not add a
+file to `data/invalid/`, because resource exhaustion says nothing is wrong with the file.
+
 ### Every rule belongs to version 1
 
 The refusal harness itself was introduced against rules that predated it, rather than being
@@ -188,11 +197,12 @@ the feature matrix is where that shows up publicly. For the runners in this repo
 is the harness's — `FAMILY_DECLINES`, `REFUSAL_FAMILIES` and the `decode_indexed` rule, all in
 `run.py`. For a runner outside it, the runner declares it; see the next section.
 
-Every runner is invoked the same way: as a subprocess, with a path, printing canonical JSON to
-stdout. A new language needs one stdout CLI and one line in `RUNNERS`. A language with a build step
-adds its built entry point there; the harness skips a family whose entry point is missing, so a
-contributor who has not built it still gets a clean run, and fails if a family was asked for by name
-and never ran.
+Ordinary variants invoke every runner the same way: as a subprocess, with a path, printing canonical
+JSON to stdout. The aggregate-budget capability has the one options-bearing probe described above. A
+new language needs one stdout CLI and one line in `RUNNERS`. A language with a build step adds its
+built entry point there; the harness skips a family whose entry point is missing, so a contributor
+who has not built it still gets a clean run, and fails if a family was asked for by name and never
+ran.
 
 **A new entry in `RUNNERS` needs the `EXE` suffix if it is compiled.** Windows names an executable
 `decode_streamed.exe`, and the harness finds a runner by testing its path for existence — so a
@@ -220,12 +230,13 @@ python3 tests/conformance/run.py \
 
 The command is split with the quoting rules of the platform the suite is running on — POSIX rules
 elsewhere, and on Windows the rules `CommandLineToArgvW` applies, which is what every program there
-is actually started under — and the variant's file path is appended to it. So a runner sees whatever
-arguments you wrote, then one path, which is the same invocation the built-in runners get. Both
-`python C:\work\decode.py` and `runner.exe --label="two words"` arrive as the two arguments a
-Windows user means by them, rather than as a mangled path or a split-apart option. An unmatched
-quote or another command-line parse error is a protocol failure naming the original `--runner-cmd`,
-not a traceback from the harness.
+is actually started under — and, for ordinary corpus comparisons, the variant's file path is
+appended to it. So a runner sees whatever arguments you wrote, then one path, which is the same
+invocation the built-in runners get. The claimed aggregate-budget gate inserts its documented option
+and value before that path. Both `python C:\work\decode.py` and `runner.exe --label="two words"`
+arrive as the two arguments a Windows user means by them, rather than as a mangled path or a
+split-apart option. An unmatched quote or another command-line parse error is a protocol failure
+naming the original `--runner-cmd`, not a traceback from the harness.
 
 ### The capabilities handshake
 
@@ -241,20 +252,22 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
   "refusals": true,
   "declines": ["Object", "SHDegree3"],
   "exactAggregates": true,
-  "canonicalStateOrder": true
+  "canonicalStateOrder": true,
+  "aggregateDecodedBudget": true
 }
 ```
 
-| Key                   | Required | Meaning                                                                                                 |
-| --------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `protocol`            | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
-| `name`                | yes      | exactly `<family>/decode_<readPath>`, such as `go/decode_indexed`; it must agree with both keys         |
-| `family`              | no       | defaults to `name` up to the first `/`                                                                  |
-| `readPath`            | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
-| `refusals`            | no       | `true` to be scored on all eleven invalid variants. Absent means no, and the eleven are skipped         |
-| `declines`            | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
-| `exactAggregates`     | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent means the transition omits them   |
-| `canonicalStateOrder` | no       | `true` makes `states[*].sample` strict; absent means the transition omits it                            |
+| Key                      | Required | Meaning                                                                                                 |
+| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------- |
+| `protocol`               | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
+| `name`                   | yes      | exactly `<family>/decode_<readPath>`, such as `go/decode_indexed`; it must agree with both keys         |
+| `family`                 | no       | defaults to `name` up to the first `/`                                                                  |
+| `readPath`               | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
+| `refusals`               | no       | `true` to be scored on all eleven invalid variants. Absent means no, and the eleven are skipped         |
+| `declines`               | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
+| `exactAggregates`        | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent means the transition omits them   |
+| `canonicalStateOrder`    | no       | `true` makes `states[*].sample` strict; absent means the transition omits it                            |
+| `aggregateDecodedBudget` | no       | `true` opts into the one-byte collecting-API resource gate; absent makes no memory claim                |
 
 Two consequences worth stating, because they are what the built-in tables get wrong for an outsider.
 The runner opts into the invalid corpus itself, so it does not need its family added to

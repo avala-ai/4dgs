@@ -116,7 +116,8 @@ export const Results = () => {
                 <code>{runner.command}</code>; refusals {String(runner.refusals)}; declines{" "}
                 {runner.declines.length === 0 ? "none" : runner.declines.join(", ")}; exact
                 aggregates {String(runner.exactAggregates)}; canonical state order{" "}
-                {String(runner.canonicalStateOrder)}
+                {String(runner.canonicalStateOrder)}; aggregate decoded budget{" "}
+                {String(runner.aggregateDecodedBudget)}
               </li>
             ))}
           </ul>
@@ -161,10 +162,12 @@ submitted**. A declared feature gap is a harness skip, not a pass; the runner's 
 are published, but skips are welcome: `51/74` is an honest, useful result, not a failed attempt to
 claim `74/74`.
 
-The `exactAggregates` and `canonicalStateOrder` capability gates are shown too. When either is
-false, the harness omits that transition field exactly as the
-[runner protocol](./conformance.md#capabilities-handshake) specifies; the score makes no claim for
-the omitted field.
+The `exactAggregates`, `canonicalStateOrder`, and `aggregateDecodedBudget` capability gates are
+shown too. When either of the first two is false, the harness omits that transition field exactly as
+the [runner protocol](./conformance.md#capabilities-handshake) specifies; the score makes no claim
+for the omitted field. `aggregateDecodedBudget: true` records that the additional one-byte injected
+gate passed. It is displayed separately rather than added to the corpus score, whose denominator
+remains the 74 immutable manifest variants per path.
 
 ## Evidence required
 

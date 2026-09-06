@@ -34,6 +34,7 @@ const RUNNER_KEYS = [
   "declines",
   "exactAggregates",
   "canonicalStateOrder",
+  "aggregateDecodedBudget",
   "command",
   "passed",
   "skipped",
@@ -181,6 +182,7 @@ function validateRunner(runner, path, corpus) {
   });
   assertBoolean(runner.exactAggregates, `${path}.exactAggregates`);
   assertBoolean(runner.canonicalStateOrder, `${path}.canonicalStateOrder`);
+  assertBoolean(runner.aggregateDecodedBudget, `${path}.aggregateDecodedBudget`);
   assertString(runner.command, `${path}.command`);
   assertInteger(runner.passed, `${path}.passed`);
   assertInteger(runner.skipped, `${path}.skipped`);
