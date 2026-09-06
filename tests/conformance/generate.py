@@ -767,6 +767,10 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
 IDENTITY_MARKER_KEY = "conformance"
 IDENTITY_MARKER_VALUE = "optional-identity-zero-defaults-v1"
 OPTIONAL_IDENTITY_ATTRIBUTES = (op.A_SOURCE_GROUP, op.A_SOURCE_INDEX, op.A_OBJECT_ID)
+# These witnesses use sigma bin 0, ordinary finite sigma, `step_sigma_log = 1`, and
+# `step_time = 1`. Section 6.3 therefore refines the mu_t pitch to 2^-5 = 1/32 second.
+# Keep the conversion explicit: Attribute Streams carry bins, not reconstructed seconds.
+IDENTITY_MU_T_BINS_PER_SECOND = 32
 
 
 def _identity_front(temporal_model: str, duration: float, gaussian_count: int, aabb: list[float]) -> list[bytes]:
@@ -800,7 +804,7 @@ def _identity_front(temporal_model: str, duration: float, gaussian_count: int, a
     ]
 
 
-def _identity_required(positions: list[list[int]], mu_t: int) -> dict[int, np.ndarray]:
+def _identity_required(positions: list[list[int]], sample_time: int) -> dict[int, np.ndarray]:
     """A complete, deliberately simple set of absolute gaussian bins."""
     count = len(positions)
     zeros3 = np.zeros((count, 3), dtype=np.int64)
@@ -812,7 +816,7 @@ def _identity_required(positions: list[list[int]], mu_t: int) -> dict[int, np.nd
         op.A_COLOR: zeros3,
         op.A_OPACITY: np.ones((count, 1), dtype=np.int64),
         op.A_MOTION: zeros3,
-        op.A_MU_T: np.full((count, 1), mu_t, dtype=np.int64),
+        op.A_MU_T: np.full((count, 1), sample_time * IDENTITY_MU_T_BINS_PER_SECOND, dtype=np.int64),
         op.A_SIGMA_T: np.zeros((count, 1), dtype=np.int64),
         op.A_FLAGS: np.zeros((count, 1), dtype=np.int64),
         op.A_WINDOW_INDEX: np.zeros((count, 1), dtype=np.int64),
