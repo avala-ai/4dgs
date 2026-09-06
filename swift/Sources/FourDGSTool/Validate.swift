@@ -51,6 +51,9 @@ public struct Report {
     }
 
     mutating func error(_ message: String) { push(.error, message, nil) }
+    mutating func error(_ message: String, refusal code: RefusalCode, at site: Site) {
+        push(.error, message, Named(code: code, site: site))
+    }
     mutating func warn(_ message: String) { push(.warning, message, nil) }
     mutating func note(_ message: String) { push(.note, message, nil) }
     mutating func incomplete(_ message: String) {
@@ -1338,7 +1341,13 @@ private func validatePhysicalRecords(
                                 "chunk index entry \(i) declares gaussian_count "
                                     + "\(index[i].gaussianCount), but the physical "
                                     + "\(opcodeName(frame.opcode)) at byte \(frame.offset) "
-                                    + "declares \(fields.count)")
+                                    + "declares \(fields.count)",
+                                refusal: .indexRecordMismatch,
+                                at: Site(
+                                    offset: frame.offset,
+                                    what:
+                                        "the physical \(opcodeName(frame.opcode)) record at byte "
+                                        + "\(frame.offset)"))
                             result.indexSafe = false
                         }
                         if !keyframeDelta, fields.opcode == Opcode.chunk {
@@ -2435,12 +2444,17 @@ private func validateKeyframeDeltaIdentity(
     }
 
     do {
-        try walkComposedStates { target, _, state in
+        try walkComposedStates { target, frame, state in
             for (i, entry) in indexed[target] ?? [] where entry.extended {
                 if entry.liveCount != UInt64(state.count) {
                     report.error(
                         "chunk index entry \(i) has live_count \(entry.liveCount), but composing "
-                            + "the state at byte \(target) produces \(state.count) live gaussians")
+                            + "the state at byte \(target) produces \(state.count) live gaussians",
+                        refusal: .indexRecordMismatch,
+                        at: Site(
+                            offset: target,
+                            what:
+                                "the physical \(opcodeName(frame.opcode)) record at byte \(target)"))
                 }
             }
         }
@@ -2697,7 +2711,11 @@ func validateKeyframeDeltaIndex(
             {
                 report.error(
                     "chunk index entry \(i) has live_count \(entry.liveCount), but the keyframe "
-                        + "Chunk at byte \(entry.offset) declares \(physical.count) gaussians")
+                        + "Chunk at byte \(entry.offset) declares \(physical.count) gaussians",
+                    refusal: .indexRecordMismatch,
+                    at: Site(
+                        offset: entry.offset,
+                        what: "the physical Chunk record at byte \(entry.offset)"))
             }
         } else if entry.deltaMode > 1 {
             report.error(

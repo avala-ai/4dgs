@@ -1292,11 +1292,13 @@ final class ValidateTests: XCTestCase {
             entry.gaussianCount + 1, into: &wrongIndexCount,
             at: index.offset + recordHeaderSize + 32)
         writeU32(0, into: &wrongIndexCount, at: footer.offset + recordHeaderSize + 16)
-        XCTAssertTrue(
-            validate(wrongIndexCount).findings.contains {
+        let wrongIndexFinding = try XCTUnwrap(
+            validate(wrongIndexCount).findings.first {
                 $0.message.contains("declares gaussian_count")
                     && $0.message.contains("physical Chunk")
             })
+        XCTAssertEqual(wrongIndexFinding.refusal?.code, .indexRecordMismatch)
+        XCTAssertEqual(wrongIndexFinding.refusal?.site?.offset, chunk.offset)
 
         var duplicateIndex = original
         let indexBytes = original[Int(index.offset)..<Int(index.offset + index.total)]
@@ -1740,11 +1742,13 @@ final class ValidateTests: XCTestCase {
         writeU64(entry.liveCount + 1, into: &wrongLiveCount, at: extensionOffset + 20)
         let footer = try XCTUnwrap(churnWalk.firstIntact(Opcode.footer))
         writeU32(0, into: &wrongLiveCount, at: footer.offset + recordHeaderSize + 16)
-        XCTAssertTrue(
-            validate(wrongLiveCount).findings.contains {
+        let wrongLiveFinding = try XCTUnwrap(
+            validate(wrongLiveCount).findings.first {
                 $0.message.contains("live_count \(entry.liveCount + 1)")
                     && $0.message.contains("keyframe Chunk")
             })
+        XCTAssertEqual(wrongLiveFinding.refusal?.code, .indexRecordMismatch)
+        XCTAssertEqual(wrongLiveFinding.refusal?.site?.offset, entry.offset)
 
         let keyframesFile = corpusDirectory().appendingPathComponent(
             "keyframe/KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics.4dgs")
