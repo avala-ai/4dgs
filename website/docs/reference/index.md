@@ -403,15 +403,9 @@ yet pin an indexed-only malformed-payload rejection.
 
 Known partial boundaries include the following; this is not an exhaustive acceptance contract.
 Indexed gaussian-birth validation returns an incomplete verdict for a Footer extended beyond its
-version-1 prefix or a summary above the validator's 64 MiB resource ceiling. Its indexed opener does
-not yet enforce one bounded working set for every conforming input: it reads a Header, Quantization,
-Window Table, index-declared Chunk, or SH Band Stream range in full before the later parse or
-decoded size checks, and retains per-record or per-identity state for Metadata, Attachment,
-Provenance, Audio Source, Audio Data, and Object Track records. Memory can therefore grow with both
-encoded payload size and repeated-record count. A legal gaussian-birth file without an index is
-likewise incomplete because the C++ surface cannot yet walk that payload sequentially. The validator
-also does not parse every lazily retained front-matter body: for example, malformed Audio Source
-pose, duration, flags, or interpolation fields can pass this partial check.
+version-1 prefix or a summary above the validator's 64 MiB resource ceiling. A legal gaussian-birth
+file without an index is likewise incomplete because the C++ surface cannot yet walk that payload
+sequentially.
 
 For keyframe-delta, an extended Footer is not yet accepted by the fixed-tail indexed core. Otherwise
 legal resources return incomplete above these validator ceilings: 65,536 Chunk Index entries, 4,096
@@ -423,11 +417,9 @@ extend past the 64 MiB front-matter prefix or a Quantization or Window Table rec
 The decoded-size rejections are shared with gaussian-birth: in either temporal model, a Chunk
 declaring more than 512 MiB of uncompressed record bytes or an Attribute Stream declaring more than
 512 MiB of decoded bytes is classified malformed; the same applies to a Delta Chunk under
-keyframe-delta. The C++ common index pre-check also reports a conforming `sh_degree > 0` Delta Chunk
-with no births and no SH Band Streams invalid, so a pure-update or pure-death delta can be rejected
-before model-specific validation. The common path returns incomplete above 262,144 retained Chunk
-Index records for either temporal model, although keyframe-delta reaches its stricter 65,536-entry
-limit first. A no-core build cannot examine the file and therefore returns no validation verdict.
+keyframe-delta. The common path returns incomplete above 262,144 retained Chunk Index records for
+either temporal model, although keyframe-delta reaches its stricter 65,536-entry limit first. A
+no-core build cannot examine the file and therefore returns no validation verdict.
 
 **Rust** decodes and encodes. Its decode rows are filled in from the same suite on the same terms as
 the other two; its encode rows come from the cross-implementation gate described above. Python
