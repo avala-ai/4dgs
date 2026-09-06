@@ -411,15 +411,14 @@ For keyframe-delta, an extended Footer is not yet accepted by the fixed-tail ind
 legal resources return incomplete above these validator ceilings: 65,536 Chunk Index entries, 4,096
 bytes in one extended Chunk Index record, 512 MiB of encoded content in one state record, 512 MiB
 plus the fixed 17-byte stream header and one-byte band identifier in one SH Band Stream, or
-1,048,576 rows in one state. Other ceilings are currently classified as malformed, so the tool
-reports an otherwise legal resource invalid rather than incomplete: a Header whose required fields
-extend past the 64 MiB front-matter prefix or a Quantization or Window Table record above 64 MiB.
-The decoded-size rejections are shared with gaussian-birth: in either temporal model, a Chunk
-declaring more than 512 MiB of uncompressed record bytes or an Attribute Stream declaring more than
-512 MiB of decoded bytes is classified malformed; the same applies to a Delta Chunk under
-keyframe-delta. The common path returns incomplete above 262,144 retained Chunk Index records for
-either temporal model, although keyframe-delta reaches its stricter 65,536-entry limit first. A
-no-core build cannot examine the file and therefore returns no validation verdict.
+1,048,576 rows in one state. The same incomplete classification now covers the core's other
+implementation ceilings instead of calling the file invalid: a Header whose required fields extend
+past the 64 MiB front-matter prefix, a Quantization or Window Table record above 64 MiB, a Chunk
+declaring more than 512 MiB of uncompressed record bytes, or an Attribute Stream declaring more than
+512 MiB of decoded bytes. The Delta Chunk equivalents are incomplete under keyframe-delta too. The
+common path returns incomplete above 262,144 retained Chunk Index records for either temporal model,
+although keyframe-delta reaches its stricter 65,536-entry limit first. A no-core build cannot
+examine the file and therefore returns no validation verdict.
 
 **Rust** decodes and encodes. Its decode rows are filled in from the same suite on the same terms as
 the other two; its encode rows come from the cross-implementation gate described above. Python
