@@ -145,6 +145,16 @@ std::string hex2(std::uint8_t value) {
   return out;
 }
 
+const Frame* secondRecord(const Walk& walk, std::uint8_t opcode) {
+  bool sawFirst = false;
+  for (const Frame& frame : walk.representatives) {
+    if (frame.opcode != opcode) continue;
+    if (sawFirst) return &frame;
+    sawFirst = true;
+  }
+  return nullptr;
+}
+
 /// The two checks only a reader can perform: open the file, then decode it.
 ///
 /// Opening it the way a seeking client would is where the front-matter refusals fire — an
@@ -716,11 +726,27 @@ Report validate(Readable& source) {
                        " declares " + std::to_string(undersizedFooter->length) +
                        " content bytes; the fixed version-1 prefix requires at least 20");
   }
-  if (walk.intactOpcodeCounts[op::kHeader] > 1) {
-    error(&report, "the file carries " + std::to_string(walk.intactOpcodeCounts[op::kHeader]) +
-                       " Header records; the Header must be unique and first");
-    return report;
+  struct UniqueFrontMatter {
+    std::uint8_t opcode;
+    const char* name;
+  };
+  constexpr std::array<UniqueFrontMatter, 3> uniqueFrontMatter = {
+      UniqueFrontMatter{op::kHeader, "Header"},
+      UniqueFrontMatter{op::kQuantization, "Quantization"},
+      UniqueFrontMatter{op::kWindowTable, "Window Table"},
+  };
+  bool duplicateFrontMatter = false;
+  for (const UniqueFrontMatter& record : uniqueFrontMatter) {
+    if (walk.intactOpcodeCounts[record.opcode] < 2) continue;
+    const Frame* second = secondRecord(walk, record.opcode);
+    if (second == nullptr) continue;
+    error(&report, "a second " + std::string(record.name) + " record at byte " +
+                       std::to_string(second->offset) +
+                       "; a file carries exactly one, and nothing says which of two copies a "
+                       "reader should believe");
+    duplicateFrontMatter = true;
   }
+  if (duplicateFrontMatter) return report;
   // The other half of the same normative sentence (spec §4: "the Header MUST be the first record,
   // the Footer MUST be the last"), and a note rather than an error on purpose.
   //

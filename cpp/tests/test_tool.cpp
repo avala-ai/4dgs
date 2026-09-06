@@ -12,6 +12,7 @@
 /// Windows as on Linux.
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -196,6 +197,30 @@ bool insertTopLevelRecord(std::vector<std::uint8_t>* bytes, std::uint64_t at,
            oldSummaryOffsetStart == 0 ? 0 : shifted(oldSummaryOffsetStart));
   resealSummary(bytes);
   return true;
+}
+
+/// Keep the streamed record sequence but remove the fixture's trailing Chunk Index records.
+std::vector<std::uint8_t> unindexedCopy(const std::vector<std::uint8_t>& bytes) {
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return {};
+  const fourdgs::tool::Frame* firstIndex = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(firstIndex != nullptr);
+  CHECK(footer != nullptr);
+  if (firstIndex == nullptr || footer == nullptr) return {};
+
+  std::vector<std::uint8_t> unindexed(bytes.begin(), bytes.begin() + firstIndex->offset);
+  const std::size_t newFooter = unindexed.size();
+  unindexed.insert(unindexed.end(), bytes.begin() + footer->offset,
+                   bytes.begin() + footer->offset + footer->total());
+  unindexed.insert(unindexed.end(), bytes.end() - fourdgs::tool::kMagicSize, bytes.end());
+  // summary_start, summary_offset_start and summary_crc all declare no summary.
+  for (std::size_t i = 0; i < 20; ++i) {
+    unindexed[newFooter + fourdgs::tool::kRecordHeaderSize + i] = 0;
+  }
+  return unindexed;
 }
 
 /// The `"refused"` member of an expectation file.
@@ -1068,25 +1093,9 @@ void anUnindexedKeyframeDeltaIsCertifiedFrontToBack() {
       corpusDirectory() / "keyframe" / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs");
   CHECK(!bytes.empty());
   if (bytes.empty()) return;
-  fourdgs::Result<Walk> walked =
-      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
-  CHECK(walked.ok());
-  if (!walked) return;
-  const fourdgs::tool::Frame* firstIndex = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
-  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
-  CHECK(firstIndex != nullptr);
-  CHECK(footer != nullptr);
-  if (firstIndex == nullptr || footer == nullptr) return;
-
-  std::vector<std::uint8_t> unindexed(bytes.begin(), bytes.begin() + firstIndex->offset);
-  const std::size_t newFooter = unindexed.size();
-  unindexed.insert(unindexed.end(), bytes.begin() + footer->offset,
-                   bytes.begin() + footer->offset + footer->total());
-  unindexed.insert(unindexed.end(), bytes.end() - fourdgs::tool::kMagicSize, bytes.end());
-  // summary_start, summary_offset_start and summary_crc all declare no summary.
-  for (std::size_t i = 0; i < 20; ++i) {
-    unindexed[newFooter + fourdgs::tool::kRecordHeaderSize + i] = 0;
-  }
+  std::vector<std::uint8_t> unindexed = unindexedCopy(bytes);
+  CHECK(!unindexed.empty());
+  if (unindexed.empty()) return;
 
   fourdgs::MemoryReadable inner(Span<const std::uint8_t>(unindexed.data(), unindexed.size()));
   fourdgs::CountingReadable counting(&inner);
@@ -1114,12 +1123,8 @@ void anUnindexedFileStillReceivesAFrontMatterVerdict() {
   CHECK(walked.ok());
   if (!walked) return;
   const fourdgs::tool::Frame* header = walked->firstIntact(fourdgs::tool::op::kHeader);
-  const fourdgs::tool::Frame* firstIndex = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
-  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
   CHECK(header != nullptr);
-  CHECK(firstIndex != nullptr);
-  CHECK(footer != nullptr);
-  if (header == nullptr || firstIndex == nullptr || footer == nullptr) return;
+  if (header == nullptr) return;
 
   std::size_t model = static_cast<std::size_t>(header->offset + fourdgs::tool::kRecordHeaderSize);
   for (int field = 0; field < 2; ++field) model += 4 + readU32(bytes, model);
@@ -1131,14 +1136,9 @@ void anUnindexedFileStillReceivesAFrontMatterVerdict() {
   if (modelLength != unknown.size()) return;
   std::copy(unknown.begin(), unknown.end(), bytes.begin() + static_cast<std::ptrdiff_t>(model));
 
-  std::vector<std::uint8_t> unindexed(bytes.begin(), bytes.begin() + firstIndex->offset);
-  const std::size_t newFooter = unindexed.size();
-  unindexed.insert(unindexed.end(), bytes.begin() + footer->offset,
-                   bytes.begin() + footer->offset + footer->total());
-  unindexed.insert(unindexed.end(), bytes.end() - fourdgs::tool::kMagicSize, bytes.end());
-  for (std::size_t i = 0; i < 20; ++i) {
-    unindexed[newFooter + fourdgs::tool::kRecordHeaderSize + i] = 0;
-  }
+  std::vector<std::uint8_t> unindexed = unindexedCopy(bytes);
+  CHECK(!unindexed.empty());
+  if (unindexed.empty()) return;
 
   const Report report =
       fourdgs::tool::validate(Span<const std::uint8_t>(unindexed.data(), unindexed.size()));
@@ -1151,35 +1151,54 @@ void anUnindexedFileStillReceivesAFrontMatterVerdict() {
   CHECK(refusedModel);
 }
 
-void duplicateHeadersAreRejectedBeforeModelDispatch() {
+void duplicateFrontMatterIsRejectedBeforeUnindexedModelDispatch() {
   if (corpusMissing()) return;
-  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
-  CHECK(!bytes.empty());
-  if (bytes.empty()) return;
-  fourdgs::Result<Walk> walked =
-      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
-  CHECK(walked.ok());
-  if (!walked) return;
-  const fourdgs::tool::Frame* header = walked->firstIntact(fourdgs::tool::op::kHeader);
-  const fourdgs::tool::Frame* chunk = walked->firstIntact(fourdgs::tool::op::kChunk);
-  CHECK(header != nullptr);
-  CHECK(chunk != nullptr);
-  if (header == nullptr || chunk == nullptr) return;
-  const std::vector<std::uint8_t> duplicate(
-      bytes.begin() + static_cast<std::ptrdiff_t>(header->offset),
-      bytes.begin() + static_cast<std::ptrdiff_t>(header->offset + header->total()));
-  bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(chunk->offset), duplicate.begin(),
-               duplicate.end());
+  const std::filesystem::path fixture =
+      corpusDirectory() / "keyframe" / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs";
+  struct Case {
+    std::uint8_t opcode;
+    const char* name;
+  };
+  const std::array<Case, 3> cases = {
+      Case{fourdgs::tool::op::kHeader, "Header"},
+      Case{fourdgs::tool::op::kQuantization, "Quantization"},
+      Case{fourdgs::tool::op::kWindowTable, "Window Table"},
+  };
+  for (const Case& test : cases) {
+    std::vector<std::uint8_t> bytes = readBytes(fixture);
+    CHECK(!bytes.empty());
+    if (bytes.empty()) return;
+    fourdgs::Result<Walk> walked =
+        fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+    CHECK(walked.ok());
+    if (!walked) return;
+    const fourdgs::tool::Frame* original = walked->firstIntact(test.opcode);
+    CHECK(original != nullptr);
+    if (original == nullptr) return;
+    const std::uint64_t secondOffset = original->offset + original->total();
+    const std::vector<std::uint8_t> duplicate(
+        bytes.begin() + static_cast<std::ptrdiff_t>(original->offset),
+        bytes.begin() + static_cast<std::ptrdiff_t>(secondOffset));
+    CHECK(insertTopLevelRecord(&bytes, secondOffset, duplicate));
+    bytes = unindexedCopy(bytes);
+    CHECK(!bytes.empty());
+    if (bytes.empty()) return;
 
-  const Report report =
-      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
-  bool unique = false;
-  for (const fourdgs::tool::Finding& finding : report.findings) {
-    if (finding.message.find("Header records; the Header must be unique") != std::string::npos) {
-      unique = true;
+    const Report report =
+        fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+    CHECK(!report.ok());
+    CHECK(report.hasErrors());
+    CHECK(report.complete);
+    const std::string expected =
+        "a second " + std::string(test.name) + " record at byte " + std::to_string(secondOffset) +
+        "; a file carries exactly one, and nothing says which of two copies a reader should "
+        "believe";
+    bool exact = false;
+    for (const fourdgs::tool::Finding& finding : report.findings) {
+      if (finding.message == expected && finding.severity == Severity::kError) exact = true;
     }
+    CHECK(exact);
   }
-  CHECK(unique);
 }
 
 void anEmbeddedChunkOpcodeIsNotARecordBoundary() {
@@ -2504,7 +2523,7 @@ void runTests() {
   aKeyframeDeltaPayloadTransportFailurePreservesCause();
   anUnindexedKeyframeDeltaIsCertifiedFrontToBack();
   anUnindexedFileStillReceivesAFrontMatterVerdict();
-  duplicateHeadersAreRejectedBeforeModelDispatch();
+  duplicateFrontMatterIsRejectedBeforeUnindexedModelDispatch();
   anEmbeddedChunkOpcodeIsNotARecordBoundary();
   anOrphanChunkIsDecodedByTheStreamedValidationPass();
   anUnindexedPhysicalBandIsRejected();
