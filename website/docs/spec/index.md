@@ -34,7 +34,8 @@ a listener pose through HRTF, panning, attenuation, occlusion and mixing, are ou
 ## 2. Conventions
 
 - All integers are little-endian and unsigned unless stated.
-- `u8`, `u16`, `u32`, `u64`, `f32`, `f64` denote fixed-width types.
+- `u8`, `u16`, `u32`, `u64`, `i32`, `f32`, `f64` denote fixed-width types; `i32` is signed
+  two's-complement and the other integer types are unsigned.
 - `string` is `u32` byte length followed by that many UTF-8 bytes. Not NUL-terminated.
 - `bytes` is `u64` byte length followed by that many bytes.
 - `map<string, string>` is `u32` byte length of the whole block, then repeated `string` key /
@@ -60,6 +61,8 @@ A decoder reconstructs, for each gaussian, this state:
 | `sigma_t`          | f32     | temporal standard deviation, seconds; `+inf` means "never fades" |
 | `win_lo`, `win_hi` | f32     | validity window, seconds                                         |
 | `sh[band]`         | varies  | optional view-dependent colour coefficients                      |
+| `source_group`     | i32     | optional producer-side grouping label; logical `0` when omitted  |
+| `source_index`     | i32     | optional producer-side stable label; logical `0` when omitted    |
 | `object_id`        | u32     | optional object membership; `0` means background / unassigned    |
 
 At scene time `t`:
@@ -416,9 +419,9 @@ a coefficient's — because that is the domain the bytes live in. A reader MAY i
 — it is a producer's declaration, not an instruction — but a reader that surfaces it MUST use these
 names, so that two readers report the same number for the same file.
 
-`object_id` is an exact label (§6.6), not a metric value. A writer MUST NOT put `object_id` in
-`bounds`, and a reader MUST refuse a Quantization record that does: there is no meaningful error
-bound between two different labels.
+`source_group`, `source_index` and `object_id` are exact labels (§6.1), not metric values. A writer
+MUST NOT put any of them in `bounds`, and a reader MUST refuse a Quantization record that does:
+there is no meaningful error bound between two different labels.
 
 **A bound is a decimal number, not a run of bytes.** Every value in `bounds` MUST be spelled by this
 grammar, and consumers compare two bounds by the number it gives them rather than by their UTF-8
@@ -1174,14 +1177,16 @@ order `updates`, `births`, `deaths`. Each sub-block holds concatenated Attribute
 
 - **`updates`** — streams whose `element_count` is `update_count`. `gaussian_id` (id 13) is required
   and names the touched gaussians. Every other stream present carries **bin differences** against
-  the reference state, aligned element-for-element with the id stream. A stream that is absent means
-  that attribute did not change for any gaussian in this chunk. `sigma_t`, `flags` and
-  `window_index` MUST be absent (§11.5); `rotation_index` and `rotation`, when present, are absolute
-  (§11.5).
+  the reference state, aligned element-for-element with the id stream, except where §11.5 makes a
+  stream absolute. A stream that is absent means that attribute did not change for any gaussian in
+  this chunk. `sigma_t`, `flags` and `window_index` MUST be absent (§11.5); `rotation_index`,
+  `rotation`, `source_group`, `source_index` and `object_id`, when present, are absolute (§11.5).
 - **`births`** — streams whose `element_count` is `birth_count`, carrying **absolute** values: the
-  full required attribute set of a keyframe chunk, plus `gaussian_id`. A born gaussian's spherical
-  harmonics ride in SH Band Stream records (§5.7) following this Delta Chunk record, exactly as they
-  do for a Chunk.
+  full required attribute set of a keyframe chunk, plus `gaussian_id`. The optional identity lanes
+  `source_group`, `source_index` and `object_id` MAY be absent; an absent lane gives every birth the
+  logical value `0` (§6.1, §11.3), and its omission alone MUST NOT be refused as an incomplete
+  birth. A born gaussian's spherical harmonics ride in SH Band Stream records (§5.7) following this
+  Delta Chunk record, exactly as they do for a Chunk.
 - **`deaths`** — exactly one stream: `gaussian_id`, `element_count` equal to `death_count`.
 
 The three sub-blocks are framed by length, not by a per-stream group byte, so `0x06` is unchanged
@@ -1211,6 +1216,24 @@ A chunk stores one Attribute Stream per attribute, structure-of-arrays, all with
 `element_count` equal to the chunk's `count`. Registry §"Attribute ids" lists the ids; the required
 set for version 1 is position, scale, rotation index, rotation, colour, opacity, motion, `mu_t`,
 `sigma_t`, flags and window index. `source_group`, `source_index` and `object_id` are optional.
+
+The three optional lanes are **identity labels**, not quantized measurements. `source_group` and
+`source_index` are exact `i32` labels produced by §5.6's integer pipeline; `object_id` is the exact
+`u32` label §6.6 defines. No dequantization step applies to any of them. Attribute Stream `mode = 1`
+MAY still delta-code consecutive stored symbols inside one stream; that reversible compression mode
+does not make a label a difference against a `keyframe-delta` reference state.
+
+Every gaussian has a logical value for each optional identity lane. When a complete `gaussian-birth`
+Chunk or `keyframe-delta` keyframe Chunk omits one, every gaussian that Chunk states has value `0`.
+A Delta Chunk birth group that omits one likewise gives each birth value `0`, whether or not
+surviving gaussians already carry non-zero values in that lane. Explicit zero and omitted zero
+therefore reconstruct to the same identity state. An API MAY preserve whether a stream was
+physically absent, but omission MUST NOT leave a row without a logical value or make an otherwise
+complete Chunk or birth malformed. §11.3 defines how these values join a composed population. When a
+reader combines multiple `gaussian-birth` Chunks and at least one carries a lane, each Chunk that
+omits it contributes zero rows; the reader MUST NOT discard the explicitly carried labels from other
+Chunks merely because their physical stream sets differ. This default is closed to attribute ids 11,
+12 and 14: omission does not invent a zero meaning for an unknown, reserved or private attribute.
 
 Gaussians within a chunk MAY be reordered freely by the encoder; nothing in the format depends on
 their order, and readers MUST NOT rely on it.
@@ -1341,7 +1364,8 @@ it.
 
 `object_id` is an optional one-channel `u32` Attribute Stream with attribute id `14`. `0` means
 background / unassigned. A chunk that omits the stream is read as though every gaussian in that
-chunk carried `0`; mixed scenes may therefore omit it from chunks containing only background.
+chunk carried `0`; mixed scenes may therefore omit it from chunks containing only background. The
+same logical-zero and composition rules apply to all three optional identity lanes (§6.1, §11.3).
 
 The id is exact and is never dequantized. Attribute Stream symbols are signed 32-bit values after
 zigzag decoding, while the id owns the full unsigned 32-bit domain. The bridge is a same-bits
@@ -1522,9 +1546,10 @@ is unaffected byte for byte, and a reader that does not implement the model refu
 Under `keyframe-delta` the timeline is covered by **state chunks**, each valid over its own
 half-open interval `[t0, t1)`. A **keyframe chunk** carries the complete state of every gaussian
 live over its interval; it is an ordinary Chunk record (`0x05`), unchanged in every field, its
-attribute streams being the required version-1 set plus `gaussian_id`. A **delta chunk** carries the
-changes between a named reference chunk and itself; it is a Delta Chunk record (`0x10`, §5.18). A
-**group of pictures** (GOP) is a keyframe chunk and the run of delta chunks that reach it.
+attribute streams being the required version-1 set plus `gaussian_id`, and optionally the identity
+lanes §6.1 defines. A **delta chunk** carries the changes between a named reference chunk and
+itself; it is a Delta Chunk record (`0x10`, §5.18). A **group of pictures** (GOP) is a keyframe
+chunk and the run of delta chunks that reach it.
 
 **The state chunks tile the timeline.** Sorted by `t0`, each chunk's `t1` equals the next chunk's
 `t0`; the first `t0` is `0`; the last `t1` is the Header's `duration_sec`. A reader MUST refuse a
@@ -1566,6 +1591,32 @@ The order is normative because a chunk that both kills and creates would otherwi
 id MUST NOT appear in more than one of the three groups of the same chunk, and a reader MUST refuse
 a file where one does.
 
+Composition treats each optional identity lane as a population-aligned logical column even when no
+record physically carries it:
+
+- after deaths, a lane physically absent from the reference is an all-zero column for the surviving
+  reference rows;
+- an update group that omits the lane carries every touched gaussian's reference value forward;
+- a present update lane has exactly `update_count` rows aligned with the group's `gaussian_id`
+  stream and replaces those labels **absolutely** (§11.5). If the reference omitted the lane, the
+  composer materializes survivor zeros before applying those replacements;
+- a birth group appends its absolute labels when the lane is present and appends zeros when it is
+  absent. If the birth is the first physical appearance of the lane, the composer first materializes
+  zeros for every surviving reference row.
+
+For example, a keyframe that omits `source_index` for gaussians A and B has logical values `[0, 0]`.
+An update carrying `source_index = 7` for A produces `[7, 0]`; a later position-only update of A
+that omits `source_index` keeps `[7, 0]`. If a new gaussian C is born while omitting the lane, the
+result is `[7, 0, 0]`. In the inverse introduction case, a reference that omits `source_group`
+followed by a birth carrying `source_group = 4` produces survivor zeros followed by the birth value,
+for example `[0, 4]`. The same transitions apply to `object_id` and to either producer lane.
+
+A new keyframe is complete state rather than an update: if it omits a lane after an earlier GOP
+carried non-zero labels, its rows are all zero and nothing carries across the GOP boundary. Within a
+GOP, a producer deriving a delta from a complete current state that omits a lane after a non-zero
+reference MUST instead encode absolute zero replacements for the changed rows. Physically omitting
+the update lane means carry-forward; it cannot mean both carry-forward and reset-to-zero.
+
 The composed state `S` is a set of gaussians in exactly the state §3 describes — the same fields,
 the same types — and **§3's arithmetic then applies verbatim**. This model changes _where the state
 comes from_ and nothing about what the state means: a consumer's decode path still ends in §3's four
@@ -1584,27 +1635,29 @@ A delta's reference may be the GOP's keyframe or the chunk immediately before it
 by `delta_mode`: `0` keyframe-referenced (reference is the keyframe at the head of the GOP), `1`
 chained (reference is the state chunk immediately preceding). The usual reason to prefer
 keyframe-referencing is that chained deltas accumulate error; **here they do not, at any depth**
-(§11.7), because a delta is a difference of quantization bins rather than a quantization of a
-difference. The choice is therefore decided on cost: chained deltas are smaller and adjacent in the
-file, so a range reader coalesces a chain into one request; keyframe-referenced deltas are always
-two records but not adjacent, and the delta grows towards a full restatement by the end of a long
-GOP. Chained is the recommended default. The mode is per-chunk so an encoder can place a
-keyframe-referenced delta at a likely seek target — a chapter boundary, a shot cut, a loop start —
-and make that one instant cost two records however deep into the GOP it falls, without spending a
-whole keyframe on it. The chain walk (§11.8) handles both uniformly because it follows
-`reference_offset` rather than assuming a shape.
+(§11.7), because every difference-composed attribute uses differences of quantization bins rather
+than quantizations of differences, while §11.5's absolute attributes do not accumulate at all. The
+choice is therefore decided on cost: chained deltas are smaller and adjacent in the file, so a range
+reader coalesces a chain into one request; keyframe-referenced deltas are always two records but not
+adjacent, and the delta grows towards a full restatement by the end of a long GOP. Chained is the
+recommended default. The mode is per-chunk so an encoder can place a keyframe-referenced delta at a
+likely seek target — a chapter boundary, a shot cut, a loop start — and make that one instant cost
+two records however deep into the GOP it falls, without spending a whole keyframe on it. The chain
+walk (§11.8) handles both uniformly because it follows `reference_offset` rather than assuming a
+shape.
 
-### 11.5 What a delta may not change
+### 11.5 Invariant and absolute update attributes
 
-Four attributes are **GOP-invariant per gaussian**: a delta MUST NOT carry them in its update group,
-and a reader MUST refuse a file where one appears there.
+Three attributes are **GOP-invariant per gaussian**: a delta MUST NOT carry them in its update
+group, and a reader MUST refuse a file where one appears there. `rotation_index` is not
+GOP-invariant: like `rotation`, it is an absolute restatement when present, as the rotation rule
+below defines.
 
-| attribute        | why                                                                 |
-| ---------------- | ------------------------------------------------------------------- |
-| `sigma_t`        | derives the per-gaussian grids for `motion` and `mu_t` (§6.3)       |
-| `flags`          | bit 0 selects which branch of both of those derivations runs        |
-| `window_index`   | feeds the velocity grid for a never-fading gaussian (§6.3)          |
-| `rotation_index` | selects which quaternion component the three stored bins are (§6.4) |
+| attribute      | why                                                           |
+| -------------- | ------------------------------------------------------------- |
+| `sigma_t`      | derives the per-gaussian grids for `motion` and `mu_t` (§6.3) |
+| `flags`        | bit 0 selects which branch of both of those derivations runs  |
+| `window_index` | feeds the velocity grid for a never-fading gaussian (§6.3)    |
 
 The first three are the same rule three times: a difference of bins is only meaningful when both
 bins are on the same grid, and these values set the grid, so changing one mid-GOP would make a
@@ -1618,6 +1671,15 @@ that boundary constantly. Rotation is therefore handled specially:
 carries `rotation_index` and the three `rotation` bins as written, and they replace the previous
 ones outright. A producer that must change `sigma_t`, `flags` or `window_index` emits a death and a
 birth, or a keyframe. Both are representable; neither is silent.
+
+**Every optional identity lane in a delta's update group is also an absolute restatement, not a bin
+difference.** `source_group`, `source_index` and `object_id` are labels (§6.1): subtraction between
+labels has no semantic meaning, so a present stream replaces the reference values outright.
+`object_id` follows the accepted object-layer decision; applying the same rule to the two producer
+lanes is an additional version-1 semantic decision recorded in the
+[optional-identity decision](./proposals/optional-identity-zero-defaults.md). All three MAY change
+within a GOP. This is distinct from Attribute Stream `mode = 1`, which may losslessly delta-code
+adjacent symbols inside the physically present stream (§5.6).
 
 ### 11.6 A delta's reference shares its `level`
 
@@ -1633,8 +1695,9 @@ leaves every option open, because relaxing a rule is an append and tightening on
 ### 11.7 Error bounds
 
 The declared-bounds contract (§5.3) holds on the **reconstructed absolute state at every instant, at
-every depth. It is not on the delta.** The mechanism is one sentence: _a delta is a difference of
-bins, never a quantization of a difference._
+every depth. It is not on the delta.** For every difference-composed quantized attribute, the
+mechanism is one sentence: _the delta is a difference of bins, never a quantization of a
+difference._ The absolute attributes §11.5 names bypass this arithmetic.
 
 Let `s` be an attribute's grid pitch, `ε = s/2` its declared bound, and `q(x) = round(x / s)` the
 bin stored for true value `x`, so `|s·q(x) - x| ≤ ε` (§5.3). The keyframe stores `b₀ = q(x₀)`; delta
@@ -1651,7 +1714,8 @@ and `scale_rel` holds unchanged (`sigma_t` is GOP-invariant under §11.5 and nev
 rotation is never composed at all (§11.5), so its bound is §6.4's applied once; and spherical
 harmonics are not delta-coded — a band's coefficients are `u8` stored as written (§6.5), so a
 gaussian's coefficients are fixed for its lifetime within a GOP and changing them needs a keyframe,
-or a death and a birth.
+or a death and a birth. The optional identity lanes are exact labels and are restated absolutely, so
+they do not participate in the telescoping arithmetic or its error bounds (§11.5).
 
 **Representability.** Bins travel as `u8`/`u16`/`u32` symbols (§5.6), but a composed bin lives in
 the decoder's accumulator. **Composed bins are `i32`.** A writer MUST NOT emit a chain any of whose
@@ -1716,6 +1780,10 @@ message.
 | a composed bin outside `i32`                            | wrapping produces a plausible wrong value                |
 | a delta's `level` differs from its reference's          | the combination has no defined meaning (§11.6)           |
 
+Omission of `source_group`, `source_index` or `object_id` from an otherwise complete keyframe or
+birth is not a failure mode: §6.1 supplies zero. Nor is omission from an update a reset or an
+incomplete update: §11.3 carries the reference value forward.
+
 ### 11.10 Truncation and recovery
 
 A streamed reader recovers every complete record before a cut and MUST NOT interpret a partial one.
@@ -1766,35 +1834,37 @@ Corrections and clarifications to this document. A row here never changes what a
 version-1 file looks like on the wire: where the text and the wire disagreed, the wire is the format
 and the text was the bug.
 
-| Change                                                                                                                                    | Kind                      |
-| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| §5.1 Header `aabb` corrected from `f32[6]` to `f64[6]`, matching every file ever written                                                  | correction                |
-| §5.3 named the `bounds` map's keys                                                                                                        | clarification             |
-| §5.4 stated the reading of an absent or empty Window Table, and that an out-of-range index is refused                                     | clarification, rule added |
-| §5.5 stated that a reader must honour a chunk's `compression`, and what `uncompressed_size` means                                         | clarification             |
-| §5.7 stated that a band stream's `attribute_id` carries `0x07` and must not be dispatched on                                              | clarification             |
-| §5.8 stated that every offset and length in the index frames a whole record                                                               | clarification             |
-| §6.3 stated that `K` uses the Header's `cutoff` rather than the default                                                                   | clarification             |
-| §6.5 added: spherical harmonic layout, whole degrees, and that `step_sh` is not applied at decode                                         | clarification             |
-| §4.5 added: the summary is exactly Chunk Index, Statistics and Summary Offset, and is contiguous                                          | rule added                |
-| §5.3 added: every quantization step and origin MUST be finite                                                                             | rule added                |
-| §5.5/§5.6 corrected: a chunk's streams are bare structures, not records, and `0x06` is not an opcode                                      | correction                |
-| §5.13 stated that `0x0E` is reserved with no defined body, rather than sharing the Attachment's                                           | clarification             |
-| §5.2 named the terms of the 37-byte tail a seeking reader reads                                                                           | clarification             |
-| §5.15 added: Coordinate Frame `0x20`, Sensor Calibration `0x21`, Rig Trajectory `0x22` and Geodetic Anchor `0x23`, all optional           | rule added                |
-| §5.15.2 added: a Coordinate Frame record supersedes the `coordinate_system` metadata key                                                  | rule added                |
-| §6.5 added: a stored SH byte is the coefficient `-4 + b * 8 / 255`, on a fixed interval                                                   | clarification, rule added |
-| §5.3/§6.5 added: per-band SH bit depths, appended to the Quantization record                                                              | rule added                |
-| Registry: reserved attribute ids 32–47 and the `relightable` profile for a future relighting extension; named, not defined                | reserved, rule added      |
-| §3/§5.15.6–§6.6 added: exact `object_id`, Object Table `0x24`, Object Track `0x25`, and base-then-track composition                       | rule added                |
-| §11/§5.18/§5.8 added: the `keyframe-delta` temporal model, Delta Chunk `0x10`, `gaussian_id` (id 13), and six appended Chunk Index fields | rule added                |
-| §5.3 added: the grammar a `bounds` value is spelled by, and that two bounds are compared as numbers rather than as bytes                  | clarification, rule added |
-| §4 added: Header, Quantization and Window Table appear exactly once, and a reader MUST refuse a file carrying two of any of them          | rule added                |
-| §5.3 added: `step_time` MUST be strictly positive and a reader refuses a non-positive value                                               | rule added                |
-| §5.8 added: decoded Chunk Index counts MUST agree with parsed operations and the composed population                                      | clarification, rule added |
-| §3.2/§5.3 added: derived binary32 attributes MUST stay finite and in range; finite quantization has no global cap                         | clarification, rule added |
-| §3.3 added: collecting APIs have a configurable 512 MiB decoded-state budget; exhaustion is `resource-limit`, never malformed             | reader contract added     |
-| §4 added: defined front matter MUST precede the first state record; an observed late record is `late-front-matter-record`                 | clarification, rule added |
+| Change                                                                                                                                            | Kind                      |
+| ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| §5.1 Header `aabb` corrected from `f32[6]` to `f64[6]`, matching every file ever written                                                          | correction                |
+| §5.3 named the `bounds` map's keys                                                                                                                | clarification             |
+| §5.4 stated the reading of an absent or empty Window Table, and that an out-of-range index is refused                                             | clarification, rule added |
+| §5.5 stated that a reader must honour a chunk's `compression`, and what `uncompressed_size` means                                                 | clarification             |
+| §5.7 stated that a band stream's `attribute_id` carries `0x07` and must not be dispatched on                                                      | clarification             |
+| §5.8 stated that every offset and length in the index frames a whole record                                                                       | clarification             |
+| §6.3 stated that `K` uses the Header's `cutoff` rather than the default                                                                           | clarification             |
+| §6.5 added: spherical harmonic layout, whole degrees, and that `step_sh` is not applied at decode                                                 | clarification             |
+| §4.5 added: the summary is exactly Chunk Index, Statistics and Summary Offset, and is contiguous                                                  | rule added                |
+| §5.3 added: every quantization step and origin MUST be finite                                                                                     | rule added                |
+| §5.5/§5.6 corrected: a chunk's streams are bare structures, not records, and `0x06` is not an opcode                                              | correction                |
+| §5.13 stated that `0x0E` is reserved with no defined body, rather than sharing the Attachment's                                                   | clarification             |
+| §5.2 named the terms of the 37-byte tail a seeking reader reads                                                                                   | clarification             |
+| §5.15 added: Coordinate Frame `0x20`, Sensor Calibration `0x21`, Rig Trajectory `0x22` and Geodetic Anchor `0x23`, all optional                   | rule added                |
+| §5.15.2 added: a Coordinate Frame record supersedes the `coordinate_system` metadata key                                                          | rule added                |
+| §6.5 added: a stored SH byte is the coefficient `-4 + b * 8 / 255`, on a fixed interval                                                           | clarification, rule added |
+| §5.3/§6.5 added: per-band SH bit depths, appended to the Quantization record                                                                      | rule added                |
+| Registry: reserved attribute ids 32–47 and the `relightable` profile for a future relighting extension; named, not defined                        | reserved, rule added      |
+| §3/§5.15.6–§6.6 added: exact `object_id`, Object Table `0x24`, Object Track `0x25`, and base-then-track composition                               | rule added                |
+| §11/§5.18/§5.8 added: the `keyframe-delta` temporal model, Delta Chunk `0x10`, `gaussian_id` (id 13), and six appended Chunk Index fields         | rule added                |
+| §5.3 added: the grammar a `bounds` value is spelled by, and that two bounds are compared as numbers rather than as bytes                          | clarification, rule added |
+| §4 added: Header, Quantization and Window Table appear exactly once, and a reader MUST refuse a file carrying two of any of them                  | rule added                |
+| §5.3 added: `step_time` MUST be strictly positive and a reader refuses a non-positive value                                                       | rule added                |
+| §5.8 added: decoded Chunk Index counts MUST agree with parsed operations and the composed population                                              | clarification, rule added |
+| §3.2/§5.3 added: derived binary32 attributes MUST stay finite and in range; finite quantization has no global cap                                 | clarification, rule added |
+| §3.3 added: collecting APIs have a configurable 512 MiB decoded-state budget; exhaustion is `resource-limit`, never malformed                     | reader contract added     |
+| §4 added: defined front matter MUST precede the first state record; an observed late record is `late-front-matter-record`                         | clarification, rule added |
+| §11.5 corrected: `rotation_index` is absolute when present, not GOP-invariant, as §5.18 already required                                          | correction                |
+| §5.3/§5.18/§6.1/§6.6/§11.3/§11.5 and registry: omitted optional identity lanes are logical zero; updates carry forward or restate them absolutely | clarification, rule added |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
 opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append
@@ -1876,6 +1946,17 @@ that shape, and no third-party producer is known to do so. Keeping it legal woul
 indexed opener to scan the gaps between state records, making open cost O(chunks) range requests in
 the worst case. The bounded indexed guarantee wins; streamed readers and validators, which already
 observe the late bytes, owe the stable refusal at no additional I/O cost.
+
+The optional-identity row changes no record layout, opcode, flag or stored value. For complete
+Chunks and births it resolves an omission the wire already permits: readers that padded with zero
+keep their result, while readers that reported `incomplete-birth` must accept the same bytes. The
+absolute-update ruling for `object_id` records the accepted object-layer decision in the normative
+text; extending it to `source_group` and `source_index` is a new semantic decision because §5.18
+previously swept those exact labels into its generic bin-difference sentence. The reference writers
+do not currently emit optional identity lanes under `keyframe-delta`, and the corpus has no such
+file, so no known produced file changes meaning. The ruling is made before that writer/corpus work,
+when the ambiguous shape has no compatibility constituency. It does not adopt Object Track
+composition or the `objects` profile changes still proposed under #79.
 
 The two §6.5 rows are the same kind of change from opposite directions, and neither moves a byte in
 any file that exists.
