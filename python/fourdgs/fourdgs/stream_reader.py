@@ -18,7 +18,13 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .decoded_f32 import check_decoded_f32
-from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec, duplicate_structural_record
+from .exceptions import (
+    MalformedFile,
+    TruncatedFile,
+    UnsupportedCodec,
+    check_front_matter_placement,
+    duplicate_structural_record,
+)
 from .model import AudioSource, AudioSourceKeyframe, CameraTrajectory, GaussianSet
 from .object_layer import ObjectLayer
 from .provenance import Provenance
@@ -516,6 +522,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     audio_payloads: dict[int, bytes] = {}
     legacy_audio: rec.Audio | None = None
     first_audio_record: tuple[str, int, int | None] | None = None
+    first_state: tuple[int, int] | None = None
 
     saw_window_table = False
 
@@ -524,6 +531,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     try:
         for record in iter_records(data, pos):
             end = record.offset + 9 + len(record.content)
+            first_state = check_front_matter_placement(record.opcode, record.offset, first_state)
             if record.opcode == op.HEADER:
                 if header is not None:
                     raise duplicate_structural_record("Header", record.offset)

@@ -35,7 +35,13 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .decoded_f32 import check_decoded_f32
-from .exceptions import ExceedsReaderLimit, FourdgsError, MalformedFile, UnsupportedCodec
+from .exceptions import (
+    ExceedsReaderLimit,
+    FourdgsError,
+    MalformedFile,
+    UnsupportedCodec,
+    check_front_matter_placement,
+)
 from .keyframe_delta import State, apply_delta, chain_from, check_tiling, keyframe_state
 from .keyframe_delta_writer import (
     KeyframeDeltaOptions,
@@ -1111,8 +1117,10 @@ def decode_streamed(data: bytes) -> DecodedSequence:
     chunks: list[ChunkInfo] = []
     by_offset: dict[int, State] = {}
     index: list[rec.ChunkIndexEntry] = []
+    first_state: tuple[int, int] | None = None
 
     for record in iter_records(data, len(MAGIC)):
+        first_state = check_front_matter_placement(record.opcode, record.offset, first_state)
         if record.opcode == op.HEADER:
             header = rec.Header.parse(record.content)
             if header.temporal_model != "keyframe-delta":
@@ -1231,7 +1239,9 @@ def open_indexed(data: bytes) -> IndexedSequence:
     check_magic(data)
     header = quant = None
     windows: list[tuple[float, float]] = []
+    first_state: tuple[int, int] | None = None
     for record in iter_records(data, len(MAGIC)):
+        first_state = check_front_matter_placement(record.opcode, record.offset, first_state)
         if record.opcode == op.HEADER:
             header = rec.Header.parse(record.content)
         elif record.opcode == op.QUANTIZATION:
@@ -1965,6 +1975,7 @@ def scan_streamed(
     quantization: rec.Quantization | None = None
     windows: list[tuple[float, float]] = []
     cutoff = 0.05
+    first_state: tuple[int, int] | None = None
 
     def finish_bands() -> None:
         nonlocal band_owner, band_rows, bands
@@ -1989,6 +2000,7 @@ def scan_streamed(
         bands = []
 
     for record in iter_records(data, len(MAGIC)):
+        first_state = check_front_matter_placement(record.opcode, record.offset, first_state)
         if record.opcode != op.SH_BAND_STREAM:
             finish_bands()
         if record.opcode == op.HEADER:

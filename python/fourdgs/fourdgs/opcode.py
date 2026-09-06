@@ -53,6 +53,29 @@ GEODETIC_ANCHOR = 0x23
 OBJECT_TABLE = 0x24
 OBJECT_TRACK = 0x25
 
+# The closed placement classes from the registry. Reserved provenance opcodes are not
+# front matter until a specification revision defines them as such.
+FRONT_MATTER_OPCODES = frozenset(
+    {
+        HEADER,
+        QUANTIZATION,
+        WINDOW_TABLE,
+        AUDIO,
+        CAMERA,
+        METADATA,
+        ATTACHMENT,
+        AUDIO_SOURCE,
+        AUDIO_DATA,
+        COORDINATE_FRAME,
+        SENSOR_CALIBRATION,
+        RIG_TRAJECTORY,
+        GEODETIC_ANCHOR,
+        OBJECT_TABLE,
+        OBJECT_TRACK,
+    }
+)
+STATE_OPCODES = frozenset({CHUNK, DELTA_CHUNK})
+
 #: First opcode of the provenance family, and one past its last. `0x26`-`0x2F` are
 #: reserved for source timing (spec section 5.15.8).
 PROVENANCE_START = 0x20

@@ -16,6 +16,12 @@ All notable changes to the Python package are documented here, following
   finite binary64 steps, ordinary underflow remains legal, and the `never_fades` sigma infinity
   remains the format's sole sentinel exception.
 
+- **Defined front matter encountered after the first state record is refused as
+  `late-front-matter-record`.** Streamed readers and validators now enforce §4 before parsing the
+  late record, and diagnostics name both physical opcodes and byte offsets. Unknown, reserved and
+  private opcodes retain their position-independent skip behavior; indexed openers may still stop at
+  the first Chunk or Delta Chunk.
+
 - **Decoded Chunk Index counts are verified as `index-record-mismatch`.** Both ordinary read paths
   now compare `gaussian_count` with validated Chunk rows or Delta operations, and keyframe-delta
   reads compare `live_count` with every composed state, keyframes included. The check runs only for

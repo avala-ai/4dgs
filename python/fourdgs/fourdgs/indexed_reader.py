@@ -215,7 +215,7 @@ def open_indexed(source: Readable) -> IndexedScene:
     attachment_ranges: list[tuple[int, int]] = []
     provenance_ranges: list[tuple[int, int, int]] = []
     for record in front.records(len(MAGIC)):
-        if record.opcode == op.CHUNK:
+        if record.opcode in op.STATE_OPCODES:
             break
         if record.opcode == op.HEADER:
             if header is not None:
