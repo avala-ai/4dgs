@@ -640,6 +640,7 @@ fn validate_index_band_ownership<R: Readable + ?Sized>(
     let mut seen = BTreeSet::new();
     let mut owner: Option<(u64, usize)> = None;
     let mut following: Vec<(u8, u64, u64)> = Vec::new();
+    let mut first_state_record: Option<(u8, u64)> = None;
 
     let finish = |owner: &mut Option<(u64, usize)>,
                   following: &mut Vec<(u8, u64, u64)>,
@@ -699,6 +700,17 @@ fn validate_index_band_ownership<R: Readable + ?Sized>(
         }
         let (opcode, length) =
             ranged_framing(source, at, None).map_err(|error| ValidationFailure::at(error, at))?;
+        if let Some((first_opcode, first_offset)) = first_state_record {
+            if op::is_front_matter(opcode) {
+                return Err(ValidationFailure::at(
+                    Error::late_front_matter_record(opcode, at, first_opcode, first_offset),
+                    at,
+                ));
+            }
+        }
+        if first_state_record.is_none() && matches!(opcode, op::CHUNK | op::DELTA_CHUNK) {
+            first_state_record = Some((opcode, at));
+        }
         let total = (RECORD_HEADER_SIZE as u64)
             .checked_add(length)
             .ok_or_else(|| {
@@ -1014,6 +1026,7 @@ where
     // decoded state until those entries arrive, capped by the same limit as indexed
     // validation rather than retaining another population.
     let mut decoded_index_counts: BTreeMap<u64, DecodedIndexCounts> = BTreeMap::new();
+    let mut first_state_record: Option<(u8, u64)> = None;
     let mut at = MAGIC.len() as u64;
 
     while at < size {
@@ -1027,6 +1040,17 @@ where
         }
         let (opcode, content_length) =
             ranged_framing(source, at, None).map_err(|error| ValidationFailure::at(error, at))?;
+        if let Some((first_opcode, first_offset)) = first_state_record {
+            if op::is_front_matter(opcode) {
+                return Err(ValidationFailure::at(
+                    Error::late_front_matter_record(opcode, at, first_opcode, first_offset),
+                    at,
+                ));
+            }
+        }
+        if first_state_record.is_none() && matches!(opcode, op::CHUNK | op::DELTA_CHUNK) {
+            first_state_record = Some((opcode, at));
+        }
         if opcode != op::SH_BAND_STREAM {
             if let Some(owner) = band_owner.take() {
                 finish_bands(
@@ -1409,7 +1433,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions, Sample};
+    use crate::keyframe_delta_file::{
+        decode_streamed, write_sequence, KeyframeDeltaOptions, Sample,
+    };
     use crate::model::GaussianSet;
     use crate::serialization::{put_record, Records};
     use crate::stream::encode_stream;
@@ -1741,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_validation_checks_late_header_and_quantization_records() {
+    fn indexed_validation_refuses_late_header_and_quantization_before_their_values() {
         for declaration in [op::HEADER, op::QUANTIZATION] {
             let mut bytes = empty_sequence();
             let replacement = if declaration == op::HEADER {
@@ -1757,7 +1783,12 @@ mod tests {
             let at = replace_record(&mut bytes, op::STATISTICS, &replacement);
             let failure = failure(&bytes, ValidationMode::Indexed);
             assert_eq!(failure.offset, Some(at as u64));
-            assert!(failure.error.refusal_code().is_some(), "{}", failure.error);
+            assert_eq!(
+                failure.error.refusal_code(),
+                Some(crate::error::refusal::LATE_FRONT_MATTER_RECORD),
+                "{}",
+                failure.error
+            );
         }
         let mut bytes = empty_sequence();
         let at = record_offset(&bytes, op::HEADER);
@@ -1780,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_validation_parses_late_window_tables() {
+    fn indexed_validation_checks_late_window_placement_before_its_body() {
         let mut bytes = sequence();
         let at = record_offset(&bytes, op::STATISTICS);
         bytes[at] = op::WINDOW_TABLE;
@@ -1788,7 +1819,91 @@ mod tests {
             .copy_from_slice(&u32::MAX.to_le_bytes());
         let failure = failure(&bytes, ValidationMode::Indexed);
         assert_eq!(failure.offset, Some(at as u64));
-        assert!(failure.error.to_string().contains("truncated"));
+        assert_eq!(
+            failure.error.refusal_code(),
+            Some(crate::error::refusal::LATE_FRONT_MATTER_RECORD)
+        );
+    }
+
+    #[test]
+    fn every_defined_front_matter_opcode_is_late_on_both_validation_paths() {
+        let front_matter = [
+            op::HEADER,
+            op::QUANTIZATION,
+            op::WINDOW_TABLE,
+            op::AUDIO,
+            op::CAMERA,
+            op::METADATA,
+            op::ATTACHMENT,
+            op::AUDIO_SOURCE,
+            op::AUDIO_DATA,
+            op::COORDINATE_FRAME,
+            op::SENSOR_CALIBRATION,
+            op::RIG_TRAJECTORY,
+            op::GEODETIC_ANCHOR,
+            op::OBJECT_TABLE,
+            op::OBJECT_TRACK,
+        ];
+        for opcode in front_matter {
+            let mut bytes = empty_sequence();
+            let first_state_at = record_offset(&bytes, op::CHUNK);
+            let late_at = record_offset(&bytes, op::STATISTICS);
+            // Keep the existing body's framing so several rows are deliberately invalid
+            // for a second reason. Placement must still win before any body is parsed.
+            bytes[late_at] = opcode;
+
+            let streamed = decode_streamed(&bytes).unwrap_err();
+            assert_eq!(
+                streamed.refusal_code(),
+                Some(crate::error::refusal::LATE_FRONT_MATTER_RECORD),
+                "{}: {streamed}",
+                op::name(opcode)
+            );
+            for mode in [ValidationMode::Streamed, ValidationMode::Indexed] {
+                let failure = failure(&bytes, mode);
+                assert_eq!(failure.offset, Some(late_at as u64));
+                assert_eq!(
+                    failure.error.refusal_code(),
+                    Some(crate::error::refusal::LATE_FRONT_MATTER_RECORD),
+                    "{} in {mode:?}: {}",
+                    op::name(opcode),
+                    failure.error
+                );
+                let message = failure.error.to_string();
+                assert!(
+                    message.contains(&format!(
+                        "{} (opcode 0x{opcode:02X}) at byte {late_at}",
+                        op::name(opcode)
+                    )),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(&format!("Chunk (opcode 0x05) at byte {first_state_at}")),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_and_private_records_after_state_remain_independent() {
+        for opcode in [0x26, 0x80] {
+            let mut bytes = empty_sequence();
+            let at = record_offset(&bytes, op::STATISTICS);
+            bytes[at] = opcode;
+            decode_streamed(&bytes).unwrap_or_else(|error| {
+                panic!("opcode 0x{opcode:02X} after state must remain skippable: {error}")
+            });
+            for mode in [ValidationMode::Streamed, ValidationMode::Indexed] {
+                validate(&mut crate::BytesReadable::new(&bytes), mode, |_, _| Ok(()))
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "opcode 0x{opcode:02X} after state failed {mode:?}: {}",
+                            failure.error
+                        )
+                    });
+            }
+        }
     }
 
     #[test]

@@ -621,6 +621,7 @@ fn read_from_with_limits<R: Read>(
     let mut audio_payload_map_bytes = 0usize;
     let mut legacy_audio: Option<rec::Audio> = None;
     let mut first_audio_record: Option<(&'static str, u64, Option<u32>)> = None;
+    let mut first_state_record: Option<(u8, u64)> = None;
     let mut truncated = false;
     let mut saw_footer = false;
 
@@ -653,6 +654,20 @@ fn read_from_with_limits<R: Read>(
         // Saturating: `at` is only used to frame offsets, and a corrupt length must not
         // wrap it into a value that looks like a plausible position in the file.
         at = at.saturating_add(RECORD_HEADER_SIZE as u64);
+
+        if let Some((first_opcode, first_offset)) = first_state_record {
+            if op::is_front_matter(opcode) {
+                return Err(Error::late_front_matter_record(
+                    opcode,
+                    offset,
+                    first_opcode,
+                    first_offset,
+                ));
+            }
+        }
+        if first_state_record.is_none() && matches!(opcode, op::CHUNK | op::DELTA_CHUNK) {
+            first_state_record = Some((opcode, offset));
+        }
         record_count = record_count.saturating_add(1);
         if record_count > record_limit {
             // A declaration is not a complete record. If the resource ends immediately after

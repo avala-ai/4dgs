@@ -8,6 +8,11 @@ All notable changes to the Rust crate are documented here, following
 
 ### Changed
 
+- **Streamed readers and validators refuse defined front matter after state begins.** The
+  `late-front-matter-record` diagnostic identifies both the late record's opcode and physical byte
+  and the first Chunk or Delta Chunk's opcode and byte, before duplicate or body parsing can mask
+  the placement error. Unknown and private records keep their existing position-independent
+  handling, while indexed open retains its bounded early-stop exemption.
 - **Readers refuse decoded binary32 attribute overflow by name.** Gaussian-birth and keyframe-delta
   decoding now complete each floating reconstruction in `f64`, then return `decoded-f32-overflow`
   before narrowing any NaN, infinity, or out-of-range result into state. Diagnostics identify the

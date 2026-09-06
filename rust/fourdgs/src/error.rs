@@ -151,6 +151,8 @@ pub mod refusal {
     pub const INDEX_RECORD_MISMATCH: &str = "index-record-mismatch";
     /// A completed floating attribute reconstruction cannot inhabit its binary32 lane.
     pub const DECODED_F32_OVERFLOW: &str = "decoded-f32-overflow";
+    /// A defined front-matter record appears after state records have begun.
+    pub const LATE_FRONT_MATTER_RECORD: &str = "late-front-matter-record";
 }
 
 impl Error {
@@ -210,6 +212,27 @@ impl Error {
         Error::Malformed(format!(
             "a second {record} record at byte {offset}; a file carries exactly one, and nothing says which of two copies a reader should believe"
         ))
+    }
+
+    /// Refuse a defined front-matter record placed after state began (spec §4).
+    ///
+    /// Call this from framing, before parsing the late body, so placement controls over
+    /// a duplicate or malformed-body diagnosis exactly as the specification requires.
+    pub fn late_front_matter_record(
+        late_opcode: u8,
+        late_offset: u64,
+        first_state_opcode: u8,
+        first_state_offset: u64,
+    ) -> Error {
+        Error::refused(
+            refusal::LATE_FRONT_MATTER_RECORD,
+            RefusalKind::Malformed,
+            format!(
+                "the defined front-matter record {} (opcode 0x{late_opcode:02X}) at byte {late_offset} follows the first state record {} (opcode 0x{first_state_opcode:02X}) at byte {first_state_offset}; every defined front-matter record must precede the first state record",
+                crate::opcode::name(late_opcode),
+                crate::opcode::name(first_state_opcode),
+            ),
+        )
     }
 
     pub(crate) fn at_record(self, record: &str, offset: u64) -> Error {
