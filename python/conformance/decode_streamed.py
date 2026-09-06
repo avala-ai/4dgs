@@ -48,7 +48,7 @@ def _temporal_model(data: bytes) -> str | None:
     return None
 
 
-def run(path: str) -> str:
+def run(path: str, *, max_decoded_state_bytes: int = fourdgs.DEFAULT_MAX_DECODED_STATE_BYTES) -> str:
     with open(path, "rb") as fh:
         data = fh.read()
 
@@ -57,10 +57,10 @@ def run(path: str) -> str:
         # reconstruction — not a whole-population summary — is what the SDKs are diffed on.
         # Truncation recovery is a gaussian-birth check: the states canonical is a
         # different statement and a cut file is a different file.
-        return canonical(kdf.states_json(kdf.decode_streamed(data)))
+        return canonical(kdf.states_json(kdf.decode_streamed(data, max_decoded_state_bytes=max_decoded_state_bytes)))
 
-    scene = fourdgs.read(path)
-    _check_truncation_recovery(path, scene)
+    scene = fourdgs.read(path, max_decoded_state_bytes=max_decoded_state_bytes)
+    _check_truncation_recovery(path, scene, max_decoded_state_bytes)
     return canonical(
         summarize(
             scene.header,
@@ -79,7 +79,7 @@ def run(path: str) -> str:
     )
 
 
-def _check_truncation_recovery(path: str, full) -> None:
+def _check_truncation_recovery(path: str, full, max_decoded_state_bytes: int) -> None:
     """Decode the same file cut short, and insist on what survives.
 
     Nothing in the corpus is truncated, so this makes one. The canonical JSON cannot
@@ -89,7 +89,7 @@ def _check_truncation_recovery(path: str, full) -> None:
     with open(path, "rb") as fh:
         data = fh.read()
 
-    cut = fourdgs.read(data[:-1])
+    cut = fourdgs.read(data[:-1], max_decoded_state_bytes=max_decoded_state_bytes)
     if not cut.truncated:
         raise AssertionError("a file cut before its trailing magic was not reported truncated")
     if cut.gaussians.count != full.gaussians.count:
@@ -99,7 +99,10 @@ def _check_truncation_recovery(path: str, full) -> None:
 
     if len(full.chunk_index) >= 2:
         last = full.chunk_index[-1]
-        mid = fourdgs.read(data[: last.chunk_offset + 5])
+        mid = fourdgs.read(
+            data[: last.chunk_offset + 5],
+            max_decoded_state_bytes=max_decoded_state_bytes,
+        )
         if not mid.truncated:
             raise AssertionError("a file cut inside a chunk record was not reported truncated")
         expected = full.gaussians.count - last.gaussian_count
@@ -108,13 +111,31 @@ def _check_truncation_recovery(path: str, full) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("usage: decode_streamed.py <file.4dgs>", file=sys.stderr)
+    if len(argv) == 2:
+        path = argv[1]
+        max_decoded_state_bytes = fourdgs.DEFAULT_MAX_DECODED_STATE_BYTES
+    elif len(argv) == 4 and argv[1] == "--max-decoded-state-bytes":
+        path = argv[3]
+        try:
+            max_decoded_state_bytes = int(argv[2])
+        except ValueError:
+            print("--max-decoded-state-bytes must be a positive integer", file=sys.stderr)
+            return 2
+        if max_decoded_state_bytes <= 0:
+            print("--max-decoded-state-bytes must be a positive integer", file=sys.stderr)
+            return 2
+    else:
+        print(
+            "usage: decode_streamed.py [--max-decoded-state-bytes N] <file.4dgs>",
+            file=sys.stderr,
+        )
         return 2
     if "--supports" in argv:
         return 0
     try:
-        print(run(argv[1]))
+        print(run(path, max_decoded_state_bytes=max_decoded_state_bytes))
+    except fourdgs.ExceedsReaderLimit:
+        print('{"unsupported":"resource-limit"}')
     except fourdgs.FourdgsError as exc:
         # A refusal is a result, not a crash: it goes to stdout and the process exits 0,
         # so the harness diffs it against the expectation like any other answer. An error
@@ -123,7 +144,7 @@ def main(argv: list[str]) -> int:
         # be claiming a valid answer for a failure nobody can check — see `refusal.py`.
         answer = refusal_answer(exc)
         if answer is None:
-            print(f"{argv[1]}: {exc}", file=sys.stderr)
+            print(f"{path}: {exc}", file=sys.stderr)
             return 1
         print(answer)
     return 0

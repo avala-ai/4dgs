@@ -21,6 +21,7 @@ __version__ = "0.6.0"
 
 from .compressed_ply import import_scene as from_compressed_ply
 from .compressed_ply import is_compressed_ply, read_compressed_ply, sorted_segments
+from .decoded_budget import DEFAULT_MAX_DECODED_STATE_BYTES
 from .exceptions import (
     BoundViolation,
     ExceedsReaderLimit,
@@ -50,6 +51,7 @@ from .usd import UsdImport, from_usd, to_usd
 from .writer import WriteOptions, write
 
 __all__ = [
+    "DEFAULT_MAX_DECODED_STATE_BYTES",
     "SH_LADDERS",
     "AudioSource",
     "AudioSourceKeyframe",

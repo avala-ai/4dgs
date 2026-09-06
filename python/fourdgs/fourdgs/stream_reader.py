@@ -17,6 +17,14 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
+from .decoded_budget import (
+    DEFAULT_MAX_DECODED_STATE_BYTES,
+    DecodedStateBudget,
+    array_capacity_bytes,
+    gaussian_assembly_working_bytes,
+    gaussian_birth_decode_working_bytes,
+    gaussian_set_output_bytes,
+)
 from .decoded_f32 import check_decoded_f32
 from .exceptions import (
     MalformedFile,
@@ -483,6 +491,21 @@ def chunk_stream_bytes(head: rec.ChunkHeader, streams) -> bytes:
     codec over the whole records block. Ignoring it decodes the compressed bytes as though
     they were attribute streams, which produces wrong gaussians instead of an error.
     """
+    decoded_body_bytes = chunk_decoded_body_bytes(head, streams)
+    if not decoded_body_bytes:
+        return streams
+    codec = {"deflate": CODEC_DEFLATE, "zstd": CODEC_ZSTD}.get(head.compression)
+    assert codec is not None
+    return decompress(bytes(streams), codec, head.uncompressed_size)
+
+
+def chunk_decoded_body_bytes(head: rec.ChunkHeader, streams) -> int:
+    """Owned bytes needed for chunk-level decompression, validating first.
+
+    An uncompressed records block is a view of the excluded encoded input and costs no
+    decoded-state capacity.  A compressed one becomes an owned buffer; its declared
+    expansion is checked by the caller before that allocation.
+    """
     if head.compression == "":
         if len(streams) != head.uncompressed_size:
             raise MalformedFile(
@@ -490,17 +513,23 @@ def chunk_stream_bytes(head: rec.ChunkHeader, streams) -> bytes:
                 f"{head.uncompressed_size}; its records block contains {len(streams)} bytes",
                 code="decompressed-size-mismatch",
             )
-        return streams
-    codec = {"deflate": CODEC_DEFLATE, "zstd": CODEC_ZSTD}.get(head.compression)
-    if codec is None:
+        return 0
+    if head.compression not in {"deflate", "zstd"}:
         raise UnsupportedCodec(
             f"chunk at t0={head.t0} is compressed with {head.compression!r}, which this build does not know"
         )
-    return decompress(bytes(streams), codec, head.uncompressed_size)
+    return int(head.uncompressed_size)
 
 
-def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3) -> Scene:
-    """Decode a whole file from bytes or a path."""
+def read(
+    path_or_bytes,
+    *,
+    recover_truncated: bool = True,
+    max_sh_band: int = 3,
+    max_decoded_state_bytes: int = DEFAULT_MAX_DECODED_STATE_BYTES,
+) -> Scene:
+    """Decode a whole file under a caller-selected aggregate decoded-state budget."""
+    budget = DecodedStateBudget(max_decoded_state_bytes)
     if isinstance(path_or_bytes, (bytes, bytearray, memoryview)):
         data = bytes(path_or_bytes)
     else:
@@ -554,6 +583,13 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                 if quant is None:
                     raise MalformedFile("a Chunk arrived before the Quantization record")
                 head, streams = rec.parse_chunk(record.content)
+                budget.check(
+                    gaussian_birth_decode_working_bytes(
+                        head.count,
+                        chunk_decoded_body_bytes(head, streams),
+                    ),
+                    f"streamed Chunk decode at byte {record.offset}",
+                )
                 decoded = decode_streams(
                     chunk_stream_bytes(head, streams),
                     head.count,
@@ -562,6 +598,10 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                     windows,
                     header.cutoff if header else DEFAULT_CUTOFF,
                     record_offset=record.offset,
+                )
+                budget.retain(
+                    array_capacity_bytes(decoded),
+                    f"streamed Chunk collection after byte {record.offset}",
                 )
                 chunks.append(decoded)
                 decoded_chunk_rows[record.offset] = len(decoded["positions"])
@@ -574,6 +614,14 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                     band_cursor = Cursor(record.content)
                     band = band_cursor.u8()
                     if band <= max_sh_band:
+                        rows = len(chunks[-1]["mu_t"])
+                        channels = 3 * (2 * band + 1)
+                        # The decoded int64 coefficients and the vectorised stream
+                        # scratch coexist with every earlier decoded Chunk.
+                        budget.check(
+                            rows * channels * 40 + len(record.content),
+                            f"streamed SH band {band} decode at byte {record.offset}",
+                        )
                         attribute, values = decode_stream(band_cursor)
                         if attribute != op.SH_BAND_STREAM:
                             raise MalformedFile(
@@ -581,6 +629,10 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                                 f"{attribute}; version 1 fixes it at {op.SH_BAND_STREAM}"
                             )
                         chunk_bands[-1][band] = values
+                        budget.retain(
+                            array_capacity_bytes(values),
+                            f"streamed SH band {band} collection after byte {record.offset}",
+                        )
             elif record.opcode == op.AUDIO:
                 if first_audio_record is None:
                     first_audio_record = ("Audio", record.offset, None)
@@ -763,7 +815,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
         )
     scene.skipped_opcodes = skipped
     scene.truncated = truncated
-    scene.gaussians = _assemble(chunks, windows, header, chunk_bands)
+    scene.gaussians = _assemble(chunks, windows, header, chunk_bands, budget=budget)
     return scene
 
 
@@ -793,7 +845,14 @@ def _audio_source(source: rec.AudioSource, data: bytes) -> AudioSource:
     )
 
 
-def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> GaussianSet:
+def _assemble(
+    chunks: list[dict],
+    windows,
+    header,
+    chunk_bands=None,
+    *,
+    budget: DecodedStateBudget | None = None,
+) -> GaussianSet:
     if not chunks:
         z3 = np.zeros((0, 3), dtype=np.float32)
         return GaussianSet(
@@ -808,19 +867,34 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
             win_hi=np.zeros(0, dtype=np.float64),
             sh_degree=header.sh_degree,
         )
+    count = sum(len(chunk["mu_t"]) for chunk in chunks)
+    sources = [chunk["source_index"] for chunk in chunks]
+    objects = [chunk["object_id"] for chunk in chunks]
+    present_bands = sorted({band for bands in (chunk_bands or []) for band in bands})
+    coefficients = SH_BAND_RANGE[present_bands[-1]][1] if present_bands else 0
+    output_bytes = gaussian_set_output_bytes(
+        count,
+        sh_coefficients=coefficients,
+        source_index=all(source is not None for source in sources),
+        object_id=any(object_ids is not None for object_ids in objects),
+    )
+    if budget is not None:
+        budget.check(
+            gaussian_assembly_working_bytes(count, output_bytes),
+            "gaussian-birth final scene assembly",
+        )
+
     table = window_table_or_default(windows)
     idx = np.concatenate([c["window_index"] for c in chunks])
     check_window_indices(idx, len(table))
-    src = [c["source_index"] for c in chunks]
-    oid = [c["object_id"] for c in chunks]
     object_id = (
         np.concatenate(
             [
                 np.zeros(len(chunk["mu_t"]), dtype=np.uint32) if ids is None else ids
-                for chunk, ids in zip(chunks, oid, strict=True)
+                for chunk, ids in zip(chunks, objects, strict=True)
             ]
         )
-        if any(ids is not None for ids in oid)
+        if any(ids is not None for ids in objects)
         else None
     )
     sh = merge_chunk_bands([len(c["mu_t"]) for c in chunks], chunk_bands or [])
@@ -838,6 +912,6 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
         win_hi=np.asarray(table[idx, 1], dtype=np.float64),
         sh=sh,
         sh_degree=header.sh_degree,
-        source_index=np.concatenate(src) if all(s is not None for s in src) else None,
+        source_index=np.concatenate(sources) if all(source is not None for source in sources) else None,
         object_id=object_id,
     )

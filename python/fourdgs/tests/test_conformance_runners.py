@@ -80,15 +80,28 @@ def _large_finite_window_file() -> bytes:
     return output.getvalue()
 
 
-def _run(runner: str, data: bytes, tmp_path) -> subprocess.CompletedProcess:
+def _run(
+    runner: str,
+    data: bytes,
+    tmp_path,
+    *runner_args: str,
+) -> subprocess.CompletedProcess:
     path = tmp_path / "input.4dgs"
     path.write_bytes(data)
     return subprocess.run(
-        [sys.executable, os.path.join(CONFORMANCE, runner), str(path)],
+        [sys.executable, os.path.join(CONFORMANCE, runner), *runner_args, str(path)],
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_one_byte_decoded_state_budget_is_the_portable_resource_result(runner, tmp_path):
+    done = _run(runner, _large_finite_window_file(), tmp_path, "--max-decoded-state-bytes", "1")
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == '{"unsupported":"resource-limit"}'
+    assert done.stderr == ""
 
 
 @pytest.mark.parametrize("runner", RUNNERS)
