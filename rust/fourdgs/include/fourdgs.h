@@ -562,6 +562,18 @@ const float *fourdgs_scene_win_lo(const fourdgs_scene *scene);
 const float *fourdgs_scene_win_hi(const fourdgs_scene *scene);
 
 /**
+ * Producer grouping labels, 1 signed integer per resident gaussian, or null when the
+ * whole scene carries no `source_group` stream. Mixed Chunk presence is zero-filled.
+ */
+const int64_t *fourdgs_scene_source_groups(const fourdgs_scene *scene);
+
+/**
+ * Producer-stable source labels, 1 signed integer per resident gaussian, or null when the
+ * whole scene carries no `source_index` stream. Mixed Chunk presence is zero-filled.
+ */
+const int64_t *fourdgs_scene_source_indices(const fourdgs_scene *scene);
+
+/**
  * Spherical harmonic coefficients, or null when the scene carries none.
  *
  * 3 * fourdgs_scene_sh_coefficients() bytes per resident gaussian, component-major: every
@@ -971,6 +983,16 @@ int fourdgs_peek_temporal_model(const uint8_t *data, size_t length, const char *
                                 size_t *out_len);
 
 /**
+ * Copy one Header attribute value from bytes without decoding state.
+ *
+ * A missing key succeeds with null/zero output. A present value is owned by the caller and
+ * freed with fourdgs_string_free. Keys are length-delimited UTF-8.
+ */
+int fourdgs_peek_header_attribute(const uint8_t *data, size_t length,
+                                  const char *key, size_t key_len,
+                                  const char **out, size_t *out_len);
+
+/**
  * Decode a keyframe-delta file and return its canonical states JSON.
  *
  * `indexed == 0` walks the file front to back, composing each chunk onto the last; a non-zero
@@ -989,6 +1011,22 @@ int fourdgs_keyframe_delta_states_json(const uint8_t *data, size_t length, int i
  * 536870912 bytes.
  */
 int fourdgs_keyframe_delta_states_json_with_options(
+    const uint8_t *data, size_t length, int indexed,
+    uint64_t max_decoded_state_bytes, const char **out, size_t *out_len);
+
+/**
+ * Decode exact optional identities after every keyframe or delta record.
+ *
+ * Physically absent `source_group`, `source_index`, and `object_id` columns read as logical
+ * zero. Rows are ordered by gaussian id. Ownership, read-path selection and wrong-model
+ * behavior match fourdgs_keyframe_delta_states_json.
+ */
+int fourdgs_keyframe_delta_identity_states_json(
+    const uint8_t *data, size_t length, int indexed,
+    const char **out, size_t *out_len);
+
+/** As above, with a positive aggregate decoded-state ceiling. */
+int fourdgs_keyframe_delta_identity_states_json_with_options(
     const uint8_t *data, size_t length, int indexed,
     uint64_t max_decoded_state_bytes, const char **out, size_t *out_len);
 
@@ -1053,7 +1091,8 @@ int fourdgs_scene_object_states_json(fourdgs_scene *scene, const char **out, siz
 
 /**
  * Release a string owned by the caller — the result of fourdgs_peek_temporal_model,
- * fourdgs_keyframe_delta_states_json, fourdgs_scene_provenance_json or
+ * fourdgs_peek_header_attribute, fourdgs_keyframe_delta_states_json,
+ * fourdgs_keyframe_delta_identity_states_json, fourdgs_scene_provenance_json or
  * fourdgs_scene_objects_json. Null is ignored.
  * The length must be the one the producing call returned; the pair identifies the same
  * allocation.

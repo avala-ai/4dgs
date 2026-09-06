@@ -1013,6 +1013,30 @@ array_accessor!(
     "Validity window end in seconds, 1 float per resident gaussian. Borrowed until the next load."
 );
 
+/// Producer grouping labels, 1 signed integer per resident gaussian, or null when the
+/// whole scene carries no `source_group` stream. Mixed physical Chunk presence is
+/// materialized with logical zero rows. Borrowed until the next load.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_source_groups(scene: *const fourdgs_scene) -> *const i64 {
+    let scene = scene_or!(scene, std::ptr::null());
+    match scene.inner.loaded().source_group.as_ref() {
+        Some(ids) if !ids.is_empty() => ids.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
+/// Producer-stable source labels, 1 signed integer per resident gaussian, or null when the
+/// whole scene carries no `source_index` stream. Mixed physical Chunk presence is
+/// materialized with logical zero rows. Borrowed until the next load.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_source_indices(scene: *const fourdgs_scene) -> *const i64 {
+    let scene = scene_or!(scene, std::ptr::null());
+    match scene.inner.loaded().source_index.as_ref() {
+        Some(ids) if !ids.is_empty() => ids.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
 /// Object membership, 1 unsigned integer per resident gaussian, or null when the scene
 /// carries no `object_id` stream (spec §6.6).
 ///
@@ -2363,6 +2387,7 @@ pub unsafe extern "C" fn fourdgs_writer_set_gaussians(
             sh: None,
             sh_coefficients: 0,
             sh_degree: 0,
+            source_group: None,
             source_index: None,
             // The C ABI encode surface does not carry object_id; a file written through it
             // groups nothing. The reader still surfaces it when a file has one.
@@ -2546,6 +2571,53 @@ pub unsafe extern "C" fn fourdgs_peek_temporal_model(
     })
 }
 
+/// Copy one Header attribute value from bytes without decoding state.
+///
+/// A missing key succeeds with null/zero output. A present value is owned by the caller and
+/// freed with [`fourdgs_string_free`].
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_peek_header_attribute(
+    data: *const u8,
+    length: usize,
+    key: *const c_char,
+    key_len: usize,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    guarded(|| {
+        if out.is_null() || out_len.is_null() {
+            set_last_error("a string out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(bytes) = borrow_bytes(data, length) else {
+            set_last_error("a non-empty buffer was passed as null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let Some(key_bytes) = borrow_bytes(key.cast::<u8>(), key_len) else {
+            set_last_error("a non-empty attribute key was passed as null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(key) = std::str::from_utf8(key_bytes) else {
+            set_last_error("the Header attribute key is not valid UTF-8".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        match crate::keyframe_delta_file::peek_header(bytes) {
+            Ok(header) => match header.attributes.get(key) {
+                Some(value) => put_owned_string(value.clone(), out, out_len),
+                None => {
+                    // SAFETY: both output pointers were checked non-null above.
+                    unsafe {
+                        *out = std::ptr::null();
+                        *out_len = 0;
+                    }
+                    FOURDGS_STATUS_OK
+                }
+            },
+            Err(e) => report(e),
+        }
+    })
+}
+
 /// Decode a `keyframe-delta` file and return its canonical states JSON.
 ///
 /// `indexed == 0` walks the file front to back, composing each chunk onto the last;
@@ -2575,19 +2647,40 @@ pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json(
     }
 }
 
-/// Decode a `keyframe-delta` file under a caller-selected decoded-state budget.
+/// Decode a `keyframe-delta` file and return exact optional identities after every record.
 ///
-/// The budget reaches the decoded sequence collector unchanged. The canonical JSON returned by
-/// this ABI is serialization output, not decoded gaussian state or decode working storage, and
-/// §3.3 does not include serialization buffers in the decoded-state boundary.
+/// Physically absent `source_group`, `source_index`, and `object_id` columns read as logical
+/// zero. Rows are ordered by gaussian id. The ownership, read-path and temporal-model
+/// contracts are the same as [`fourdgs_keyframe_delta_states_json`].
 #[no_mangle]
-pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json_with_options(
+pub unsafe extern "C" fn fourdgs_keyframe_delta_identity_states_json(
+    data: *const u8,
+    length: usize,
+    indexed: c_int,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    // SAFETY: forwarded with the shared default decoded-state budget.
+    unsafe {
+        fourdgs_keyframe_delta_identity_states_json_with_options(
+            data,
+            length,
+            indexed,
+            crate::stream_reader::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+            out,
+            out_len,
+        )
+    }
+}
+
+unsafe fn keyframe_delta_json_with_options(
     data: *const u8,
     length: usize,
     indexed: c_int,
     max_decoded_state_bytes: u64,
     out: *mut *const c_char,
     out_len: *mut usize,
+    project: fn(&crate::keyframe_delta_file::DecodedSequence) -> String,
 ) -> c_int {
     guarded(|| {
         if out.is_null() || out_len.is_null() {
@@ -2622,14 +2715,62 @@ pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json_with_options(
             crate::keyframe_delta_file::decode_streamed_with_options(bytes, &options)
         };
         match decoded {
-            Ok(seq) => put_owned_string(
-                crate::keyframe_delta_file::keyframe_delta_states_json(&seq),
-                out,
-                out_len,
-            ),
+            Ok(seq) => put_owned_string(project(&seq), out, out_len),
             Err(e) => report(e),
         }
     })
+}
+
+/// Decode a `keyframe-delta` file under a caller-selected decoded-state budget.
+///
+/// The budget reaches the decoded sequence collector unchanged. The canonical JSON returned by
+/// this ABI is serialization output, not decoded gaussian state or decode working storage, and
+/// §3.3 does not include serialization buffers in the decoded-state boundary.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json_with_options(
+    data: *const u8,
+    length: usize,
+    indexed: c_int,
+    max_decoded_state_bytes: u64,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    // SAFETY: the shared implementation validates every raw argument before use.
+    unsafe {
+        keyframe_delta_json_with_options(
+            data,
+            length,
+            indexed,
+            max_decoded_state_bytes,
+            out,
+            out_len,
+            crate::keyframe_delta_file::keyframe_delta_states_json,
+        )
+    }
+}
+
+/// Decode exact keyframe-delta identities under a caller-selected decoded-state budget.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_keyframe_delta_identity_states_json_with_options(
+    data: *const u8,
+    length: usize,
+    indexed: c_int,
+    max_decoded_state_bytes: u64,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    // SAFETY: the shared implementation validates every raw argument before use.
+    unsafe {
+        keyframe_delta_json_with_options(
+            data,
+            length,
+            indexed,
+            max_decoded_state_bytes,
+            out,
+            out_len,
+            crate::keyframe_delta_file::keyframe_delta_identity_states_json,
+        )
+    }
 }
 
 /// Canonical provenance JSON for an opened scene (spec §5.15).
@@ -3106,6 +3247,7 @@ pub unsafe extern "C" fn fourdgs_kd_writer_add_sample(
                 sh: None,
                 sh_coefficients: 0,
                 sh_degree: 0,
+                source_group: None,
                 source_index: None,
                 // As on the `gaussian-birth` encode surface, this ABI does not carry
                 // object membership; a file written through it groups nothing.

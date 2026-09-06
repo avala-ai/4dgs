@@ -1422,20 +1422,54 @@ fn composed_state_resident_bound(reference: &State, decoded: &DecodedDelta) -> R
         .bins
         .keys()
         .copied()
+        .chain(decoded.update_bins.keys().copied())
         .chain(decoded.birth_bins.keys().copied())
         .collect();
     total = total
         .checked_add(delta_bin_map_node_bytes(attributes.len())?)
         .ok_or_else(|| Error::UnsupportedOperation("composed state bytes overflow".into()))?;
     for attribute in attributes {
-        let base_len = reference
+        let is_optional_identity = crate::keyframe_delta::OPTIONAL_IDENTITY.contains(&attribute);
+        let channels = reference
             .bins
             .get(&attribute)
-            .map_or(0, |values| values.values.len());
-        let birth_len = decoded
-            .birth_bins
-            .get(&attribute)
-            .map_or(0, |values| values.values.len());
+            .or_else(|| decoded.update_bins.get(&attribute))
+            .or_else(|| decoded.birth_bins.get(&attribute))
+            .map_or(1, |values| values.channels);
+        let implicit_base_len = reference.ids.len().checked_mul(channels).ok_or_else(|| {
+            Error::UnsupportedOperation(format!(
+                "composed optional identity attribute {attribute} prefix count overflows"
+            ))
+        })?;
+        let base_len = reference.bins.get(&attribute).map_or_else(
+            || {
+                if is_optional_identity
+                    && (decoded.update_bins.contains_key(&attribute)
+                        || decoded.birth_bins.contains_key(&attribute))
+                {
+                    implicit_base_len
+                } else {
+                    0
+                }
+            },
+            |values| values.values.len(),
+        );
+        let birth_len = if is_optional_identity {
+            decoded
+                .birth_ids
+                .len()
+                .checked_mul(channels)
+                .ok_or_else(|| {
+                    Error::UnsupportedOperation(format!(
+                        "composed optional identity attribute {attribute} birth count overflows"
+                    ))
+                })?
+        } else {
+            decoded
+                .birth_bins
+                .get(&attribute)
+                .map_or(0, |values| values.values.len())
+        };
         let needed = base_len.checked_add(birth_len).ok_or_else(|| {
             Error::UnsupportedOperation(format!(
                 "composed attribute {attribute} value count overflows"
@@ -3651,6 +3685,88 @@ fn opt_int(v: Option<u32>) -> Json {
     }
 }
 
+/// The exact optional identities after every keyframe or delta record.
+///
+/// This is the narrow structural projection the C ABI exposes to bindings whose
+/// keyframe-delta path delegates composition to this crate. Physically absent identity
+/// columns read as logical zero, and rows are ordered by gaussian id so storage order is
+/// never part of the result.
+pub fn keyframe_delta_identity_states_json(seq: &DecodedSequence) -> String {
+    let identity = |state: &State, attribute: u8, row: usize| {
+        state
+            .bins
+            .get(&attribute)
+            .map_or(0, |values| values.values[row * values.channels])
+    };
+    Json::obj(vec![
+        ("temporalModel", Json::Str("keyframe-delta".into())),
+        (
+            "identityStates",
+            Json::Arr(
+                seq.chunks
+                    .iter()
+                    .map(|chunk| {
+                        let mut order: Vec<usize> = (0..chunk.state.count()).collect();
+                        order.sort_by_key(|&row| chunk.state.ids[row]);
+                        Json::obj(vec![
+                            ("t", num(chunk.t0)),
+                            (
+                                "rows",
+                                Json::Arr(
+                                    order
+                                        .into_iter()
+                                        .map(|row| {
+                                            let object_code =
+                                                identity(&chunk.state, op::A_OBJECT_ID, row);
+                                            let object_id = u32::from_le_bytes(
+                                                i32::try_from(object_code)
+                                                    .expect(
+                                                        "decoded object_id codes fit signed i32",
+                                                    )
+                                                    .to_le_bytes(),
+                                            );
+                                            Json::obj(vec![
+                                                (
+                                                    "sourceGroup",
+                                                    Json::Str(
+                                                        identity(
+                                                            &chunk.state,
+                                                            op::A_SOURCE_GROUP,
+                                                            row,
+                                                        )
+                                                        .to_string(),
+                                                    ),
+                                                ),
+                                                (
+                                                    "sourceIndex",
+                                                    Json::Str(
+                                                        identity(
+                                                            &chunk.state,
+                                                            op::A_SOURCE_INDEX,
+                                                            row,
+                                                        )
+                                                        .to_string(),
+                                                    ),
+                                                ),
+                                                ("objectId", int(object_id as u64)),
+                                                (
+                                                    "gaussianId",
+                                                    Json::Str(chunk.state.ids[row].to_string()),
+                                                ),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+    .to_json()
+}
+
 /// The statement two implementations are diffed on for a `keyframe-delta` file.
 ///
 /// `chunks` proves a decoder read `depth`, `deltaMode` and `liveCount` — a field no row
@@ -3753,23 +3869,27 @@ pub fn keyframe_delta_states_json(seq: &DecodedSequence) -> String {
     .to_json()
 }
 
-/// The Header's declared temporal model, read without decoding the body.
+/// Parse the Header without decoding any state body.
 ///
-/// A binding that dispatches on the temporal model needs it before it commits to a read
-/// path, and the ordinary open refuses a model this build's scene reader does not implement
-/// — so a keyframe-delta file cannot answer the question through an opened scene. This walks
-/// only as far as the Header record and reads the one field.
-pub fn peek_temporal_model(data: &[u8]) -> Result<String> {
+/// A binding may need the temporal model or a dispatch marker before it commits to a read
+/// path, while the ordinary scene opener can refuse an otherwise legal model it does not
+/// implement. This walks only as far as the Header record.
+pub fn peek_header(data: &[u8]) -> Result<rec::Header> {
     check_magic(data)?;
     for record in Records::new(data, MAGIC.len()) {
         let record = record?;
         if record.opcode == op::HEADER {
-            return Ok(rec::Header::parse(record.content)?.temporal_model);
+            return rec::Header::parse(record.content);
         }
     }
     Err(Error::Malformed(
-        "file has no Header record to read a temporal model from".into(),
+        "file has no Header record to inspect".into(),
     ))
+}
+
+/// The Header's declared temporal model, read without decoding the body.
+pub fn peek_temporal_model(data: &[u8]) -> Result<String> {
+    Ok(peek_header(data)?.temporal_model)
 }
 
 #[cfg(test)]

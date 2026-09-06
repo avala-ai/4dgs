@@ -27,6 +27,9 @@ use fourdgs::provenance::{pose_at, Pose, PoseSampled, Provenance};
 use fourdgs::records::{Attachment, Camera, Header, Metadata, Statistics, SummaryOffset};
 use fourdgs::Result;
 
+const OPTIONAL_IDENTITY_MARKER_KEY: &str = "conformance";
+const OPTIONAL_IDENTITY_MARKER_VALUE: &str = "optional-identity-zero-defaults-v1";
+
 pub const FLOAT_DECIMALS: usize = 6;
 /// How many gaussians appear in full. The aggregates cover the rest, so a decoder cannot
 /// pass by getting a prefix right.
@@ -217,6 +220,78 @@ fn numf(v: f32) -> J {
 /// An integer as a string, so a 64-bit value survives a JSON parser backed by doubles.
 pub fn int(v: u64) -> J {
     J::Str(v.to_string())
+}
+
+fn signed_int(v: i64) -> J {
+    J::Str(v.to_string())
+}
+
+/// Whether the shared corpus selected the narrow optional-identity canonical projection.
+pub fn is_optional_identity_witness(header: &Header) -> bool {
+    header
+        .attributes
+        .get(OPTIONAL_IDENTITY_MARKER_KEY)
+        .is_some_and(|value| value == OPTIONAL_IDENTITY_MARKER_VALUE)
+}
+
+/// Exact logical identity rows for the gaussian-birth optional-identity witness.
+pub fn optional_identity_gaussian_birth_json(gaussians: &GaussianSet) -> String {
+    let mut order: Vec<usize> = (0..gaussians.count()).collect();
+    order.sort_by(|&a, &b| {
+        (0..3)
+            .find_map(|component| {
+                gaussians.positions[a * 3 + component]
+                    .partial_cmp(&gaussians.positions[b * 3 + component])
+                    .filter(|ordering| *ordering != Ordering::Equal)
+            })
+            .unwrap_or(Ordering::Equal)
+    });
+    J::obj(vec![
+        ("temporalModel", J::Str("gaussian-birth".into())),
+        (
+            "identityRows",
+            J::Arr(
+                order
+                    .into_iter()
+                    .map(|row| {
+                        J::obj(vec![
+                            (
+                                "sourceGroup",
+                                signed_int(
+                                    gaussians.source_group.as_ref().map_or(0, |ids| ids[row]),
+                                ),
+                            ),
+                            (
+                                "sourceIndex",
+                                signed_int(
+                                    gaussians.source_index.as_ref().map_or(0, |ids| ids[row]),
+                                ),
+                            ),
+                            (
+                                "objectId",
+                                int(gaussians.object_id.as_ref().map_or(0, |ids| ids[row]) as u64),
+                            ),
+                            (
+                                "position",
+                                J::Arr(
+                                    gaussians.positions[row * 3..row * 3 + 3]
+                                        .iter()
+                                        .map(|value| numf(*value))
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+    .to_json()
+}
+
+/// Exact logical identity state after every keyframe or delta record in the witness.
+pub fn optional_identity_keyframe_delta_json(sequence: &DecodedSequence) -> String {
+    fourdgs::keyframe_delta_file::keyframe_delta_identity_states_json(sequence)
 }
 
 /// CRC-32 of a byte payload, as a string. Used where a summary needs to prove it read the

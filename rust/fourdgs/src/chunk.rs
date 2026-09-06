@@ -28,6 +28,11 @@ pub struct DecodedChunk {
     pub mu_t: Vec<f32>,
     pub sigma_t: Vec<f32>,
     pub window_index: Vec<u32>,
+    /// Per-gaussian producer grouping label, or `None` when every row in this physical
+    /// Chunk has the logical default `0`.
+    pub source_group: Option<Vec<i64>>,
+    /// Per-gaussian producer stable label, or `None` when every row in this physical
+    /// Chunk has the logical default `0`.
     pub source_index: Option<Vec<i64>>,
     /// Per-gaussian object membership, or `None` when the chunk carries no `object_id`
     /// stream. Exact: each signed stream code contributes its same 32 bits to the
@@ -222,6 +227,7 @@ pub(crate) fn decode_streams_with_limit(
             | op::A_SIGMA_T
             | op::A_FLAGS
             | op::A_WINDOW_INDEX
+            | op::A_SOURCE_GROUP
             | op::A_SOURCE_INDEX
             | op::A_OBJECT_ID => Some(1),
             _ => None,
@@ -321,6 +327,7 @@ pub(crate) fn decode_streams_with_limit(
         }
     }
     for (name, stream) in [
+        ("source_group", got.get(&op::A_SOURCE_GROUP)),
         ("source_index", got.get(&op::A_SOURCE_INDEX)),
         ("object_id", got.get(&op::A_OBJECT_ID)),
     ] {
@@ -361,8 +368,13 @@ pub(crate) fn decode_streams_with_limit(
     // validated. A malformed huge-count Chunk stays malformed; a structurally valid set
     // of constant streams reaches this implementation resource ceiling without ever
     // materializing the repeated rows.
-    let optional_state_bytes = usize::from(got.contains_key(&op::A_SOURCE_INDEX))
+    let optional_state_bytes = usize::from(got.contains_key(&op::A_SOURCE_GROUP))
         .checked_mul(8)
+        .and_then(|bytes| {
+            usize::from(got.contains_key(&op::A_SOURCE_INDEX))
+                .checked_mul(8)
+                .and_then(|source_bytes| bytes.checked_add(source_bytes))
+        })
         .and_then(|bytes| {
             usize::from(got.contains_key(&op::A_OBJECT_ID))
                 .checked_mul(4)
@@ -516,8 +528,13 @@ pub(crate) fn decode_streams_with_limit(
         out.mu_t.push(mu_value as f32);
     }
 
-    if let Some(src) = got.get(&op::A_SOURCE_INDEX) {
-        out.source_index = Some((0..count).map(|i| src.get(i, 0)).collect());
+    for (attribute, output) in [
+        (op::A_SOURCE_GROUP, &mut out.source_group),
+        (op::A_SOURCE_INDEX, &mut out.source_index),
+    ] {
+        if let Some(values) = got.get(&attribute) {
+            *output = Some((0..count).map(|i| values.get(i, 0)).collect());
+        }
     }
     if let Some(ids) = got.get(&op::A_OBJECT_ID) {
         if ids.channels != 1 {
