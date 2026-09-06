@@ -525,6 +525,22 @@ answers a question `gaussian_count` cannot: for a delta entry `gaussian_count` i
 a reader budgeting a decode needs the population. Both numbers are useful and neither substitutes
 for the other, so the entry carries both.
 
+These counts are pre-decode planning claims. A reader MAY use `gaussian_count` and, where present,
+`live_count` to plan a range read, size bounded working storage or report the indexed population
+before it fetches the described record; it need not decode an otherwise-unneeded entry merely to
+authenticate them. Once a reader or validator has decoded that entry, however, it MUST verify the
+claims against what it decoded. For a Chunk, `gaussian_count` is the number of validated gaussian
+rows. For a Delta Chunk, it is the number of validated operations across the `updates`, `births` and
+`deaths` groups (`update_count + birth_count + death_count` after the group rows have been
+validated). For every extended entry whose state has been composed, `live_count` is the resulting
+live population, including for a keyframe entry. This obligation applies only to entries the reader
+or validator decoded; it does not turn an indexed read into a scan of unrelated chunks.
+
+A reader or validator MUST refuse any such disagreement with the shared refusal identifier
+`index-record-mismatch`. The diagnosis MUST name the Chunk Index entry, the `gaussian_count` or
+`live_count` field, its declared value and the decoded row, operation or population count that was
+expected.
+
 ### 5.9 Audio — opcode `0x09` (legacy)
 
 The pre-spatial single-track representation. Readers MUST continue to accept it; writers SHOULD emit
@@ -1653,6 +1669,7 @@ and the text was the bug.
 | §5.3 added: the grammar a `bounds` value is spelled by, and that two bounds are compared as numbers rather than as bytes                  | clarification, rule added |
 | §4 added: Header, Quantization and Window Table appear exactly once, and a reader MUST refuse a file carrying two of any of them          | rule added                |
 | §5.3 added: `step_time` MUST be strictly positive and a reader refuses a non-positive value                                               | rule added                |
+| §5.8 added: decoded Chunk Index counts MUST agree with parsed operations and the composed population                                      | clarification, rule added |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
 opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append
