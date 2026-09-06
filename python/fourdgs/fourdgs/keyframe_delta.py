@@ -56,22 +56,14 @@ BIN_MAX = 2**31 - 1
 #: restated absolutely instead of forbidden — see `ABSOLUTE_IN_UPDATE`.
 GOP_INVARIANT = frozenset({op.A_SIGMA_T, op.A_FLAGS, op.A_WINDOW_INDEX})
 
-#: Attributes an update restates outright rather than differencing.
-ABSOLUTE_IN_UPDATE = frozenset({op.A_ROTATION_INDEX, op.A_ROTATION})
+#: The three optional exact-label lanes. Complete states and births default an omitted
+#: lane to zero; updates carry it forward when absent and replace it absolutely when
+#: present. They are labels, not coordinates on a quantization grid, so subtraction has
+#: no semantic meaning (spec §6.1 and §11.3).
+ZERO_DEFAULT_IDENTITY = frozenset({op.A_SOURCE_GROUP, op.A_SOURCE_INDEX, op.A_OBJECT_ID})
 
-#: The attribute a row may lack and still have a value: §6.6 says a chunk omitting
-#: `object_id` "is read as though every gaussian in that chunk carried `0`". That is the
-#: only such rule in the specification, so it is the only lane that pads here.
-#:
-#: `source_group` and `source_index` are *not* in this set, though §6.1 calls them optional
-#: too. Optional says a file may omit the stream; it does not say what a composed column
-#: holds for a row whose birth omitted it, and no section supplies a value the way §6.6
-#: does for `object_id`. Padding them with zero would be this reader inventing a label
-#: rather than reading one. TypeScript and Swift exempt `object_id` alone; Dart also
-#: exempts the two producer lanes and Rust exempts nothing at all, so the six do not yet
-#: agree and §5.18 — a birth carries "the full required attribute set", which excludes all
-#: three — does not settle which of them is right. That is a specification question.
-ZERO_DEFAULT_IDENTITY = frozenset({op.A_OBJECT_ID})
+#: Attributes an update restates outright rather than differencing.
+ABSOLUTE_IN_UPDATE = frozenset({op.A_ROTATION_INDEX, op.A_ROTATION}) | ZERO_DEFAULT_IDENTITY
 
 
 @dataclass
@@ -181,11 +173,15 @@ def apply_delta(
                     f"{update_ids.shape[0]}",
                     "stream-element-count-mismatch",
                 )
-            if attribute not in state.bins:
+            if attribute not in state.bins and attribute not in ZERO_DEFAULT_IDENTITY:
                 raise _refuse(
                     f"an update touches attribute {attribute}, which the referenced state does not carry",
                     "unknown-attribute-in-update",
                 )
+            if attribute not in state.bins:
+                # A physically absent identity lane is a logical population-length zero
+                # column. Materialize it only when an update supplies a non-zero row.
+                state.bins[attribute] = np.zeros((state.count, *delta.shape[1:]), dtype=np.int64)
             if attribute in ABSOLUTE_IN_UPDATE:
                 _check_absolute_bins(attribute, delta, "an absolute update")
                 state.bins[attribute][rows] = delta

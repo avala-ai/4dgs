@@ -117,12 +117,15 @@ def gaussian_set_output_bytes(
     count: int,
     *,
     sh_coefficients: int,
+    source_group: bool,
     source_index: bool,
     object_id: bool,
 ) -> int:
     """Element capacity of the ``GaussianSet`` that assembly is about to allocate."""
     # f32 position/scale/rotation/RGBA/motion/mu/sigma plus two f64 window endpoints.
     per_row = 92 + 3 * int(sh_coefficients)
+    if source_group:
+        per_row += 8  # decoded source groups retain their int64 stream width
     if source_index:
         per_row += 8  # decoded source indexes retain their int64 stream width
     if object_id:

@@ -23,6 +23,7 @@ from fourdgs import keyframe_delta_file as kdf
 from fourdgs.opcode import HEADER
 from fourdgs.records import Header
 from fourdgs.serialization import MAGIC, check_magic, iter_records
+from optional_identity import gaussian_birth_rows, is_witness, keyframe_delta_states
 from refusal import refusal_answer
 
 #: Variants this runner declines. Empty: the reference implementation supports the whole
@@ -57,10 +58,13 @@ def run(path: str, *, max_decoded_state_bytes: int = fourdgs.DEFAULT_MAX_DECODED
         # reconstruction — not a whole-population summary — is what the SDKs are diffed on.
         # Truncation recovery is a gaussian-birth check: the states canonical is a
         # different statement and a cut file is a different file.
-        return canonical(kdf.states_json(kdf.decode_streamed(data, max_decoded_state_bytes=max_decoded_state_bytes)))
+        decoded = kdf.decode_streamed(data, max_decoded_state_bytes=max_decoded_state_bytes)
+        return canonical(keyframe_delta_states(decoded) if is_witness(decoded.header) else kdf.states_json(decoded))
 
     scene = fourdgs.read(path, max_decoded_state_bytes=max_decoded_state_bytes)
     _check_truncation_recovery(path, scene, max_decoded_state_bytes)
+    if is_witness(scene.header):
+        return canonical(gaussian_birth_rows(scene.gaussians))
     return canonical(
         summarize(
             scene.header,

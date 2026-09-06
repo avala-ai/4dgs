@@ -222,11 +222,14 @@ class GaussianSet:
     win_hi: np.ndarray  # (n,) f64 when decoded
     sh: np.ndarray | None = None  # (n, coeffs*3) u8
     sh_degree: int = 0
+    #: Exact producer labels. ``None`` preserves the storage fact that every decoded
+    #: Chunk omitted the lane; its logical value is still an all-zero column.
     source_group: np.ndarray | None = None
     source_index: np.ndarray | None = None
-    #: Per-gaussian object membership (spec section 6.6), or `None` when the file
-    #: carries no `object_id` stream. Exact integers, `0` = background/unassigned; the
-    #: object layer's tracks transform the gaussians of a given id (see `object_layer`).
+    #: Per-gaussian object membership (spec section 6.6). ``None`` means every decoded
+    #: Chunk omitted the stream and is logically an all-zero column. Exact integers,
+    #: `0` = background/unassigned; the object layer's tracks transform the gaussians of
+    #: a given id (see `object_layer`).
     object_id: np.ndarray | None = None
 
     @property
