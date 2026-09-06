@@ -115,6 +115,16 @@ def steps_from(q: rec.Quantization) -> Steps:
     )
 
 
+def check_index_count(entry: rec.ChunkIndexEntry, field: str, observed: int, observation: str) -> None:
+    """Refuse an index count that disagrees with content this reader decoded."""
+    declared = getattr(entry, field)
+    if declared != observed:
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} declares {field} {declared}; {observation} is {observed}",
+            code="index-record-mismatch",
+        )
+
+
 def decode_chunk_blob(
     chunk_record: bytes, steps: Steps, origin: np.ndarray, windows, cutoff: float = DEFAULT_CUTOFF
 ) -> dict:
@@ -362,6 +372,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     quant: rec.Quantization | None = None
     windows: list[tuple[float, float]] = []
     chunks: list[dict] = []
+    decoded_chunk_rows: dict[int, int] = {}
     chunk_bands: list[dict[int, np.ndarray]] = []
     scene = Scene(header=None, gaussians=None, duration_sec=0.0)  # type: ignore[arg-type]
     skipped: list[int] = []
@@ -401,16 +412,16 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                 if quant is None:
                     raise MalformedFile("a Chunk arrived before the Quantization record")
                 head, streams = rec.parse_chunk(record.content)
-                chunks.append(
-                    decode_streams(
-                        chunk_stream_bytes(head, streams),
-                        head.count,
-                        steps_from(quant),
-                        np.asarray(quant.pos_origin),
-                        windows,
-                        header.cutoff if header else DEFAULT_CUTOFF,
-                    )
+                decoded = decode_streams(
+                    chunk_stream_bytes(head, streams),
+                    head.count,
+                    steps_from(quant),
+                    np.asarray(quant.pos_origin),
+                    windows,
+                    header.cutoff if header else DEFAULT_CUTOFF,
                 )
+                chunks.append(decoded)
+                decoded_chunk_rows[record.offset] = len(decoded["positions"])
                 chunk_bands.append({})
             elif record.opcode == op.SH_BAND_STREAM:
                 # Bands belong to the chunk that precedes them. A front-to-back reader
@@ -523,6 +534,15 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
 
     if header is None or quant is None:
         raise MalformedFile("file has no Header or no Quantization record")
+
+    # The summary follows the chunks in a streamed file, so the cross-check necessarily
+    # happens here rather than while each row is decoded. Keep only one integer per Chunk,
+    # not another population. An index entry whose record was not decoded is deliberately
+    # left alone: §5.8 does not turn a selective read into a scan of unrelated content.
+    for entry in scene.chunk_index:
+        rows = decoded_chunk_rows.get(entry.chunk_offset)
+        if rows is not None:
+            check_index_count(entry, "gaussian_count", rows, "the decoded Chunk's validated gaussian row count")
 
     # The cross-record rules — unique sensor names, a rig reference that resolves —
     # can only run once the whole front matter has gone past. A truncated file may

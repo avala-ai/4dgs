@@ -71,7 +71,7 @@ from .serialization import (
     encode_stream,
     iter_records,
 )
-from .stream_reader import check_sh_codes, check_window_indices, chunk_stream_bytes
+from .stream_reader import check_index_count, check_sh_codes, check_window_indices, chunk_stream_bytes
 
 #: Matches `tests/conformance/canonical.py`: integers are strings so a 64-bit value
 #: survives a double-backed JSON parser, floats are rounded before comparison, a
@@ -827,6 +827,7 @@ def decode_streamed(data: bytes) -> DecodedSequence:
     windows: list[tuple[float, float]] = []
     chunks: list[ChunkInfo] = []
     by_offset: dict[int, State] = {}
+    index: list[rec.ChunkIndexEntry] = []
 
     for record in iter_records(data, len(MAGIC)):
         if record.opcode == op.HEADER:
@@ -885,9 +886,16 @@ def decode_streamed(data: bytes) -> DecodedSequence:
                     state,
                 )
             )
+        elif record.opcode == op.CHUNK_INDEX:
+            index.append(rec.ChunkIndexEntry.parse(record.content))
 
     if header is None or quant is None:
         raise MalformedFile("keyframe-delta file has no Header or Quantization record")
+    decoded_by_offset = {chunk.offset: chunk for chunk in chunks}
+    for entry in index:
+        chunk = decoded_by_offset.get(entry.chunk_offset)
+        if chunk is not None:
+            _check_decoded_entry_counts(entry, chunk)
     return DecodedSequence(header=header, quantization=quant, windows=windows, chunks=chunks)
 
 
@@ -1106,13 +1114,27 @@ def _check_entry_against_record(entry: rec.ChunkIndexEntry, head: rec.DeltaChunk
                 f"the Delta Chunk record there declares {in_record}",
                 code="index-record-mismatch",
             )
-    declared = int(head.update_count) + int(head.birth_count) + int(head.death_count)
-    if entry.gaussian_count != declared:
-        raise MalformedFile(
-            f"the chunk index entry at {entry.chunk_offset} declares gaussian_count {entry.gaussian_count}; "
-            f"the Delta Chunk record there declares {declared} gaussians across its three groups",
-            code="index-record-mismatch",
-        )
+    operations = int(head.update_count) + int(head.birth_count) + int(head.death_count)
+    check_index_count(
+        entry,
+        "gaussian_count",
+        operations,
+        "the decoded Delta Chunk's validated operation count",
+    )
+
+
+def _check_decoded_entry_counts(entry: rec.ChunkIndexEntry, chunk: ChunkInfo) -> None:
+    """Verify both count claims against one state already decoded front to back."""
+    if chunk.kind == 0:
+        operations = chunk.state.count
+        observation = "the decoded keyframe's validated gaussian row count"
+    else:
+        assert chunk.update_count is not None and chunk.birth_count is not None and chunk.death_count is not None
+        operations = chunk.update_count + chunk.birth_count + chunk.death_count
+        observation = "the decoded Delta Chunk's validated operation count"
+    check_index_count(entry, "gaussian_count", operations, observation)
+    if entry.extended:
+        check_index_count(entry, "live_count", chunk.state.count, "the composed state's live population")
 
 
 def compose_chain(
@@ -1234,12 +1256,12 @@ def compose_chain(
                     f"[{head.t0}, {head.t1})",
                     code="index-record-mismatch",
                 )
-            if link.extended and link.gaussian_count != state.count:
-                raise MalformedFile(
-                    f"the chunk index entry at {link.chunk_offset} declares gaussian_count "
-                    f"{link.gaussian_count}; the keyframe chunk there carries {state.count}",
-                    code="index-record-mismatch",
-                )
+            check_index_count(
+                link,
+                "gaussian_count",
+                state.count,
+                "the decoded keyframe's validated gaussian row count",
+            )
             _check_keyframe_mu_t(head.t0, bins, grids)
             reference_level = int(head.level)
             composed_at = link.chunk_offset
@@ -1261,16 +1283,10 @@ def compose_chain(
                     f"its reference at {reference_at} declares level {reference_level}",
                     code="index-record-mismatch",
                 )
+        if link.extended:
+            check_index_count(link, "live_count", state.count, "the composed state's live population")
     if state is None:
         raise MalformedFile("a chain with no chunks in it", code="chain-without-keyframe")
-    # `live_count` is the population after composition — the number a seeking consumer
-    # budgets against — and it is the one index field only a decode can check.
-    if entry.extended and entry.live_count != state.count:
-        raise MalformedFile(
-            f"the chunk index entry at {entry.chunk_offset} declares live_count {entry.live_count}; "
-            f"composing its chain produces {state.count} gaussians",
-            code="index-record-mismatch",
-        )
     check_window_indices_of(state, windows)
     _decode_index_bands(data, entry)
     return state
@@ -1503,12 +1519,12 @@ def scan_indexed(
                     f"[{head.t0}, {head.t1})",
                     code="index-record-mismatch",
                 )
-            if entry.gaussian_count != state.count:
-                raise MalformedFile(
-                    f"the chunk index entry at {entry.chunk_offset} declares gaussian_count "
-                    f"{entry.gaussian_count}; the keyframe chunk there carries {state.count}",
-                    code="index-record-mismatch",
-                )
+            check_index_count(
+                entry,
+                "gaussian_count",
+                state.count,
+                "the decoded keyframe's validated gaussian row count",
+            )
             _check_keyframe_mu_t(head.t0, bins, grids)
             if entry.extended and (
                 entry.keyframe_offset != entry.chunk_offset
@@ -1588,12 +1604,8 @@ def scan_indexed(
             # population bound in this suspended generator frame across the yield below.
             reference = None
 
-        if entry.extended and entry.live_count != state.count:
-            raise MalformedFile(
-                f"the chunk index entry at {entry.chunk_offset} declares live_count {entry.live_count}; "
-                f"composition produces {state.count} gaussians",
-                code="index-record-mismatch",
-            )
+        if entry.extended:
+            check_index_count(entry, "live_count", state.count, "the composed state's live population")
         check_window_indices_of(state, windows)
         _decode_index_bands(data, entry, on_band)
         yield entry, state

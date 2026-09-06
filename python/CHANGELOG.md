@@ -8,6 +8,12 @@ All notable changes to the Python package are documented here, following
 
 ### Changed
 
+- **Decoded Chunk Index counts are verified as `index-record-mismatch`.** Both ordinary read paths
+  now compare `gaussian_count` with validated Chunk rows or Delta operations, and keyframe-delta
+  reads compare `live_count` with every composed state, keyframes included. The check runs only for
+  entries the read decoded, so selecting an unrelated GOP does not expand into a whole-file scan.
+  Diagnostics name the entry, field, declared value and observed row, operation or population count.
+
 - **A finite `step_time` of zero or less is refused as `non-positive-step-time` before
   dequantization.** The birth-time grid formula divides by this field. Zero therefore made Python
   propagate NaN into every reconstructed birth time while another SDK threw, and a negative value

@@ -29,7 +29,7 @@ from .provenance import Provenance
 from .readable import Readable
 from .registry import check_quantization_scheme, check_temporal_model
 from .serialization import MAGIC, Cursor, check_magic, crc32, iter_records, read_record
-from .stream_reader import check_sh_codes, chunk_stream_bytes, decode_streams, steps_from
+from .stream_reader import check_index_count, check_sh_codes, chunk_stream_bytes, decode_streams, steps_from
 
 #: One read of this size from the front covers the header records of every scene measured
 #: so far. A larger header costs one extra round trip, never a wrong parse.
@@ -377,7 +377,6 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
     for field_name, indexed, actual in (
         ("t0", entry.t0, head.t0),
         ("t1", entry.t1, head.t1),
-        ("gaussian_count", entry.gaussian_count, head.count),
     ):
         if indexed != actual:
             raise MalformedFile(
@@ -392,6 +391,12 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
         np.asarray(scene.quantization.pos_origin),
         scene.windows,
         scene.header.cutoff,
+    )
+    check_index_count(
+        entry,
+        "gaussian_count",
+        len(decoded["positions"]),
+        "the decoded Chunk's validated gaussian row count",
     )
     decoded["sh"] = {}
     for band, offset, length in entry.bands:

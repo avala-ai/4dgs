@@ -28,18 +28,22 @@ import sys
 import fourdgs
 import numpy as np
 import pytest
+from fourdgs import keyframe_delta_file as kdf
 from fourdgs.exceptions import MalformedFile, TruncatedFile
 from fourdgs.indexed_reader import open_indexed
 from fourdgs.readable import BytesReadable
 
 CONFORMANCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "conformance")
-INVALID_GENERATOR = os.path.join(CONFORMANCE, "..", "..", "tests", "conformance", "generator")
+SHARED_CONFORMANCE = os.path.join(CONFORMANCE, "..", "..", "tests", "conformance")
+INVALID_GENERATOR = os.path.join(SHARED_CONFORMANCE, "generator")
 RUNNERS = ("decode_streamed.py", "decode_indexed.py")
 
 #: The runners are scripts beside the package rather than part of it, so the classifier
 #: they share is imported the way they import each other.
 sys.path.insert(0, CONFORMANCE)
+sys.path.insert(0, SHARED_CONFORMANCE)
 sys.path.insert(0, INVALID_GENERATOR)
+import generate
 import invalid
 from refusal import CODES, refusal_answer
 
@@ -130,6 +134,63 @@ def test_non_positive_step_time_is_one_named_refusal_on_both_read_paths(value, t
         done = _run(runner, data, tmp_path)
         assert done.returncode == 0, f"{runner} failed: {done.stderr}"
         assert json.loads(done.stdout) == {"refused": "non-positive-step-time"}
+
+
+def _index_count_base() -> bytes:
+    return next(
+        data for name, data, _expectation in generate.build_keyframe_delta_corpus() if name == invalid.INDEX_COUNT_BASE
+    )
+
+
+@pytest.mark.parametrize("refusal", invalid.INDEX_COUNT_REFUSALS, ids=lambda refusal: refusal.name)
+def test_index_count_mismatches_are_one_named_refusal_on_both_read_paths(refusal, tmp_path):
+    base = _index_count_base()
+    data = refusal.mutate(base)
+    opened = kdf.open_indexed(data)
+    wrong = next(entry for entry in opened.index if entry.kind == 1)
+    field = "gaussian_count" if "Gaussian" in refusal.name else "live_count"
+    declared = getattr(wrong, field)
+    decoded = next(chunk for chunk in kdf.decode_streamed(base).chunks if chunk.offset == wrong.chunk_offset)
+    observed = (
+        decoded.update_count + decoded.birth_count + decoded.death_count
+        if field == "gaussian_count"
+        else decoded.state.count
+    )
+
+    # The whole streamed decoder and the ordinary indexed decoder both own the rule.
+    for decode in (kdf.decode_streamed, kdf.decode_indexed):
+        with pytest.raises(MalformedFile) as caught:
+            decode(data)
+        assert caught.value.code == "index-record-mismatch"
+        message = str(caught.value)
+        assert f"chunk index entry at {wrong.chunk_offset}" in message
+        assert f"declares {field} {declared}" in message
+        assert f"is {observed}" in message
+
+    # A selected entry also verifies every state in its required chain. The wrong first
+    # delta is an intermediate of the next delta, not the selected entry itself.
+    selected = opened.index[2]
+    assert selected.reference_offset == wrong.chunk_offset
+    with pytest.raises(MalformedFile) as caught:
+        kdf.compose_chain(data, opened.index, selected, opened.windows, opened.grids)
+    assert caught.value.code == "index-record-mismatch"
+    assert f"chunk index entry at {wrong.chunk_offset}" in str(caught.value)
+
+    for runner in RUNNERS:
+        done = _run(runner, data, tmp_path)
+        assert done.returncode == 0, f"{runner} failed: {done.stderr}"
+        assert json.loads(done.stdout) == {"refused": "index-record-mismatch"}
+
+
+@pytest.mark.parametrize("refusal", invalid.INDEX_COUNT_REFUSALS, ids=lambda refusal: refusal.name)
+def test_an_index_count_mismatch_in_an_unrelated_gop_does_not_expand_a_seek(refusal):
+    data = refusal.mutate(_index_count_base())
+    opened = kdf.open_indexed(data)
+    later_keyframe = next(entry for entry in opened.index if entry.kind == 0 and entry.t0 > 0)
+
+    state = kdf.compose_chain(data, opened.index, later_keyframe, opened.windows, opened.grids)
+
+    assert state.count == later_keyframe.live_count
 
 
 def test_large_finite_window_endpoint_agrees_on_both_read_paths(tmp_path):
