@@ -21,7 +21,7 @@
     }
   },
   "bin": {
-    "4dgs": "./dist/cli.js"
+    "4dgs": "dist/cli.js"
   },
   "files": [
     "dist"
