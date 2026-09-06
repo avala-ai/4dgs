@@ -1430,6 +1430,30 @@ def _expect_failure(what: str, call, substring: str) -> str:
     raise AssertionError(f"{what}: the check passed, so it does not bite")
 
 
+def _expect_index_count_failure(what: str, call, assertion_field: str, refusal_field: str) -> str:
+    """Accept the independent count check or the decoder's exact named refusal.
+
+    Decoder layers acquire this check one at a time. Before they do, this gate's own
+    independent assertion is the failure; afterwards the decoder can reject the same lie
+    first. A generic malformed-file error is not evidence that the count check bit.
+    """
+    try:
+        call()
+    except AssertionError as exc:
+        if assertion_field not in str(exc):
+            raise AssertionError(f"{what}: expected an assertion containing {assertion_field!r}, got:\n{exc}") from None
+        return str(exc).splitlines()[0]
+    except fourdgs.MalformedFile as exc:
+        count_diagnostic = f"declares {refusal_field} "
+        if exc.code != "index-record-mismatch" or count_diagnostic not in str(exc):
+            raise AssertionError(
+                f"{what}: expected refusal code 'index-record-mismatch' with a {refusal_field} "
+                f"count diagnostic, got code {exc.code!r}:\n{exc}"
+            ) from None
+        return str(exc).splitlines()[0]
+    raise AssertionError(f"{what}: the check passed, so it does not bite")
+
+
 def _test_tolerance_is_read_from_the_file(tmp: str) -> list[str]:
     """The tolerance follows the file's declared bounds, and is not a number chosen here.
 
@@ -1783,7 +1807,14 @@ def _test_index_counts_bite(tmp: str) -> list[str]:
         entry.gaussian_count, entry.live_count = entry.live_count, entry.gaussian_count
 
     _rewrite_index_entry(keyframe, swapped, swap, select=lambda e: e.kind == 1)
-    said.append(_expect_failure("index/keyframe-delta", lambda: check_index_counts(swapped), "live_count"))
+    said.append(
+        _expect_index_count_failure(
+            "index/keyframe-delta",
+            lambda: check_index_counts(swapped),
+            assertion_field="live_count",
+            refusal_field="gaussian_count",
+        )
+    )
 
     bad_kind = os.path.join(tmp, "index-kind.4dgs")
     _rewrite_index_entry(keyframe, bad_kind, lambda e: setattr(e, "kind", 7))
