@@ -249,7 +249,8 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   // before the next record is read.
   final Map<int, int> audioSources = <int, int>{};
   final Map<int, int> audioData = <int, int>{};
-  bool firstChunkSeen = false;
+  int? firstStateOpcode;
+  int? firstStateOffset;
   bool legacyAudioSeen = false;
   // A front-matter refusal makes the reader passes below pointless: the reader
   // would refuse the same record for the same reason at the same byte, and a
@@ -271,6 +272,27 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
         break;
       }
       if (firstOpcode < 0) firstOpcode = frame.opcode;
+      if (firstStateOffset != null && isFrontMatterOpcode(frame.opcode)) {
+        final FourdgsMalformedFile error = lateFrontMatterRecord(
+          lateOpcode: frame.opcode,
+          lateOffset: frame.offset,
+          firstStateOpcode: firstStateOpcode!,
+          firstStateOffset: firstStateOffset,
+        );
+        report.refused(
+          '',
+          error,
+          site: FourdgsRefusalSite(
+            frame.offset,
+            'the ${opcodeName(frame.opcode)} record',
+          ),
+        );
+        return FourdgsValidation(report.findings);
+      }
+      if (firstStateOffset == null && isStateOpcode(frame.opcode)) {
+        firstStateOpcode = frame.opcode;
+        firstStateOffset = frame.offset;
+      }
       seen.add(frame.opcode);
       if (frame.opcode == opChunkIndex ||
           frame.opcode == opStatistics ||
@@ -341,7 +363,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
           }
         case opChunk:
         case opDeltaChunk:
-          firstChunkSeen = true;
           chunkCount += 1;
           try {
             if (frame.opcode == opChunk) {
@@ -440,11 +461,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
           try {
             final FourdgsAudioSourceRecord parsed =
                 FourdgsAudioSourceRecord.parse(await _bytesOf(source, frame));
-            if (firstChunkSeen) {
-              report.error(
-                'Audio Source id ${parsed.sourceId} appears after the first Chunk',
-              );
-            }
             if (audioSources.containsKey(parsed.sourceId)) {
               report.error(
                 'Audio Source id ${parsed.sourceId} appears more than once',
@@ -475,11 +491,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
               await _bytesOf(source, frame, most: audioDataHeadBytes),
               frame,
             );
-            if (firstChunkSeen) {
-              report.error(
-                'Audio Data id ${parsed.sourceId} appears after the first Chunk',
-              );
-            }
             if (audioData.containsKey(parsed.sourceId)) {
               report.error(
                 'Audio Data id ${parsed.sourceId} appears more than once',

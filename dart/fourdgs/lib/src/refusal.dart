@@ -13,7 +13,9 @@
 /// So the tool supplies it. Most refusal identifiers are about exactly one kind
 /// of record, and a framing walk knows where every record is. The decoded-f32
 /// refusal can belong to a Chunk or Delta Chunk, so the decoder supplies that
-/// physical state-record site when it catches the failure. That is the whole
+/// physical state-record site when it catches the failure. A late-front-matter
+/// refusal can name any record in that placement class, so the validator passes
+/// the specific late record's site from the same framing walk. That is the whole
 /// mechanism: walk the framing, ask which record this refusal is about, name the
 /// byte.
 ///

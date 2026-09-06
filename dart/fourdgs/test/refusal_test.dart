@@ -567,10 +567,10 @@ void main() {
       expect(_refusalOf(() => checkMagic(Uint8List(3))), isNull);
     });
 
-    test('every identifier a raise site uses is one of the nine', () {
-      // The set is the vocabulary; a tenth string invented in one language is
+    test('every identifier a raise site uses is one of the ten', () {
+      // The set is the vocabulary; an eleventh string invented in one language is
       // a conformance failure everywhere else.
-      expect(fourdgsRefusalCodes, hasLength(9));
+      expect(fourdgsRefusalCodes, hasLength(10));
       expect(<String>{
         refusalMagicMismatch,
         refusalUnsupportedMajorVersion,
@@ -580,6 +580,7 @@ void main() {
         refusalUnknownStreamCodec,
         refusalWindowIndexOutOfRange,
         refusalDecodedF32Overflow,
+        refusalLateFrontMatterRecord,
         refusalIndexRecordMismatch,
       }, fourdgsRefusalCodes);
     });
