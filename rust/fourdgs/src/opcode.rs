@@ -67,6 +67,31 @@ pub fn is_private(opcode: u8) -> bool {
     opcode >= PRIVATE_START
 }
 
+/// True for every specification-defined top-level front-matter record (spec §4).
+///
+/// The set is deliberately closed. Unknown, reserved and private opcodes acquire no
+/// placement rule merely by where their numeric value falls.
+pub fn is_front_matter(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        HEADER
+            | QUANTIZATION
+            | WINDOW_TABLE
+            | AUDIO
+            | CAMERA
+            | METADATA
+            | ATTACHMENT
+            | AUDIO_SOURCE
+            | AUDIO_DATA
+            | COORDINATE_FRAME
+            | SENSOR_CALIBRATION
+            | RIG_TRAJECTORY
+            | GEODETIC_ANCHOR
+            | OBJECT_TABLE
+            | OBJECT_TRACK
+    )
+}
+
 /// A human name for an opcode, for error messages.
 pub fn name(opcode: u8) -> String {
     let known = match opcode {

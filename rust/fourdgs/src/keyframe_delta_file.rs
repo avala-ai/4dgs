@@ -33,7 +33,8 @@ use crate::quantization::{
 };
 use crate::records as rec;
 use crate::serialization::{
-    check_magic, crc32, Cursor, Records, MAGIC, MAX_STREAM_BYTES, STREAM_HEADER_SIZE,
+    check_magic, crc32, Cursor, Records, MAGIC, MAX_STREAM_BYTES, RECORD_HEADER_SIZE,
+    STREAM_HEADER_SIZE,
 };
 use crate::stream::{decode_stream_with_limit, encode_stream, DecodedStream};
 
@@ -1724,6 +1725,7 @@ pub(crate) fn compose_delta_chunk_checked(
 /// Front to back: decode each chunk and compose it onto the state it references.
 pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
     check_magic(data)?;
+    check_streamed_front_matter_placement(data)?;
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
     let mut windows: Vec<(f64, f64)> = Vec::new();
@@ -1869,6 +1871,55 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
         windows,
         chunks,
     })
+}
+
+/// Check the state boundary from record framing alone, before any late body is read.
+///
+/// [`Records`] quite correctly rejects a body whose declared length crosses the resource
+/// before yielding it. Placement has higher precedence, though, so this small bounded pass
+/// must see the opcode byte first. If an earlier record is malformed, the ordinary decode
+/// pass below remains responsible for diagnosing it.
+fn check_streamed_front_matter_placement(data: &[u8]) -> Result<()> {
+    let mut first_state: Option<(u8, usize)> = None;
+    let mut at = MAGIC.len();
+    loop {
+        let remaining = data.len().saturating_sub(at);
+        if remaining <= MAGIC.len() || remaining < RECORD_HEADER_SIZE {
+            return Ok(());
+        }
+        let opcode = data[at];
+        if let Some((first_opcode, first_offset)) = first_state {
+            if op::is_front_matter(opcode) {
+                return Err(Error::late_front_matter_record(
+                    opcode,
+                    at as u64,
+                    first_opcode,
+                    first_offset as u64,
+                ));
+            }
+        }
+        if first_state.is_none() && matches!(opcode, op::CHUNK | op::DELTA_CHUNK) {
+            first_state = Some((opcode, at));
+        }
+        let length = u64::from_le_bytes(
+            data[at + 1..at + RECORD_HEADER_SIZE]
+                .try_into()
+                .expect("the record header is nine bytes"),
+        );
+        let Ok(length) = usize::try_from(length) else {
+            return Ok(());
+        };
+        let Some(end) = at
+            .checked_add(RECORD_HEADER_SIZE)
+            .and_then(|content| content.checked_add(length))
+        else {
+            return Ok(());
+        };
+        if end > data.len() {
+            return Ok(());
+        }
+        at = end;
+    }
 }
 
 pub(crate) fn ranged_framing<R: crate::Readable + ?Sized>(
@@ -3899,6 +3950,27 @@ mod hostile_record_tests {
     }
 
     #[test]
+    fn streamed_placement_precedes_a_truncated_late_front_matter_body() {
+        let mut data = empty_indexed_file();
+        let state = Records::new(&data, MAGIC.len())
+            .map(|record| record.unwrap())
+            .find(|record| matches!(record.opcode, op::CHUNK | op::DELTA_CHUNK))
+            .expect("the fixture has state");
+        let late_at = state.offset + crate::serialization::RECORD_HEADER_SIZE + state.content.len();
+        let mut framing = vec![op::HEADER];
+        framing.extend_from_slice(&u64::MAX.to_le_bytes());
+        data.splice(late_at..late_at, framing);
+
+        let error = decode_streamed(&data).unwrap_err();
+        assert_eq!(
+            error.refusal_code(),
+            Some(crate::error::refusal::LATE_FRONT_MATTER_RECORD),
+            "{error}"
+        );
+        assert!(error.to_string().contains(&format!("byte {late_at}")));
+    }
+
+    #[test]
     fn indexed_open_skips_an_extensible_header_trailer() {
         let mut data = empty_indexed_file();
         let old_footer_at =
@@ -3935,7 +4007,7 @@ mod hostile_record_tests {
     }
 
     #[test]
-    fn streamed_and_indexed_reads_keep_the_pre_state_window_table() {
+    fn streamed_read_refuses_a_late_window_table_while_indexed_open_may_stop_early() {
         let mut data = empty_indexed_file();
         let old_footer_at =
             data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
@@ -3957,10 +4029,20 @@ mod hostile_record_tests {
             ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
             .copy_from_slice(&shifted_summary.to_le_bytes());
 
-        let streamed = decode_streamed(&data).unwrap();
+        let streamed = decode_streamed(&data).unwrap_err();
+        assert_eq!(
+            streamed.refusal_code(),
+            Some(crate::error::refusal::LATE_FRONT_MATTER_RECORD),
+            "{streamed}"
+        );
+        assert!(
+            streamed
+                .to_string()
+                .contains(&format!("byte {old_summary_start}")),
+            "{streamed}"
+        );
         let indexed = open_indexed(&mut BytesReadable::new(&data)).unwrap();
-        assert_eq!(streamed.windows, indexed.windows);
-        assert_ne!(streamed.windows, vec![(10.0, 20.0)]);
+        assert_ne!(indexed.windows, vec![(10.0, 20.0)]);
     }
 
     #[test]

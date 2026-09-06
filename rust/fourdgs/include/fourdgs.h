@@ -154,11 +154,11 @@ const char *fourdgs_last_error(void);
  * The identifier the specification's refusal table gives the last error on this thread —
  * "magic-mismatch", "unsupported-major-version", "unknown-temporal-model",
  * "unknown-quantization-scheme", "non-positive-step-time", "unknown-stream-codec",
- * "window-index-out-of-range", "index-record-mismatch", "decoded-f32-overflow" — or NULL
- * with *out_len 0 when the last error is not one of them.
+ * "window-index-out-of-range", "index-record-mismatch", "decoded-f32-overflow",
+ * "late-front-matter-record" — or NULL with *out_len 0 when the last error is not one of them.
  *
  * The status codes say what KIND of thing went wrong, and FOURDGS_STATUS_UNSUPPORTED_CODEC
- * alone covers three of those nine. This is how a caller says WHICH one, in the same words
+ * alone covers three of those ten. This is how a caller says WHICH one, in the same words
  * every other implementation of this format uses.
  *
  * NULL is not a failure. A truncated transport, an I/O error and a null-argument mistake

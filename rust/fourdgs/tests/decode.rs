@@ -519,6 +519,19 @@ fn after_last_chunk(bytes: &[u8]) -> usize {
     last.expect("the fixture carries a Chunk record")
 }
 
+fn first_chunk(bytes: &[u8]) -> usize {
+    let mut at = MAGIC.len();
+    while at + 9 <= bytes.len() {
+        let opcode = bytes[at];
+        let length = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().unwrap()) as usize;
+        if opcode == op::CHUNK {
+            return at;
+        }
+        at += 9 + length;
+    }
+    panic!("the fixture carries no Chunk record")
+}
+
 /// A window index is checked against the table in force when its Chunk is decoded. A
 /// second, shorter Window Table spliced in after that Chunk leaves indices already
 /// accepted pointing outside the table the assembler is handed — which used to index a
@@ -537,14 +550,135 @@ fn a_window_table_spliced_in_after_a_chunk_is_refused_rather_than_panicking() {
 
     let error = fourdgs::read_bytes(&bytes)
         .expect_err("a Window Table that cannot apply to the Chunks before it is malformed");
-    assert!(matches!(error, Error::Malformed(_)), "{error}");
-    assert!(error.to_string().contains("Window Table"), "{error}");
+    assert_eq!(
+        error.refusal_code(),
+        Some(fourdgs::error::refusal::LATE_FRONT_MATTER_RECORD)
+    );
+    let message = error.to_string();
+    assert!(message.contains("WindowTable"), "{message}");
+    assert!(message.contains(&format!("byte {splice_at}")), "{message}");
+    assert!(
+        message.contains(&format!(
+            "Chunk (opcode 0x05) at byte {}",
+            first_chunk(&bytes)
+        )),
+        "{message}"
+    );
 
     // The same bytes through the automatic open, which is what a consumer calls.
     let mut source = fourdgs::readable::BytesReadable::new(&bytes);
     if let Ok(mut reader) = fourdgs::SceneReader::open(&mut source) {
         let _ = reader.state_at(0.5, 0);
     }
+}
+
+#[test]
+fn every_defined_front_matter_opcode_is_late_before_its_body_is_parsed() {
+    let front_matter = [
+        op::HEADER,
+        op::QUANTIZATION,
+        op::WINDOW_TABLE,
+        op::AUDIO,
+        op::CAMERA,
+        op::METADATA,
+        op::ATTACHMENT,
+        op::AUDIO_SOURCE,
+        op::AUDIO_DATA,
+        op::COORDINATE_FRAME,
+        op::SENSOR_CALIBRATION,
+        op::RIG_TRAJECTORY,
+        op::GEODETIC_ANCHOR,
+        op::OBJECT_TABLE,
+        op::OBJECT_TRACK,
+    ];
+    for opcode in front_matter {
+        let mut bytes = two_window_file();
+        let late_at = after_last_chunk(&bytes);
+        let first_state_at = first_chunk(&bytes);
+        let mut late = Vec::new();
+        put_record(&mut late, opcode, &[]);
+        bytes.splice(late_at..late_at, late);
+
+        let error = fourdgs::read_bytes(&bytes).unwrap_err();
+        assert_eq!(
+            error.refusal_code(),
+            Some(fourdgs::error::refusal::LATE_FRONT_MATTER_RECORD),
+            "{}: {error}",
+            op::name(opcode)
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "{} (opcode 0x{opcode:02X}) at byte {late_at}",
+                op::name(opcode)
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("Chunk (opcode 0x05) at byte {first_state_at}")),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn unknown_and_private_records_acquire_no_front_matter_placement_rule() {
+    for opcode in [0x26, 0x80] {
+        let mut bytes = two_window_file();
+        let at = after_last_chunk(&bytes);
+        let mut extension = Vec::new();
+        put_record(&mut extension, opcode, &[]);
+        bytes.splice(at..at, extension);
+        fourdgs::read_bytes(&bytes).unwrap_or_else(|error| {
+            panic!("opcode 0x{opcode:02X} after state must remain skippable: {error}")
+        });
+    }
+}
+
+#[test]
+fn a_delta_chunk_begins_state_for_front_matter_placement() {
+    let mut bytes = minimal_file();
+    bytes.truncate(bytes.len() - Footer::default().encode().len() - MAGIC.len());
+    let first_state_at = bytes.len();
+    put_record(&mut bytes, op::DELTA_CHUNK, &[]);
+    let late_at = bytes.len();
+    put_record(&mut bytes, op::METADATA, &[]);
+    bytes.extend_from_slice(&Footer::default().encode());
+    bytes.extend_from_slice(&MAGIC);
+
+    let error = fourdgs::read_bytes(&bytes).unwrap_err();
+    assert_eq!(
+        error.refusal_code(),
+        Some(fourdgs::error::refusal::LATE_FRONT_MATTER_RECORD)
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("Metadata (opcode 0x0B) at byte {late_at}")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "DeltaChunk (opcode 0x10) at byte {first_state_at}"
+        )),
+        "{message}"
+    );
+}
+
+#[test]
+fn late_placement_precedes_a_truncated_front_matter_body() {
+    let mut bytes = two_window_file();
+    let late_at = after_last_chunk(&bytes);
+    let mut framing = vec![op::HEADER];
+    framing.extend_from_slice(&u64::MAX.to_le_bytes());
+    bytes.splice(late_at..late_at, framing);
+
+    let error = fourdgs::read_bytes(&bytes).unwrap_err();
+    assert_eq!(
+        error.refusal_code(),
+        Some(fourdgs::error::refusal::LATE_FRONT_MATTER_RECORD),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&format!("byte {late_at}")));
 }
 
 /// The assembler is a second caller with its own window table, and it must not trust that

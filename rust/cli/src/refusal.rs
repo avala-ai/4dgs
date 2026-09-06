@@ -370,12 +370,33 @@ pub fn locate_streaming(source: &mut dyn Readable, code: &str) -> Option<Site> {
         id::NON_POSITIVE_STEP_TIME => {
             first_non_positive_step_time(source, op::QUANTIZATION, "the Quantization record")
         }
+        id::LATE_FRONT_MATTER_RECORD => first_late_front_matter(source),
         id::UNKNOWN_STREAM_CODEC | id::WINDOW_INDEX_OUT_OF_RANGE => match scan_streamed(source) {
             Err((error, site)) if error.refusal_code() == Some(code) => site,
             _ => None,
         },
         _ => None,
     }
+}
+
+/// Find the first defined front-matter opcode after state began without reading its body.
+fn first_late_front_matter(source: &mut dyn Readable) -> Option<Site> {
+    let mut records = Streamed::open(source).ok()?;
+    let mut first_state = None;
+    while let Some(frame) = records.next_frame() {
+        if let Some((_opcode, _offset)) = first_state {
+            if op::is_front_matter(frame.opcode) {
+                return Some(Site {
+                    offset: frame.offset,
+                    what: format!("the late {} record", op::name(frame.opcode)),
+                });
+            }
+        }
+        if first_state.is_none() && matches!(frame.opcode, op::CHUNK | op::DELTA_CHUNK) {
+            first_state = Some((frame.opcode, frame.offset));
+        }
+    }
+    None
 }
 
 /// The first whole record of this kind whose own declared value is the one being refused.

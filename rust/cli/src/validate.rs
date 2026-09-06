@@ -327,7 +327,20 @@ fn validate_checked(data: &[u8]) -> Result<Report> {
     // to point at.
     let mut refusing_header = None;
     let mut refusing_quantization = None;
+    let mut first_state_frame: Option<refusal::Frame> = None;
+    let mut late_front_matter: Option<(refusal::Frame, refusal::Frame)> = None;
     let walk = match refusal::walk_each(&mut BytesReadable::new(data), |frame, intact| {
+        // Placement is decided from the nine framing bytes alone. In particular, a late
+        // Header with a malformed or truncated body is still late first, as spec §4
+        // requires, and a Delta Chunk begins state just as a Chunk does.
+        if let Some(first_state) = first_state_frame {
+            if late_front_matter.is_none() && op::is_front_matter(frame.opcode) {
+                late_front_matter = Some((frame, first_state));
+            }
+        }
+        if first_state_frame.is_none() && matches!(frame.opcode, op::CHUNK | op::DELTA_CHUNK) {
+            first_state_frame = Some(frame);
+        }
         if !intact {
             return;
         }
@@ -367,6 +380,23 @@ fn validate_checked(data: &[u8]) -> Result<Report> {
             return Ok(report);
         }
     };
+    if let Some((late, first_state)) = late_front_matter {
+        let error = fourdgs::Error::late_front_matter_record(
+            late.opcode,
+            late.offset,
+            first_state.opcode,
+            first_state.offset,
+        );
+        report.refused(
+            "",
+            &error,
+            None,
+            Some(refusal::Site {
+                offset: late.offset,
+                what: format!("the late {} record", op::name(late.opcode)),
+            }),
+        );
+    }
     if !data.ends_with(&MAGIC) {
         report.error(
             "file does not end with the magic; it is truncated or was written by a broken encoder"
@@ -395,6 +425,15 @@ fn validate_checked(data: &[u8]) -> Result<Report> {
             }
         };
         seen.push(record.opcode);
+        // The framing pass already emitted the required named placement refusal. Do not
+        // parse a late defined front-matter body or let its duplicate/value diagnostics
+        // supersede that refusal. Keep it in `seen`, because it still physically affects
+        // final-record and summary checks.
+        if first_state_frame.is_some_and(|first_state| {
+            record.offset as u64 > first_state.offset && op::is_front_matter(record.opcode)
+        }) {
+            continue;
+        }
         // A record whose own body will not parse is a finding rather than an abort: the
         // point of a validator is to say everything that is wrong with a file, not the
         // first thing.
@@ -1639,6 +1678,51 @@ mod tests {
             .as_ref()
             .unwrap_or_else(|| panic!("`{code}` was named but not placed"))
             .offset
+    }
+
+    #[test]
+    fn a_late_front_matter_refusal_is_named_and_placed_before_body_parsing() {
+        let mut data = minimal();
+        let first_state_at = nth_record(&data, op::CHUNK, 0);
+        let late_at = nth_record(&data, op::CHUNK_INDEX, 0);
+        // A Chunk Index body cannot parse as a Header. Placement must control before that
+        // malformed-body result or the fact that this is a second Header.
+        data[late_at as usize] = op::HEADER;
+
+        let report = validate(&data);
+        assert_eq!(
+            refused_at(&report, fourdgs::error::refusal::LATE_FRONT_MATTER_RECORD),
+            late_at
+        );
+        let late = report
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.refusal.as_ref().is_some_and(|named| {
+                    named.code == fourdgs::error::refusal::LATE_FRONT_MATTER_RECORD
+                })
+            })
+            .expect("the named placement refusal");
+        assert!(
+            late.message
+                .contains(&format!("Header (opcode 0x01) at byte {late_at}")),
+            "{}",
+            late.message
+        );
+        assert!(
+            late.message
+                .contains(&format!("Chunk (opcode 0x05) at byte {first_state_at}")),
+            "{}",
+            late.message
+        );
+        assert!(
+            !errors(&report)
+                .iter()
+                .any(|message| message.contains("Header does not parse")
+                    || message.contains("a second Header")),
+            "{:?}",
+            errors(&report)
+        );
     }
 
     /// Where the `n`th record with this opcode starts, counting from zero.
