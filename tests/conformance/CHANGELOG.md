@@ -21,7 +21,7 @@ What each part of the version means here:
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-08-10
+## [0.1.0] - 2026-09-05
 
 The first publication of the corpus. Until now the only route to the `.4dgs` files was cloning the
 repository and running a Python generator, which made "prove your decoder correct" a thing only the
@@ -36,8 +36,8 @@ release here is. The corpus becomes 1.0.0 when version 1 of the specification is
 ### Added
 
 - **`4dgs-conformance-corpus-X.Y.Z.tar.gz`**, attached to the `releases/corpus/vX.Y.Z` release with
-  its SHA-256 beside it. 60 variants — 46 valid, 4 keyframe-delta, 3 object-layer, 7 that must be
-  refused — each as a `.4dgs` and the `.json` a correct decoder must produce from it. 519 KiB
+  its SHA-256 beside it. 74 variants — 48 valid, 5 keyframe-delta, 10 object-layer, 11 that must be
+  refused — each as a `.4dgs` and the `.json` a correct decoder must produce from it. 564 KiB
   packed.
 
 - **`corpus/` is byte-for-byte `tests/conformance/data`.** The same names, the same subdirectories,
