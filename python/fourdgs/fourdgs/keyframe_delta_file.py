@@ -34,6 +34,7 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
+from .decoded_f32 import check_decoded_f32
 from .exceptions import ExceedsReaderLimit, FourdgsError, MalformedFile, UnsupportedCodec
 from .keyframe_delta import State, apply_delta, chain_from, check_tiling, keyframe_state
 from .keyframe_delta_writer import (
@@ -266,10 +267,10 @@ def _reanchor_bins(bins: dict[int, np.ndarray], grids: Grids, t0: float) -> dict
     time_step = grids.mu_step(sigma, never_fades)
 
     position = dequantize(bins[op.A_POSITION], grids.steps.pos, grids.origin)
-    motion = bins[op.A_MOTION].astype(np.float64) * motion_step[:, None]
-    authored_mu = bins[op.A_MU_T].reshape(-1).astype(np.float64) * time_step
+    motion = dequantize(bins[op.A_MOTION], motion_step[:, None])
+    authored_mu = dequantize(bins[op.A_MU_T].reshape(-1), time_step)
     anchor_bins = np.rint(float(t0) / time_step).astype(np.int64)
-    serialized_mu = anchor_bins.astype(np.float64) * time_step
+    serialized_mu = dequantize(anchor_bins, time_step)
     centre = position + motion * (serialized_mu - authored_mu)[:, None]
 
     anchored = dict(bins)
@@ -281,7 +282,7 @@ def _reanchor_bins(bins: dict[int, np.ndarray], grids: Grids, t0: float) -> dict
 def _keyframe_mu_bins(t0: float, bins: dict[int, np.ndarray], grids: Grids) -> np.ndarray:
     """The one `mu_t` bin each keyframe row must use for its own timestamp."""
     sigma_bins = bins[op.A_SIGMA_T][:, 0]
-    never_fades = bins[op.A_FLAGS][:, 0] != 0
+    never_fades = (bins[op.A_FLAGS][:, 0] & op.FLAG_NEVER_FADES) != 0
     step = grids.mu_step(sigma_bins, never_fades)
     if np.any(~np.isfinite(step)) or np.any(step <= 0):
         raise MalformedFile("the keyframe mu_t grid has a non-finite or non-positive step")
@@ -298,7 +299,7 @@ def _check_keyframe_mu_t(t0: float, bins: dict[int, np.ndarray], grids: Grids) -
     if mismatch.size:
         row = int(mismatch[0])
         sigma_bins = bins[op.A_SIGMA_T][:, 0]
-        never_fades = bins[op.A_FLAGS][:, 0] != 0
+        never_fades = (bins[op.A_FLAGS][:, 0] & op.FLAG_NEVER_FADES) != 0
         step = grids.mu_step(sigma_bins, never_fades)
         decoded = float(actual[row]) * float(step[row])
         raise MalformedFile(
@@ -635,6 +636,257 @@ def _decoded_grids(
     )
 
 
+_F32_ATTRIBUTES = frozenset(
+    {
+        op.A_POSITION,
+        op.A_SCALE,
+        op.A_ROTATION,
+        op.A_COLOR,
+        op.A_OPACITY,
+        op.A_MOTION,
+        op.A_MU_T,
+        op.A_SIGMA_T,
+    }
+)
+
+
+def _f32_dependencies(attributes) -> set[int]:
+    """The composed columns needed to reconstruct the requested floating lanes."""
+    wanted = set(attributes) & _F32_ATTRIBUTES
+    needed = set(wanted)
+    if op.A_ROTATION in wanted:
+        needed.add(op.A_ROTATION_INDEX)
+    if wanted & {op.A_SIGMA_T, op.A_MOTION, op.A_MU_T}:
+        needed.update({op.A_SIGMA_T, op.A_FLAGS})
+    if op.A_MOTION in wanted:
+        needed.add(op.A_WINDOW_INDEX)
+    return needed
+
+
+def _check_state_f32(
+    ids: np.ndarray,
+    bins: dict[int, np.ndarray],
+    stored: dict[int, np.ndarray],
+    grids: Grids,
+    *,
+    record_offset: int,
+    row_kind: str,
+    stored_kind: str,
+    attributes,
+) -> None:
+    """Check the rows one state record introduced or changed, then forget provenance.
+
+    ``bins`` is composed absolute state for those rows; ``stored`` is the same record's
+    absolute birth/keyframe bins or its update deltas.  Keeping only this record-local
+    view is what lets a Delta Chunk name both numbers without attaching a provenance map
+    to every live gaussian.
+    """
+    ids = np.asarray(ids).reshape(-1)
+    if not ids.size:
+        return
+    wanted = set(attributes) & _F32_ATTRIBUTES
+    if not wanted:
+        return
+
+    record = "Delta Chunk" if row_kind in ("update", "birth") else "Chunk"
+    temporal = bool(wanted & {op.A_SIGMA_T, op.A_MOTION, op.A_MU_T})
+    never_fades = (bins[op.A_FLAGS][:, 0] & op.FLAG_NEVER_FADES) != 0 if temporal else None
+
+    def scalar_detail(attribute: int, row: int, component: int, step: str) -> str:
+        saved = int(stored[attribute][row, component])
+        absolute = int(bins[attribute][row, component])
+        if stored_kind == "delta":
+            return f"from stored delta bin {saved} and composed bin {absolute} with {step}"
+        return f"from stored/composed absolute bin {absolute} with {step}"
+
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        if op.A_SIGMA_T in wanted:
+            assert never_fades is not None
+            sigma_bins = bins[op.A_SIGMA_T][:, 0]
+            sigma = np.where(never_fades, np.inf, np.exp(sigma_bins * grids.steps.sigma_log))
+            check_decoded_f32(
+                sigma,
+                record=record,
+                record_offset=record_offset,
+                row_kind=row_kind,
+                gaussian_ids=ids,
+                attribute="sigma_t",
+                components=("value",),
+                detail=lambda row, component: scalar_detail(
+                    op.A_SIGMA_T,
+                    row,
+                    component,
+                    f"step_sigma_log {grids.steps.sigma_log!r}",
+                ),
+                permitted_positive_infinity=never_fades,
+            )
+
+        if op.A_POSITION in wanted:
+            values = dequantize(bins[op.A_POSITION], grids.steps.pos, grids.origin)
+            check_decoded_f32(
+                values,
+                record=record,
+                record_offset=record_offset,
+                row_kind=row_kind,
+                gaussian_ids=ids,
+                attribute="position",
+                components=("x", "y", "z"),
+                detail=lambda row, component: scalar_detail(
+                    op.A_POSITION,
+                    row,
+                    component,
+                    f"step_pos {grids.steps.pos!r} and pos_origin.{('x', 'y', 'z')[component]} "
+                    f"{float(grids.origin[component])!r}",
+                ),
+            )
+
+        if op.A_SCALE in wanted:
+            values = np.exp(dequantize(bins[op.A_SCALE], grids.steps.scale_log))
+            check_decoded_f32(
+                values,
+                record=record,
+                record_offset=record_offset,
+                row_kind=row_kind,
+                gaussian_ids=ids,
+                attribute="scale",
+                components=("x", "y", "z"),
+                detail=lambda row, component: scalar_detail(
+                    op.A_SCALE,
+                    row,
+                    component,
+                    f"step_scale_log {grids.steps.scale_log!r}",
+                ),
+            )
+
+        if op.A_ROTATION in wanted:
+            values = dequantize_rotation(bins[op.A_ROTATION_INDEX][:, 0], bins[op.A_ROTATION], grids.steps.rot)
+
+            def rotation_detail(row: int, _component: int) -> str:
+                absolute_index = int(bins[op.A_ROTATION_INDEX][row, 0])
+                absolute = bins[op.A_ROTATION][row].astype(int).tolist()
+                if stored_kind == "delta":
+                    saved_index = int(stored[op.A_ROTATION_INDEX][row, 0])
+                    saved = stored[op.A_ROTATION][row].astype(int).tolist()
+                    return (
+                        f"from stored absolute update rotation_index {saved_index} and bins {saved}, "
+                        f"composed rotation_index {absolute_index} and bins {absolute}, with step_rot "
+                        f"{grids.steps.rot!r}"
+                    )
+                return (
+                    f"from stored/composed rotation_index {absolute_index} and bins {absolute} "
+                    f"with step_rot {grids.steps.rot!r}"
+                )
+
+            check_decoded_f32(
+                values,
+                record=record,
+                record_offset=record_offset,
+                row_kind=row_kind,
+                gaussian_ids=ids,
+                attribute="rotation",
+                components=("x", "y", "z", "w"),
+                detail=rotation_detail,
+            )
+
+        if op.A_COLOR in wanted:
+            rgb_bins = rct_inverse(bins[op.A_COLOR])
+            values = np.clip(dequantize(rgb_bins, grids.steps.rgb), 0.0, 1.0)
+
+            def color_detail(row: int, component: int) -> str:
+                absolute = bins[op.A_COLOR][row].astype(int).tolist()
+                reconstructed = int(rgb_bins[row, component])
+                if stored_kind == "delta":
+                    saved = stored[op.A_COLOR][row].astype(int).tolist()
+                    return (
+                        f"from stored (g, r-g, b-g) delta bins {saved}, composed bins {absolute}, "
+                        f"and reconstructed RGB bin {reconstructed}, with step_rgb {grids.steps.rgb!r}"
+                    )
+                return (
+                    f"from stored/composed (g, r-g, b-g) bins {absolute} and reconstructed "
+                    f"RGB bin {reconstructed}, with step_rgb {grids.steps.rgb!r}"
+                )
+
+            check_decoded_f32(
+                values,
+                record=record,
+                record_offset=record_offset,
+                row_kind=row_kind,
+                gaussian_ids=ids,
+                attribute="color",
+                components=("r", "g", "b"),
+                detail=color_detail,
+            )
+
+        if op.A_OPACITY in wanted:
+            values = np.clip(dequantize(bins[op.A_OPACITY][:, 0], grids.steps.alpha), 0.0, 1.0)
+            check_decoded_f32(
+                values,
+                record=record,
+                record_offset=record_offset,
+                row_kind=row_kind,
+                gaussian_ids=ids,
+                attribute="color",
+                components=("a",),
+                detail=lambda row, component: scalar_detail(
+                    op.A_OPACITY,
+                    row,
+                    component,
+                    f"step_alpha {grids.steps.alpha!r}",
+                ),
+            )
+
+        sigma_bins = bins[op.A_SIGMA_T][:, 0] if wanted & {op.A_MOTION, op.A_MU_T} else np.zeros(0, dtype=np.int64)
+        if op.A_MOTION in wanted:
+            assert never_fades is not None
+            effective = grids.motion_step(sigma_bins, never_fades, bins[op.A_WINDOW_INDEX][:, 0])
+            values = dequantize(bins[op.A_MOTION], effective[:, None])
+            check_decoded_f32(
+                values,
+                record=record,
+                record_offset=record_offset,
+                row_kind=row_kind,
+                gaussian_ids=ids,
+                attribute="motion",
+                components=("x", "y", "z"),
+                detail=lambda row, component: scalar_detail(
+                    op.A_MOTION,
+                    row,
+                    component,
+                    f"effective step {float(effective[row])!r} (step_motion {grids.steps.motion!r})",
+                ),
+            )
+
+        if op.A_MU_T in wanted:
+            assert never_fades is not None
+            effective = grids.mu_step(sigma_bins, never_fades)
+            values = dequantize(bins[op.A_MU_T][:, 0], effective)
+            check_decoded_f32(
+                values,
+                record=record,
+                record_offset=record_offset,
+                row_kind=row_kind,
+                gaussian_ids=ids,
+                attribute="mu_t",
+                components=("value",),
+                detail=lambda row, component: scalar_detail(
+                    op.A_MU_T,
+                    row,
+                    component,
+                    f"effective step {float(effective[row])!r} (step_time {grids.steps.time!r})",
+                ),
+            )
+
+
+def _rows_for_ids(state: State, ids: np.ndarray) -> np.ndarray:
+    """Rows of already-validated live ids, without retaining an id-to-row map."""
+    ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+    if not ids.size:
+        return np.zeros(0, dtype=np.int64)
+    order = np.argsort(state.ids, kind="stable")
+    at = np.searchsorted(state.ids[order], ids)
+    return order[at]
+
+
 def _decode_group(stream_bytes) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     """One length-framed sub-block: its ids, and a bin array per other attribute."""
     cursor = Cursor(bytes(stream_bytes))
@@ -744,7 +996,13 @@ def _check_channel_counts(bins: dict[int, np.ndarray]) -> None:
             )
 
 
-def _compose_delta(reference: State, content) -> tuple[State, rec.DeltaChunkHeader]:
+def _compose_delta(
+    reference: State,
+    content,
+    grids: Grids | None = None,
+    *,
+    record_offset: int = 0,
+) -> tuple[State, rec.DeltaChunkHeader]:
     head, updates, births, deaths = _delta_chunk_groups(content)
     update_ids, update_bins = _decode_group(updates)
     birth_ids, birth_bins = _decode_group(births)
@@ -786,6 +1044,31 @@ def _compose_delta(reference: State, content) -> tuple[State, rec.DeltaChunkHead
         birth_bins=birth_bins,
         death_ids=death_ids,
     )
+    if grids is not None:
+        update_rows = _rows_for_ids(state, update_ids)
+        update_attributes = set(update_bins)
+        _check_state_f32(
+            update_ids,
+            {attribute: state.bins[attribute][update_rows] for attribute in _f32_dependencies(update_attributes)},
+            update_bins,
+            grids,
+            record_offset=record_offset,
+            row_kind="update",
+            stored_kind="delta",
+            attributes=update_attributes,
+        )
+        if birth_ids.size:
+            birth_rows = np.arange(state.count - birth_ids.size, state.count)
+            _check_state_f32(
+                birth_ids,
+                {attribute: values[birth_rows] for attribute, values in state.bins.items()},
+                birth_bins,
+                grids,
+                record_offset=record_offset,
+                row_kind="birth",
+                stored_kind="absolute",
+                attributes=_F32_ATTRIBUTES,
+            )
     return state, head
 
 
@@ -849,6 +1132,16 @@ def decode_streamed(data: bytes) -> DecodedSequence:
                 _decoded_grids(quant, windows, header.cutoff),
             )
             state = keyframe_state(ids, bins)
+            _check_state_f32(
+                state.ids,
+                state.bins,
+                bins,
+                _decoded_grids(quant, windows, header.cutoff),
+                record_offset=record.offset,
+                row_kind="keyframe",
+                stored_kind="absolute",
+                attributes=_F32_ATTRIBUTES,
+            )
             by_offset[record.offset] = state
             chunks.append(
                 ChunkInfo(
@@ -869,7 +1162,12 @@ def decode_streamed(data: bytes) -> DecodedSequence:
                     f"delta chunk at {record.offset} references {head_peek.reference_offset}, which is not behind it",
                     code="forward-reference",
                 )
-            state, head = _compose_delta(reference, record.content)
+            state, head = _compose_delta(
+                reference,
+                record.content,
+                _decoded_grids(quant, windows, header.cutoff),
+                record_offset=record.offset,
+            )
             by_offset[record.offset] = state
             chunks.append(
                 ChunkInfo(
@@ -1263,6 +1561,16 @@ def compose_chain(
                 "the decoded keyframe's validated gaussian row count",
             )
             _check_keyframe_mu_t(head.t0, bins, grids)
+            _check_state_f32(
+                state.ids,
+                state.bins,
+                bins,
+                grids,
+                record_offset=link.chunk_offset,
+                row_kind="keyframe",
+                stored_kind="absolute",
+                attributes=_F32_ATTRIBUTES,
+            )
             reference_level = int(head.level)
             composed_at = link.chunk_offset
         else:
@@ -1270,7 +1578,7 @@ def compose_chain(
                 raise MalformedFile("a chain begins with a delta chunk", code="chain-without-keyframe")
             reference_at = composed_at
             composed_at = link.chunk_offset
-            state, head = _compose_delta(state, content)
+            state, head = _compose_delta(state, content, grids, record_offset=link.chunk_offset)
             if link.extended:
                 _check_entry_against_record(link, head)
             # `level` is a chunk field and not an index one, so this is the first place on
@@ -1526,6 +1834,16 @@ def scan_indexed(
                 "the decoded keyframe's validated gaussian row count",
             )
             _check_keyframe_mu_t(head.t0, bins, grids)
+            _check_state_f32(
+                state.ids,
+                state.bins,
+                bins,
+                grids,
+                record_offset=entry.chunk_offset,
+                row_kind="keyframe",
+                stored_kind="absolute",
+                attributes=_F32_ATTRIBUTES,
+            )
             if entry.extended and (
                 entry.keyframe_offset != entry.chunk_offset
                 or entry.depth != 0
@@ -1590,7 +1908,7 @@ def scan_indexed(
                     f"its reference at {reference_at} requires depth {expected_depth}",
                     code="depth-mismatch",
                 )
-            state, head = _compose_delta(reference, content)
+            state, head = _compose_delta(reference, content, grids, record_offset=entry.chunk_offset)
             _check_entry_against_record(entry, head)
             if int(head.level) != reference_level:
                 raise MalformedFile(
@@ -1696,6 +2014,16 @@ def scan_streamed(
                 _decoded_grids(quantization, windows, cutoff),
             )
             state = keyframe_state(ids, bins)
+            _check_state_f32(
+                state.ids,
+                state.bins,
+                bins,
+                _decoded_grids(quantization, windows, cutoff),
+                record_offset=record.offset,
+                row_kind="keyframe",
+                stored_kind="absolute",
+                attributes=_F32_ATTRIBUTES,
+            )
             keyframe_at, keyframe_state_ = record.offset, state
             keyframe_level = int(head.level)
             depth = 0
@@ -1746,7 +2074,12 @@ def scan_streamed(
                     f"its selected reference requires depth {expected_depth}",
                     code="depth-mismatch",
                 )
-            state, head = _compose_delta(reference, record.content)
+            state, head = _compose_delta(
+                reference,
+                record.content,
+                _decoded_grids(quantization, windows, cutoff),
+                record_offset=record.offset,
+            )
             if int(head.level) != reference_level:
                 raise MalformedFile(
                     f"delta at {record.offset} declares level {head.level}; "
@@ -2215,27 +2548,31 @@ def _dequantize(state: State, grids: Grids):
             code="missing-window-index",
         )
     sigma_bins = b[op.A_SIGMA_T][:, 0]
-    never_fades = b[op.A_FLAGS][:, 0] != 0
-    sigma = np.where(never_fades, np.inf, np.exp(sigma_bins * grids.steps.sigma_log))
-    m_step = grids.motion_step(sigma_bins, never_fades, b[op.A_WINDOW_INDEX][:, 0])[:, None]
-    t_step = grids.mu_step(sigma_bins, never_fades)
-    return dict(
-        positions=dequantize(b[op.A_POSITION], grids.steps.pos, grids.origin),
-        scales=np.exp(dequantize(b[op.A_SCALE], grids.steps.scale_log)),
-        rotations=dequantize_rotation(b[op.A_ROTATION_INDEX][:, 0], b[op.A_ROTATION], grids.steps.rot),
-        colors=np.concatenate(
-            [
-                np.clip(dequantize(rct_inverse(b[op.A_COLOR]), grids.steps.rgb), 0.0, 1.0),
-                np.clip(dequantize(b[op.A_OPACITY][:, 0], grids.steps.alpha), 0.0, 1.0)[:, None],
-            ],
-            axis=1,
-        ),
-        motions=b[op.A_MOTION].astype(np.float64) * m_step,
-        mu_t=b[op.A_MU_T][:, 0].astype(np.float64) * t_step,
-        sigma_t=sigma,
-        # Carried through so reconstruction can apply each row's own validity window.
-        window_index=b[op.A_WINDOW_INDEX][:, 0].astype(np.int64),
-    )
+    never_fades = (b[op.A_FLAGS][:, 0] & op.FLAG_NEVER_FADES) != 0
+    # These rows already crossed `_check_state_f32`. Repeating the same arithmetic for the
+    # public value view must not leak an expected overflow/underflow warning, especially
+    # for the legal never_fades infinity and finite-sigma underflow cases.
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        sigma = np.where(never_fades, np.inf, np.exp(sigma_bins * grids.steps.sigma_log))
+        m_step = grids.motion_step(sigma_bins, never_fades, b[op.A_WINDOW_INDEX][:, 0])[:, None]
+        t_step = grids.mu_step(sigma_bins, never_fades)
+        return dict(
+            positions=dequantize(b[op.A_POSITION], grids.steps.pos, grids.origin),
+            scales=np.exp(dequantize(b[op.A_SCALE], grids.steps.scale_log)),
+            rotations=dequantize_rotation(b[op.A_ROTATION_INDEX][:, 0], b[op.A_ROTATION], grids.steps.rot),
+            colors=np.concatenate(
+                [
+                    np.clip(dequantize(rct_inverse(b[op.A_COLOR]), grids.steps.rgb), 0.0, 1.0),
+                    np.clip(dequantize(b[op.A_OPACITY][:, 0], grids.steps.alpha), 0.0, 1.0)[:, None],
+                ],
+                axis=1,
+            ),
+            motions=dequantize(b[op.A_MOTION], m_step),
+            mu_t=dequantize(b[op.A_MU_T][:, 0], t_step),
+            sigma_t=sigma,
+            # Carried through so reconstruction can apply each row's own validity window.
+            window_index=b[op.A_WINDOW_INDEX][:, 0].astype(np.int64),
+        )
 
 
 def reconstruct_at(state: State, grids: Grids, t: float) -> dict:
@@ -2263,7 +2600,7 @@ def reconstruct_at(state: State, grids: Grids, t: float) -> dict:
     position = values["positions"][order]
     motion = values["motions"][order]
     color = values["colors"][order]
-    with np.errstate(over="ignore"):
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
         marginal = np.where(np.isinf(sigma), 1.0, np.exp(-0.5 * ((t - mu) / sigma) ** 2))
     # A gaussian is absent outside its own validity window, exactly as the gaussian-birth
     # path decides it (`model.py`: `win_lo <= t < win_hi`). This was unobservable while

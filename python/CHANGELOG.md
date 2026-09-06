@@ -8,6 +8,14 @@ All notable changes to the Python package are documented here, following
 
 ### Changed
 
+- **Readers refuse decoded binary32 attribute overflow by name.** Gaussian-birth and keyframe-delta
+  decoding now completes each floating reconstruction in binary64 and returns `decoded-f32-overflow`
+  before a NaN, infinity or out-of-range result can narrow into state. Diagnostics identify the
+  physical Chunk or Delta Chunk byte, row, identity where present, attribute component, contributing
+  bin, and effective step and origin where applicable. Zero bins remain legal beside the greatest
+  finite binary64 steps, ordinary underflow remains legal, and the `never_fades` sigma infinity
+  remains the format's sole sentinel exception.
+
 - **Decoded Chunk Index counts are verified as `index-record-mismatch`.** Both ordinary read paths
   now compare `gaussian_count` with validated Chunk rows or Delta operations, and keyframe-delta
   reads compare `live_count` with every composed state, keyframes included. The check runs only for

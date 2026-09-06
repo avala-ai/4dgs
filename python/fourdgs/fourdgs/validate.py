@@ -819,7 +819,7 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
         except FourdgsError as exc:
             site = band_site
             if site is None and entry is not None:
-                what = "Chunk" if entry.kind == 0 else "DeltaChunk"
+                what = "Chunk" if entry.kind == 0 else "Delta Chunk"
                 site = Site(entry.chunk_offset, f"the {what} record at index entry {i}")
             report.refused("a chunk does not decode: ", exc, walk, site)
             return

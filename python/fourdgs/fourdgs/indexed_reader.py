@@ -391,6 +391,7 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
         np.asarray(scene.quantization.pos_origin),
         scene.windows,
         scene.header.cutoff,
+        record_offset=entry.chunk_offset,
     )
     check_index_count(
         entry,

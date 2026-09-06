@@ -489,6 +489,7 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
                     np.asarray(quant.pos_origin),
                     windows,
                     cutoff,
+                    record_offset=frame.offset,
                 )
             except FourdgsError as exc:
                 return ChunkRefusal(exc, here)

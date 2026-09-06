@@ -244,7 +244,19 @@ def quantize(values, step: float, origin=0.0) -> np.ndarray:
 
 
 def dequantize(bins, step: float, origin=0.0) -> np.ndarray:
-    return np.asarray(bins, dtype=np.float64) * step + origin
+    values = np.asarray(bins, dtype=np.float64)
+    reconstructed = np.zeros_like(values)
+    # A declared step is finite, but a per-gaussian effective step can exceed binary64.
+    # Its zero bin still denotes exactly the finite origin; evaluating `0 * inf` first
+    # would manufacture a NaN and turn a legal result into decoded-f32-overflow.
+    # Non-zero bins still have to produce their true infinity/NaN so the decoded-f32
+    # boundary can refuse them.  Suppress only NumPy's process-global floating-point
+    # notification: the caller diagnoses the resulting value, and applications are free
+    # to have installed ``np.seterr(all="raise")`` before entering the decoder.
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        np.multiply(values, step, out=reconstructed, where=values != 0)
+        reconstructed += origin
+    return reconstructed
 
 
 # --------------------------------------------------------------------------
@@ -262,24 +274,30 @@ def life_class(sigma_bins, sigma_log_step: float, never_fades, window_len, k: fl
     `k` comes from the file's own cutoff (spec section 6.3); it defaults to the default
     cutoff's value so a caller that has no header still gets the common case right.
     """
-    sigma = np.exp(np.asarray(sigma_bins, dtype=np.float64) * sigma_log_step)
-    half = np.where(never_fades, np.asarray(window_len, dtype=np.float64), k * sigma)
-    half = np.clip(half, LIFE_HALF_MIN, LIFE_HALF_MAX)
-    cls = np.ceil(np.log2(half / LIFE_REF))
-    return np.clip(cls, LIFE_MIN_CLASS, LIFE_MAX_CLASS).astype(np.int64)
+    # Finite declarations may legitimately overflow or underflow an intermediate.  The
+    # completed effective grid, and ultimately its reconstructed lane, decides validity;
+    # do not let a caller's global NumPy warning policy decide it first.
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        sigma = np.exp(np.asarray(sigma_bins, dtype=np.float64) * sigma_log_step)
+        half = np.where(never_fades, np.asarray(window_len, dtype=np.float64), k * sigma)
+        half = np.clip(half, LIFE_HALF_MIN, LIFE_HALF_MAX)
+        cls = np.ceil(np.log2(half / LIFE_REF))
+        return np.clip(cls, LIFE_MIN_CLASS, LIFE_MAX_CLASS).astype(np.int64)
 
 
 def motion_steps(classes, step_ref: float) -> np.ndarray:
-    return step_ref * np.power(2.0, -np.asarray(classes, dtype=np.float64))
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        return step_ref * np.power(2.0, -np.asarray(classes, dtype=np.float64))
 
 
 def mu_steps(sigma_bins, sigma_log_step: float, never_fades, step_ref: float) -> np.ndarray:
     """Birth-time pitch: `step_ref`, refined by powers of two until it is at most
     `MU_REL` of the gaussian's own sigma."""
-    sigma = np.exp(np.asarray(sigma_bins, dtype=np.float64) * sigma_log_step)
-    target = np.where(never_fades, step_ref, np.minimum(step_ref, MU_REL * sigma))
-    cls = np.clip(np.floor(np.log2(target / step_ref)), MU_MIN_CLASS, 0)
-    return step_ref * np.power(2.0, cls)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        sigma = np.exp(np.asarray(sigma_bins, dtype=np.float64) * sigma_log_step)
+        target = np.where(never_fades, step_ref, np.minimum(step_ref, MU_REL * sigma))
+        cls = np.clip(np.floor(np.log2(target / step_ref)), MU_MIN_CLASS, 0)
+        return step_ref * np.power(2.0, cls)
 
 
 # --------------------------------------------------------------------------
