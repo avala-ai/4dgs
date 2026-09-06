@@ -8,6 +8,12 @@ All notable changes to the Python package are documented here, following
 
 ### Changed
 
+- **Optional identity lanes now have one zero-default rule.** Gaussian-birth assembly pads omitted
+  `source_group`, `source_index` and `object_id` rows when another Chunk carries the lane.
+  Keyframe-delta births do the same, omitted updates carry the reference label forward, and present
+  updates replace labels absolutely rather than treating them as bin differences. Both maintained
+  conformance read paths now prove the shared optional-identity witnesses.
+
 - **Collecting readers now have a configurable aggregate decoded-state budget.** `read`,
   `keyframe_delta_file.decode_streamed` and `decode_indexed` accept the additive
   `max_decoded_state_bytes` keyword, defaulting to 536,870,912 bytes. They account for retained

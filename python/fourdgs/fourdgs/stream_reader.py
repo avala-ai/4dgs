@@ -242,6 +242,7 @@ def decode_streams(
             "mu_t": np.zeros(0),
             "sigma_t": np.zeros(0),
             "window_index": np.zeros(0, dtype=np.int64),
+            "source_group": None,
             "source_index": None,
             "object_id": None,
         }
@@ -400,6 +401,7 @@ def decode_streams(
         "mu_t": mu_t,
         "sigma_t": sigma,
         "window_index": window_index,
+        "source_group": got[op.A_SOURCE_GROUP][:, 0] if op.A_SOURCE_GROUP in got else None,
         "source_index": got[op.A_SOURCE_INDEX][:, 0] if op.A_SOURCE_INDEX in got else None,
         # Exact: signed stream codes are the two's-complement bit view of all u32 ids.
         "object_id": object_id,
@@ -868,15 +870,17 @@ def _assemble(
             sh_degree=header.sh_degree,
         )
     count = sum(len(chunk["mu_t"]) for chunk in chunks)
-    sources = [chunk["source_index"] for chunk in chunks]
-    objects = [chunk["object_id"] for chunk in chunks]
+    source_groups = [chunk["source_group"] for chunk in chunks]
+    source_indexes = [chunk["source_index"] for chunk in chunks]
+    object_ids = [chunk["object_id"] for chunk in chunks]
     present_bands = sorted({band for bands in (chunk_bands or []) for band in bands})
     coefficients = SH_BAND_RANGE[present_bands[-1]][1] if present_bands else 0
     output_bytes = gaussian_set_output_bytes(
         count,
         sh_coefficients=coefficients,
-        source_index=all(source is not None for source in sources),
-        object_id=any(object_ids is not None for object_ids in objects),
+        source_group=any(values is not None for values in source_groups),
+        source_index=any(values is not None for values in source_indexes),
+        object_id=any(values is not None for values in object_ids),
     )
     if budget is not None:
         budget.check(
@@ -887,16 +891,20 @@ def _assemble(
     table = window_table_or_default(windows)
     idx = np.concatenate([c["window_index"] for c in chunks])
     check_window_indices(idx, len(table))
-    object_id = (
-        np.concatenate(
+
+    def merge_identity(values: list[np.ndarray | None], dtype) -> np.ndarray | None:
+        if not any(column is not None for column in values):
+            return None
+        return np.concatenate(
             [
-                np.zeros(len(chunk["mu_t"]), dtype=np.uint32) if ids is None else ids
-                for chunk, ids in zip(chunks, objects, strict=True)
+                np.zeros(len(chunk["mu_t"]), dtype=dtype) if column is None else np.asarray(column, dtype=dtype)
+                for chunk, column in zip(chunks, values, strict=True)
             ]
         )
-        if any(ids is not None for ids in objects)
-        else None
-    )
+
+    source_group = merge_identity(source_groups, np.int64)
+    source_index = merge_identity(source_indexes, np.int64)
+    object_id = merge_identity(object_ids, np.uint32)
     sh = merge_chunk_bands([len(c["mu_t"]) for c in chunks], chunk_bands or [])
     return GaussianSet(
         positions=np.concatenate([c["positions"] for c in chunks]).astype(np.float32),
@@ -912,6 +920,7 @@ def _assemble(
         win_hi=np.asarray(table[idx, 1], dtype=np.float64),
         sh=sh,
         sh_degree=header.sh_degree,
-        source_index=np.concatenate(sources) if all(source is not None for source in sources) else None,
+        source_group=source_group,
+        source_index=source_index,
         object_id=object_id,
     )

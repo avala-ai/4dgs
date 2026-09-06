@@ -274,40 +274,54 @@ def test_every_composed_column_is_as_tall_as_the_population():
     )
     grown = _apply(
         state,
-        births=([3], {op.A_POSITION: np.asarray([[2, 2, 2]]), op.A_OBJECT_ID: np.asarray([[7]])}),
+        births=(
+            [3],
+            {
+                op.A_POSITION: np.asarray([[2, 2, 2]]),
+                op.A_SOURCE_GROUP: np.asarray([[-7]]),
+                op.A_SOURCE_INDEX: np.asarray([[9]]),
+                op.A_OBJECT_ID: np.asarray([[7]]),
+            },
+        ),
     )
     assert grown.count == 3
     for attribute, column in grown.bins.items():
         assert column.shape[0] == 3, f"attribute {attribute}: {column.shape}"
+    assert grown.bins[op.A_SOURCE_GROUP].reshape(-1).tolist() == [0, 0, -7]
+    assert grown.bins[op.A_SOURCE_INDEX].reshape(-1).tolist() == [0, 0, 9]
     assert grown.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [0, 0, 7]
 
     later = _apply(grown, births=([4], {op.A_POSITION: np.asarray([[3, 3, 3]])}))
     assert later.count == 4
-    assert later.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [0, 0, 7, 0]
+    for attribute, expected in (
+        (op.A_SOURCE_GROUP, [0, 0, -7, 0]),
+        (op.A_SOURCE_INDEX, [0, 0, 9, 0]),
+        (op.A_OBJECT_ID, [0, 0, 7, 0]),
+    ):
+        assert later.bins[attribute].reshape(-1).tolist() == expected
 
 
-def test_only_object_id_has_a_value_for_a_row_nothing_gave_one():
-    """§6.6 gives `object_id` a default and no section gives one to the producer lanes.
-
-    "Optional" says a file may omit the stream. It does not say what a composed column
-    holds for a row whose birth omitted it, and zero is a label like any other — reading
-    one that was never written is inventing it. So `object_id` pads and `source_index`
-    is refused, which is where TypeScript and Swift already stand.
-    """
-    with_object = kd.keyframe_state(
+@pytest.mark.parametrize("attribute", [op.A_SOURCE_GROUP, op.A_SOURCE_INDEX, op.A_OBJECT_ID])
+def test_every_optional_identity_lane_defaults_an_omitted_birth_to_zero(attribute):
+    state = kd.keyframe_state(
         np.asarray([1]),
-        {op.A_POSITION: np.asarray([[0, 0, 0]]), op.A_OBJECT_ID: np.asarray([[7]])},
+        {op.A_POSITION: np.asarray([[0, 0, 0]]), attribute: np.asarray([[7]])},
     )
-    grown = _apply(with_object, births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]])}))
-    assert grown.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [7, 0]
+    grown = _apply(state, births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]])}))
+    assert grown.bins[attribute].reshape(-1).tolist() == [7, 0]
 
-    with_source = kd.keyframe_state(
-        np.asarray([1]),
-        {op.A_POSITION: np.asarray([[0, 0, 0]]), op.A_SOURCE_INDEX: np.asarray([[7]])},
-    )
-    with pytest.raises(MalformedFile) as caught:
-        _apply(with_source, births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]])}))
-    assert caught.value.code == "incomplete-birth"
+
+@pytest.mark.parametrize("attribute", [op.A_SOURCE_GROUP, op.A_SOURCE_INDEX, op.A_OBJECT_ID])
+def test_identity_update_materializes_reference_zeros_and_replaces_absolutely(attribute):
+    state = _state([1, 2], [[0, 0, 0], [1, 1, 1]])
+    introduced = _apply(state, updates=([2], {attribute: np.asarray([[7]])}))
+    assert introduced.bins[attribute].reshape(-1).tolist() == [0, 7]
+
+    carried = _apply(introduced, updates=([2], {op.A_POSITION: np.asarray([[1, 0, 0]])}))
+    assert carried.bins[attribute].reshape(-1).tolist() == [0, 7]
+
+    replaced = _apply(carried, updates=([2], {attribute: np.asarray([[-3]])}))
+    assert replaced.bins[attribute].reshape(-1).tolist() == [0, -3]
 
 
 def test_a_keyframe_may_state_an_empty_population_and_let_a_birth_fill_it():

@@ -41,6 +41,7 @@ from fourdgs.opcode import HEADER
 from fourdgs.readable import FileReadable
 from fourdgs.records import Header
 from fourdgs.serialization import MAGIC, iter_records
+from optional_identity import gaussian_birth_rows, is_witness, keyframe_delta_states
 from refusal import refusal_answer
 
 UNSUPPORTED: frozenset[str] = frozenset()
@@ -115,7 +116,8 @@ def run(path: str, *, max_decoded_state_bytes: int = fourdgs.DEFAULT_MAX_DECODED
         # canonical states must match the streamed path's exactly. Its own runner asserts
         # that agreement — here we emit the indexed decode so the harness diffs it against
         # the same committed expectation the streamed runner is held to.
-        return canonical(kdf.states_json(kdf.decode_indexed(data, max_decoded_state_bytes=max_decoded_state_bytes)[0]))
+        decoded = kdf.decode_indexed(data, max_decoded_state_bytes=max_decoded_state_bytes)[0]
+        return canonical(keyframe_delta_states(decoded) if is_witness(decoded.header) else kdf.states_json(decoded))
 
     budget = DecodedStateBudget(max_decoded_state_bytes)
     with FileReadable(path) as raw:
@@ -154,6 +156,9 @@ def run(path: str, *, max_decoded_state_bytes: int = fourdgs.DEFAULT_MAX_DECODED
         [chunk.get("sh", {}) for chunk in chunks],
         budget=budget,
     )
+
+    if is_witness(scene.header):
+        return canonical(gaussian_birth_rows(gaussians))
 
     return canonical(
         summarize(

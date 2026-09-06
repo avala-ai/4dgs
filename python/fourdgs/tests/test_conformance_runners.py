@@ -105,6 +105,21 @@ def test_one_byte_decoded_state_budget_is_the_portable_resource_result(runner, t
 
 
 @pytest.mark.parametrize("runner", RUNNERS)
+def test_optional_identity_witnesses_match_the_shared_canonical(runner, tmp_path):
+    for _model, _name, data, expectation in generate.build_optional_identity_corpus():
+        done = _run(runner, data, tmp_path)
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == json.loads(expectation)
+        assert done.stderr == ""
+
+
+def test_optional_identity_witnesses_are_valid_files():
+    for _model, name, data, _expectation in generate.build_optional_identity_corpus():
+        report = validate(data)
+        assert report.ok, f"{name}: {[str(finding) for finding in report.findings]}"
+
+
+@pytest.mark.parametrize("runner", RUNNERS)
 def test_an_unnamed_error_is_a_failed_invocation(runner, tmp_path):
     """No refusal document, a diagnosis on stderr, and a non-zero status.
 
