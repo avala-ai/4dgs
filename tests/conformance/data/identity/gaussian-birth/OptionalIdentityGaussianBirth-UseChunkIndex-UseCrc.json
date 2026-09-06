@@ -1,0 +1,55 @@
+{
+  "identityRows": [
+    {
+      "objectId": "2147483648",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "sourceGroup": "-2147483648",
+      "sourceIndex": "2147483647"
+    },
+    {
+      "objectId": "4294967295",
+      "position": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "sourceGroup": "2147483647",
+      "sourceIndex": "-2147483648"
+    },
+    {
+      "objectId": "0",
+      "position": [
+        2.0,
+        0.0,
+        0.0
+      ],
+      "sourceGroup": "0",
+      "sourceIndex": "0"
+    },
+    {
+      "objectId": "0",
+      "position": [
+        3.0,
+        0.0,
+        0.0
+      ],
+      "sourceGroup": "0",
+      "sourceIndex": "0"
+    },
+    {
+      "objectId": "0",
+      "position": [
+        4.0,
+        0.0,
+        0.0
+      ],
+      "sourceGroup": "0",
+      "sourceIndex": "0"
+    }
+  ],
+  "temporalModel": "gaussian-birth"
+}

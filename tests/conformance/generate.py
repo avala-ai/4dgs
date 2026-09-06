@@ -40,6 +40,7 @@ INVALID = os.path.join(DATA, "invalid")
 LATE_FRONT_MATTER = os.path.join(INVALID, "late-front-matter")
 KEYFRAME = os.path.join(DATA, "keyframe")
 OBJECT = os.path.join(DATA, "object")
+IDENTITY = os.path.join(DATA, "identity")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
 sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
@@ -51,6 +52,8 @@ import invalid
 import scenarios
 from canonical import canonical, summarize
 from fourdgs import keyframe_delta_file as kdf
+from fourdgs import opcode as op
+from fourdgs import records as rec
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 from fourdgs.model import DEFAULT_CUTOFF
 from fourdgs.object_layer import ObjectLayer
@@ -78,7 +81,7 @@ from fourdgs.records import (
     RigTrajectory,
     SensorCalibration,
 )
-from fourdgs.serialization import put_record
+from fourdgs.serialization import MAGIC, crc32, encode_stream, put_record
 
 MAX_DATA_BYTES = 2_500_000
 
@@ -632,6 +635,396 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
         expectation = canonical(kdf.states_json(kdf.decode_streamed(data)))
         out.append((name, data, expectation))
     return out
+
+
+# --------------------------------------------------------------------------
+# optional-identity conformance family
+# --------------------------------------------------------------------------
+#
+# These files follow the normative decision in
+# `website/docs/spec/proposals/optional-identity-zero-defaults.md`, ahead of any SDK
+# claiming it.  They therefore cannot be written or summarized through the current
+# reference SDK: doing that would either omit the three streams or make today's Python
+# behaviour the contract the other languages are asked to implement.  The small encoder
+# below uses only the public wire record/stream encoders and writes the expected logical
+# identity state explicitly.  `test_verify.py` independently inspects the physical
+# streams, counts, references and omitted groups, so the expectation cannot accidentally
+# describe a different file.
+
+IDENTITY_MARKER_KEY = "conformance"
+IDENTITY_MARKER_VALUE = "optional-identity-zero-defaults-v1"
+OPTIONAL_IDENTITY_ATTRIBUTES = (op.A_SOURCE_GROUP, op.A_SOURCE_INDEX, op.A_OBJECT_ID)
+
+
+def _identity_front(temporal_model: str, duration: float, gaussian_count: int, aabb: list[float]) -> list[bytes]:
+    """Common deterministic front matter for the two identity witnesses."""
+    return [
+        MAGIC,
+        rec.Header(
+            duration_sec=duration,
+            gaussian_count=gaussian_count,
+            aabb=aabb,
+            profile="capture",
+            library="4dgs conformance optional-identity generator",
+            temporal_model=temporal_model,
+            cutoff=0.05,
+            attributes={IDENTITY_MARKER_KEY: IDENTITY_MARKER_VALUE},
+        ).encode(),
+        rec.Quantization(
+            scheme="uniform-v1",
+            pos_origin=[0.0, 0.0, 0.0],
+            step_pos=1.0,
+            step_scale_log=1.0,
+            step_rot=1.0,
+            step_rgb=1.0,
+            step_alpha=1.0,
+            step_motion=1.0,
+            step_time=1.0,
+            step_sigma_log=1.0,
+            step_sh=1,
+        ).encode(),
+        rec.WindowTable(windows=[(0.0, duration)]).encode(),
+    ]
+
+
+def _identity_required(positions: list[list[int]], mu_t: int) -> dict[int, np.ndarray]:
+    """A complete, deliberately simple set of absolute gaussian bins."""
+    count = len(positions)
+    zeros3 = np.zeros((count, 3), dtype=np.int64)
+    return {
+        op.A_POSITION: np.asarray(positions, dtype=np.int64).reshape(count, 3),
+        op.A_SCALE: zeros3,
+        op.A_ROTATION_INDEX: np.full((count, 1), 3, dtype=np.int64),
+        op.A_ROTATION: zeros3,
+        op.A_COLOR: zeros3,
+        op.A_OPACITY: np.ones((count, 1), dtype=np.int64),
+        op.A_MOTION: zeros3,
+        op.A_MU_T: np.full((count, 1), mu_t, dtype=np.int64),
+        op.A_SIGMA_T: np.zeros((count, 1), dtype=np.int64),
+        op.A_FLAGS: np.zeros((count, 1), dtype=np.int64),
+        op.A_WINDOW_INDEX: np.zeros((count, 1), dtype=np.int64),
+    }
+
+
+def _identity_streams(
+    bins: dict[int, np.ndarray],
+    *,
+    gaussian_ids: list[int] | None = None,
+) -> bytes:
+    """Encode one keyframe/delta group in stable attribute-id order."""
+    streams: list[bytes] = []
+    if gaussian_ids is not None:
+        streams.append(encode_stream(op.A_GAUSSIAN_ID, np.asarray(gaussian_ids, dtype=np.int64)))
+    for attribute, values in sorted(bins.items()):
+        array = np.asarray(values, dtype=np.int64)
+        channels = 1 if array.ndim == 1 else int(array.shape[1])
+        streams.append(
+            encode_stream(
+                attribute,
+                array,
+                channels=channels,
+                # Keep exact identity streams raw: adjacent signed endpoints (and u32
+                # same-bit codes) can need a 33-bit intra-stream subtraction even though
+                # every label fits its domain. That compression mode is independent of
+                # state-chunk update semantics.
+                allow_delta=attribute not in OPTIONAL_IDENTITY_ATTRIBUTES,
+            )
+        )
+    return b"".join(streams)
+
+
+def _identity_finish(
+    parts: list[bytes],
+    indexes: list[rec.ChunkIndexEntry],
+    statistics: rec.Statistics | None = None,
+) -> bytes:
+    """Append the indexed summary, its CRC, and trailing magic."""
+    summary_start = sum(len(part) for part in parts)
+    summary_records = [entry.encode() for entry in indexes]
+    if statistics is not None:
+        summary_records.append(statistics.encode())
+    summary = b"".join(summary_records)
+    parts.extend(
+        [
+            summary,
+            rec.Footer(summary_start=summary_start, summary_crc=crc32(summary)).encode(),
+            MAGIC,
+        ]
+    )
+    return b"".join(parts)
+
+
+def _identity_row(
+    *,
+    source_group: int,
+    source_index: int,
+    object_id: int,
+    position: list[float] | None = None,
+    gaussian_id: int | None = None,
+) -> dict:
+    """One row in the capability's exact canonical result."""
+    row = {
+        "sourceGroup": str(source_group),
+        "sourceIndex": str(source_index),
+        "objectId": str(object_id),
+    }
+    if position is not None:
+        row["position"] = [canonical_module.num(value) for value in position]
+    if gaussian_id is not None:
+        row["gaussianId"] = str(gaussian_id)
+    return row
+
+
+def _build_gaussian_birth_identity() -> tuple[str, bytes, str]:
+    """Mixed physical Chunk presence, with omitted and explicit zero rows."""
+    name = "OptionalIdentityGaussianBirth-UseChunkIndex-UseCrc"
+    parts = _identity_front("gaussian-birth", 1.0, 5, [0.0, 0.0, 0.0, 4.0, 0.0, 0.0])
+    indexes: list[rec.ChunkIndexEntry] = []
+
+    present_bins = _identity_required([[0, 0, 0], [1, 0, 0], [2, 0, 0]], 0)
+    present_bins.update(
+        {
+            op.A_SOURCE_GROUP: np.asarray([-(2**31), 2**31 - 1, 0], dtype=np.int64),
+            op.A_SOURCE_INDEX: np.asarray([2**31 - 1, -(2**31), 0], dtype=np.int64),
+            # Same-bit signed stream codes for u32 values 0x80000000, 0xffffffff and 0.
+            op.A_OBJECT_ID: np.asarray([-(2**31), -1, 0], dtype=np.int64),
+        }
+    )
+    omitted_bins = _identity_required([[3, 0, 0], [4, 0, 0]], 0)
+    for bins in (present_bins, omitted_bins):
+        count = int(bins[op.A_POSITION].shape[0])
+        blob = rec.encode_chunk(0.0, 1.0, 0, count, _identity_streams(bins))
+        at = sum(len(part) for part in parts)
+        parts.append(blob)
+        indexes.append(
+            rec.ChunkIndexEntry(
+                t0=0.0,
+                t1=1.0,
+                chunk_offset=at,
+                chunk_length=len(blob),
+                gaussian_count=count,
+            )
+        )
+
+    data = _identity_finish(parts, indexes)
+    expectation = canonical(
+        {
+            "temporalModel": "gaussian-birth",
+            "identityRows": [
+                _identity_row(
+                    position=[0.0, 0.0, 0.0],
+                    source_group=-(2**31),
+                    source_index=2**31 - 1,
+                    object_id=2**31,
+                ),
+                _identity_row(
+                    position=[1.0, 0.0, 0.0],
+                    source_group=2**31 - 1,
+                    source_index=-(2**31),
+                    object_id=2**32 - 1,
+                ),
+                _identity_row(
+                    position=[2.0, 0.0, 0.0],
+                    source_group=0,
+                    source_index=0,
+                    object_id=0,
+                ),
+                _identity_row(
+                    position=[3.0, 0.0, 0.0],
+                    source_group=0,
+                    source_index=0,
+                    object_id=0,
+                ),
+                _identity_row(
+                    position=[4.0, 0.0, 0.0],
+                    source_group=0,
+                    source_index=0,
+                    object_id=0,
+                ),
+            ],
+        }
+    )
+    return name, data, expectation
+
+
+def _build_keyframe_delta_identity() -> tuple[str, bytes, str]:
+    """One compact sequence covering every optional-identity composition transition."""
+    name = "OptionalIdentityKeyframeDelta-UseChunkIndex-UseCrc-UseStatistics"
+    duration = 7.0
+    parts = _identity_front("keyframe-delta", duration, 4, [0.0, 0.0, 0.0, 3.0, 0.0, 0.0])
+    indexes: list[rec.ChunkIndexEntry] = []
+    offsets: list[int] = []
+    keyframe_offset = 0
+
+    def emit_keyframe(t0: int, ids: list[int], positions: list[list[int]]) -> None:
+        nonlocal keyframe_offset
+        bins = _identity_required(positions, t0)
+        blob = rec.encode_chunk(float(t0), float(t0 + 1), 0, len(ids), _identity_streams(bins, gaussian_ids=ids))
+        at = sum(len(part) for part in parts)
+        parts.append(blob)
+        offsets.append(at)
+        keyframe_offset = at
+        indexes.append(
+            rec.ChunkIndexEntry(
+                t0=float(t0),
+                t1=float(t0 + 1),
+                chunk_offset=at,
+                chunk_length=len(blob),
+                gaussian_count=len(ids),
+                extended=True,
+                kind=0,
+                keyframe_offset=at,
+                live_count=len(ids),
+            )
+        )
+
+    def emit_delta(
+        t0: int,
+        *,
+        update_ids: list[int] | None = None,
+        update_bins: dict[int, np.ndarray] | None = None,
+        birth_ids: list[int] | None = None,
+        birth_bins: dict[int, np.ndarray] | None = None,
+        live_count: int,
+    ) -> None:
+        update_ids = update_ids or []
+        birth_ids = birth_ids or []
+        updates = _identity_streams(update_bins or {}, gaussian_ids=update_ids) if update_ids else b""
+        births = _identity_streams(birth_bins or {}, gaussian_ids=birth_ids) if birth_ids else b""
+        reference_offset = offsets[-1]
+        depth = indexes[-1].depth + 1
+        blob = rec.encode_delta_chunk(
+            float(t0),
+            float(t0 + 1),
+            level=0,
+            delta_mode=DELTA_MODE_CHAINED,
+            reference_offset=reference_offset,
+            keyframe_offset=keyframe_offset,
+            depth=depth,
+            updates=updates,
+            births=births,
+            deaths=b"",
+            counts=(len(update_ids), len(birth_ids), 0),
+        )
+        at = sum(len(part) for part in parts)
+        parts.append(blob)
+        offsets.append(at)
+        indexes.append(
+            rec.ChunkIndexEntry(
+                t0=float(t0),
+                t1=float(t0 + 1),
+                chunk_offset=at,
+                chunk_length=len(blob),
+                gaussian_count=len(update_ids) + len(birth_ids),
+                extended=True,
+                kind=1,
+                delta_mode=DELTA_MODE_CHAINED,
+                reference_offset=reference_offset,
+                keyframe_offset=keyframe_offset,
+                depth=depth,
+                live_count=live_count,
+            )
+        )
+
+    # Complete keyframe omission gives both existing rows logical zero.
+    emit_keyframe(0, [10, 20], [[0, 0, 0], [1, 0, 0]])
+    # All three lanes are introduced by an update into a physically absent reference.
+    emit_delta(
+        1,
+        update_ids=[10],
+        update_bins={
+            op.A_SOURCE_GROUP: np.asarray([-17], dtype=np.int64),
+            op.A_SOURCE_INDEX: np.asarray([23], dtype=np.int64),
+            op.A_OBJECT_ID: np.asarray([-1], dtype=np.int64),
+        },
+        live_count=2,
+    )
+    # A birth omitting all three appends logical zeros beside the present survivor columns.
+    emit_delta(
+        2,
+        birth_ids=[30],
+        birth_bins=_identity_required([[2, 0, 0]], 2),
+        live_count=3,
+    )
+    # A touched row with no identity stream carries all reference labels forward.
+    emit_delta(
+        3,
+        update_ids=[10],
+        update_bins={op.A_POSITION: np.asarray([[1, 0, 0]], dtype=np.int64)},
+        live_count=3,
+    )
+    # Present update values are absolute labels, so explicit zero resets rather than adds.
+    emit_delta(
+        4,
+        update_ids=[10],
+        update_bins={attribute: np.asarray([0], dtype=np.int64) for attribute in OPTIONAL_IDENTITY_ATTRIBUTES},
+        live_count=3,
+    )
+    # A new complete keyframe does not inherit identity from the preceding GOP.
+    emit_keyframe(5, [10, 20], [[0, 0, 0], [1, 0, 0]])
+    # A birth introduces all three columns into an absent reference: survivors are the
+    # zero prefix, followed by exact signed labels and a same-bit u32 object id.
+    emit_delta(
+        6,
+        birth_ids=[40],
+        birth_bins={
+            **_identity_required([[3, 0, 0]], 6),
+            op.A_SOURCE_GROUP: np.asarray([2**31 - 1], dtype=np.int64),
+            op.A_SOURCE_INDEX: np.asarray([-(2**31)], dtype=np.int64),
+            op.A_OBJECT_ID: np.asarray([-(2**31)], dtype=np.int64),
+        },
+        live_count=3,
+    )
+
+    data = _identity_finish(
+        parts,
+        indexes,
+        rec.Statistics(
+            gaussian_count=4,
+            chunk_count=len(indexes),
+            duration_sec=duration,
+            aabb=[0.0, 0.0, 0.0, 3.0, 0.0, 0.0],
+        ),
+    )
+
+    def state(t: int, rows: list[tuple[int, int, int, int]]) -> dict:
+        return {
+            "t": canonical_module.num(float(t)),
+            "rows": [
+                _identity_row(
+                    gaussian_id=gaussian_id,
+                    source_group=source_group,
+                    source_index=source_index,
+                    object_id=object_id,
+                )
+                for gaussian_id, source_group, source_index, object_id in rows
+            ],
+        }
+
+    labelled = [(10, -17, 23, 2**32 - 1), (20, 0, 0, 0)]
+    expectation = canonical(
+        {
+            "temporalModel": "keyframe-delta",
+            "identityStates": [
+                state(0, [(10, 0, 0, 0), (20, 0, 0, 0)]),
+                state(1, labelled),
+                state(2, [*labelled, (30, 0, 0, 0)]),
+                state(3, [*labelled, (30, 0, 0, 0)]),
+                state(4, [(10, 0, 0, 0), (20, 0, 0, 0), (30, 0, 0, 0)]),
+                state(5, [(10, 0, 0, 0), (20, 0, 0, 0)]),
+                state(6, [(10, 0, 0, 0), (20, 0, 0, 0), (40, 2**31 - 1, -(2**31), 2**31)]),
+            ],
+        }
+    )
+    return name, data, expectation
+
+
+def build_optional_identity_corpus() -> list[tuple[str, str, bytes, str]]:
+    """Capability-gated witnesses as ``(subdirectory, name, bytes, expectation)``."""
+    return [
+        ("gaussian-birth", *_build_gaussian_birth_identity()),
+        ("keyframe-delta", *_build_keyframe_delta_identity()),
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -1309,6 +1702,21 @@ def write_corpus(target: str) -> Corpus:
         checksums[f"object/{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
         expectations[f"object/{name}"] = expectation + "\n"
 
+    # Optional identity defaults are capability-gated valid files.  Their two temporal
+    # models stay in named subdirectories so downloadable-corpus manifests can report the
+    # model without interpreting a Header (which would be wrong for invalid files).
+    for model, name, data, expectation in build_optional_identity_corpus():
+        directory = os.path.join(target, "identity", model)
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, f"{name}.4dgs"), "wb") as fh:
+            fh.write(data)
+        with open(os.path.join(directory, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(expectation + "\n")
+        qualified = f"identity/{model}/{name}"
+        checksums[f"{qualified}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"{qualified}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[qualified] = expectation + "\n"
+
     invalid_dir = os.path.join(target, "invalid")
     late_front_matter_dir = os.path.join(invalid_dir, "late-front-matter")
     os.makedirs(invalid_dir, exist_ok=True)
@@ -1349,6 +1757,8 @@ def read_expectations() -> dict[str, str]:
         (LATE_FRONT_MATTER, invalid.LATE_FRONT_MATTER_PREFIX),
         (KEYFRAME, "keyframe/"),
         (OBJECT, "object/"),
+        (os.path.join(IDENTITY, "gaussian-birth"), "identity/gaussian-birth/"),
+        (os.path.join(IDENTITY, "keyframe-delta"), "identity/keyframe-delta/"),
     ):
         if not os.path.isdir(root):
             continue
@@ -1443,6 +1853,8 @@ def _verify(corpus: Corpus, committed_expectations: dict[str, str]) -> bool:
         record(f"keyframe/{name}", data, expectation)
     for name, data, expectation in build_object_corpus():
         record(f"object/{name}", data, expectation)
+    for model, name, data, expectation in build_optional_identity_corpus():
+        record(f"identity/{model}/{name}", data, expectation)
     for name, digest in checksums.items():
         if second.get(name) != digest:
             failures.append(f"{name}: encoder is not deterministic between runs")

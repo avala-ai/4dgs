@@ -75,8 +75,9 @@ def variants() -> list[tuple[str, str]]:
     """Every variant as `(name, relative directory)`, sorted, discovered from disk.
 
     Walked rather than enumerated so this script carries no knowledge of the corpus's
-    shape. `data/keyframe/`, `data/object/` and `data/invalid/` are families the generator
-    decided on, and a family added tomorrow is packed without editing this file.
+    shape. `data/keyframe/`, `data/object/`, `data/identity/` and `data/invalid/` are
+    families the generator decided on, and a family added tomorrow is packed without
+    editing this file.
     """
     found = []
     for dirpath, dirnames, filenames in os.walk(DATA):
@@ -147,7 +148,8 @@ def describe(name: str, directory: str, path: str, expectation_path: str) -> dic
         "expectationSha256": sha256(expectation_path),
         "temporalModel": (
             "keyframe-delta"
-            if directory == "keyframe" or qualified in invalid_corpus.KEYFRAME_DELTA_REFUSALS
+            if directory in ("keyframe", "identity/keyframe-delta")
+            or qualified in invalid_corpus.KEYFRAME_DELTA_REFUSALS
             else "gaussian-birth"
         ),
         # Whether a runner that reads through the chunk index may be asked this variant. A
@@ -157,6 +159,10 @@ def describe(name: str, directory: str, path: str, expectation_path: str) -> dic
         # valid indexes, but an indexed opener may stop at the first state and is not asked
         # to scan the tail. This mirrors `supports()` from one shared variant registry.
         "indexed": (invalid or "UseChunkIndex" in name) and qualified not in invalid_corpus.STREAMED_ONLY_REFUSALS,
+        # The live harness enforces the same all-or-none gate from the capabilities
+        # handshake. This additive field lets an outside harness select the downloadable
+        # family without learning that rule from Python source.
+        "requiredCapability": "optionalIdentityDefaults" if directory.startswith("identity/") else None,
         # `null` for a valid variant: it must decode. For an invalid one this is the whole
         # expectation — the identifier of the rule a conforming reader refuses it under.
         "refusal": refusal,
@@ -205,6 +211,9 @@ them usable by somebody who has not cloned it.
     <variant>.json   exactly what a correct decoder must produce from it
     keyframe/        the keyframe-delta temporal model
     object/          the object layer: an Object Table and SE(3) tracks
+    identity/        capability-gated optional identity defaults
+      gaussian-birth/  mixed physical Chunk presence
+      keyframe-delta/  zero-default and materialization transitions
     invalid/         baseline files a conforming reader must refuse
       late-front-matter/  streamed-only, independently gated placement refusals
 ```
@@ -233,7 +242,8 @@ implementation supports, then compare parsed JSON rather than text:
 
 ```bash
 mode=streamed # or indexed
-families=valid,keyframe,object,invalid,invalid/late-front-matter # remove unsupported families
+families=valid,keyframe,object,identity/gaussian-birth
+families=$families,identity/keyframe-delta,invalid,invalid/late-front-matter # remove unsupported families
 allowlist= # optional file: one MANIFEST variant name per line
 selection=$(mktemp) || exit 1
 trap 'rm -f "$selection"' EXIT
@@ -322,8 +332,9 @@ exit "$failed"
 ```
 
 `MANIFEST.json` says which variants a runner may skip and why: `family` separates the base,
-keyframe-delta, object-layer and invalid corpora; `indexed` is false for a variant an indexed reader
-is not obligated to answer; and `refusal` is non-null for a file that must be refused. The JSON beside
+keyframe-delta, object-layer, optional-identity and invalid corpora; `indexed` is false for a variant
+an indexed reader is not obligated to answer; `requiredCapability` names an all-or-none semantic
+claim for a gated valid family; and `refusal` is non-null for a file that must be refused. The JSON beside
 the file is the exact answer: ordinarily `{{"refused": "<identifier>"}}`, while a rule that requires
 structured evidence carries those additional fields too. The exit status is still 0, because a
 refusal is a result rather than a crash. A feature-level partial implementation sets `allowlist` to a text file

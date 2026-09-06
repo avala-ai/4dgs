@@ -22,13 +22,14 @@ A variant's name is its scenario followed by the flags it carries, hyphen-separa
 `MixedLifetimes-Quantized-SHDegree2-UseChunkIndex-UseCrc`. The name is load-bearing in two places:
 the decode harness matches fragments to select runners, and the encode gate makes its second,
 per-band-depth pass only when the name contains `SHDegree`. Most variants sit at the top of `data/`;
-three families live in subdirectories — `data/keyframe/`, `data/object/` and `data/invalid/` — and a
-variant there is named with its directory as a prefix. The 18 independently gated streamed-placement
-witnesses sit one level deeper at `data/invalid/late-front-matter/`, so an SDK unit suite scanning
-the baseline invalid directory does not claim them accidentally. Today there are 48 valid variants
-at the top level, 5 keyframe-delta, 10 object-layer and 29 invalid. The immutable 0.1.0 download
-below remains the 74-variant release described by its manifest; the additional source-tree cases are
-unreleased.
+four families live in subdirectories — `data/keyframe/`, `data/object/`, `data/identity/` and
+`data/invalid/` — and a variant there is named with its directory as a prefix. The two identity
+witnesses are split again by temporal model; the 18 independently gated streamed-placement witnesses
+sit one level deeper at `data/invalid/late-front-matter/`, so an SDK unit suite scanning the
+baseline invalid directory does not claim them accidentally. Today there are 48 valid variants at
+the top level, 5 keyframe-delta, 10 object-layer, 2 optional-identity and 29 invalid. The immutable
+0.1.0 download below remains the 74-variant release described by its manifest; the additional
+source-tree cases are unreleased.
 
 ## The corpus is generated, not committed
 
@@ -83,6 +84,9 @@ and it says what a major, minor and patch bump each mean for a score taken again
     <variant>.json   exactly what a correct decoder must produce from it
     keyframe/        the keyframe-delta temporal model
     object/          the object layer: an Object Table and SE(3) tracks
+    identity/        capability-gated optional identity defaults
+      gaussian-birth/  mixed physical Chunk presence
+      keyframe-delta/  zero-default and materialization transitions
     invalid/         baseline files a conforming reader must refuse
       late-front-matter/  streamed-only, independently gated placement refusals
 ```
@@ -93,9 +97,10 @@ unpacked corpus is a drop-in replacement for a generated one, so nothing that al
 
 `MANIFEST.json` is what a harness that is not `run.py` reads. Per variant it carries both paths,
 both SHA-256s, the byte length, the temporal model, whether a runner reading through the chunk index
-may be asked it at all, and — for an invalid variant — the refusal identifier a conforming reader
-must produce. Those last two are the rules the harness applies when it decides what to skip, written
-down as data so an outside harness does not have to reimplement them by reading Python.
+may be asked it at all, the optional `requiredCapability` for a gated valid family, and — for an
+invalid variant — the refusal identifier a conforming reader must produce. Those last three are the
+rules the harness applies when it decides what to skip, written down as data so an outside harness
+does not have to reimplement them by reading Python.
 
 ### Verify it
 
@@ -184,7 +189,8 @@ argument. It must exit zero and print one JSON object:
   "declines": ["WithObjects"],
   "exactAggregates": true,
   "canonicalStateOrder": true,
-  "aggregateDecodedBudget": true
+  "aggregateDecodedBudget": true,
+  "optionalIdentityDefaults": true
 }
 ```
 
@@ -202,6 +208,11 @@ field. `aggregateDecodedBudget` defaults to false and opts into the separate inj
 below; false makes no memory claim and skips only that gate. A malformed declaration, a non-zero
 exit, or a command that cannot start fails the run; it is not silently treated as an implementation
 that supports nothing.
+
+`optionalIdentityDefaults` defaults to false. True opts into both valid identity witnesses and both
+temporal models for that runner's read path; `declines` cannot remove only one after the runner made
+the claim. False skips only `data/identity/` and says nothing about the ordinary object-layer
+corpus.
 
 Pass one `--runner-cmd` per read path. The harness does not infer or manufacture the other path, and
 it does not require a pair, so the command list is also the record of which paths were actually
@@ -371,7 +382,7 @@ implementations get abandoned rather than finished.
 
 The predicate that decides is `supports()` in the harness. Built-in runners receive capabilities
 derived from the tables in `run.py`; out-of-tree runners receive the same record from their
-`--capabilities` answer. The predicate consults four things:
+`--capabilities` answer. The predicate consults five things:
 
 1. `declines`: `FAMILY_DECLINES[family]` for a built-in or the external declaration's list. A valid
    variant containing one of those fragments is skipped. The built-in table is empty today because
@@ -384,6 +395,9 @@ derived from the tables in `run.py`; out-of-tree runners receive the same record
    expectation for a streamed runner. It cannot select only some opcodes.
 4. `indexed`: derived from the built-in runner name or the external `readPath`. An indexed runner
    skips a valid variant without `UseChunkIndex` and every streamed-only late-placement variant.
+5. `optionalIdentityDefaults`: membership in `OPTIONAL_IDENTITY_DEFAULTS_FAMILIES` for a built-in or
+   the external declaration's boolean. True activates both identity witnesses; decline fragments
+   cannot reduce this all-or-none claim.
 
 Some built-in entry points still define their own `supportsVariant` function. `run.py` does not call
 it; the capability record is authoritative. That keeps support decisions outside file invocation,
@@ -514,6 +528,36 @@ implementation layer proves the claim. An out-of-tree runner makes both claims i
 `"refusals": true` and `"lateFrontMatterRecords": true`. The latter without the former is a protocol
 error, and neither field may select only some of the cases it names.
 
+### Optional identity zero-default gate
+
+The two valid files under `data/identity/` are the shared prerequisite for implementing #79. They
+test only ids 11 (`source_group`), 12 (`source_index`) and 14 (`object_id`); neither file carries an
+Object Table or Object Track, and passing them makes no object-composition claim.
+
+| Witness                                          | Physical construction                                                                                             | Required logical result                                                                                                                               |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gaussian-birth/OptionalIdentityGaussianBirth-…` | an indexed two-Chunk population; the first carries all three lanes and explicit zero, while the second omits them | omitted Chunk rows are zero beside exact `i32` producer labels and same-bit-stream `u32` object ids                                                   |
+| `keyframe-delta/OptionalIdentityKeyframeDelta-…` | an indexed seven-state sequence with omitted/present lanes in complete keyframes, update groups and birth groups  | zero complete defaults, update carry, zero birth suffixes, absolute zero reset, absent-reference zero prefixes, and exact absolute replacement values |
+
+Both are ordinary valid files. A runner opts in with `"optionalIdentityDefaults": true`, and the
+harness then asks that read path for both temporal models. The claim is indivisible: a `declines`
+fragment cannot remove one witness after the declaration said true. The shared bottom layer leaves
+the built-in family set empty, so adding the corpus does not award an SDK a claim or move a feature
+matrix cell.
+
+Each Header carries the byte-level attribute `"conformance": "optional-identity-zero-defaults-v1"`.
+That marker tells a runner to emit the narrow identity result from the bytes rather than recognizing
+a filename. The gaussian-birth result has `temporalModel` and `identityRows`; each row carries a
+canonical position and the string fields `sourceGroup`, `sourceIndex` and `objectId`. The
+keyframe-delta result has `temporalModel` and `identityStates`; each state carries its numeric `t`
+and rows in ascending `gaussianId`, with the same three string identity fields. The strings preserve
+the exact signed endpoints and `u32` values through a double-backed JSON parser.
+
+The expected JSON is authored from the adopted rule, not by decoding through the first SDK that
+happens to implement it. Generator tests independently parse the physical Attribute Streams and
+assert every present/absent group, signed code, index offset, backward reference and summary CRC.
+The normal double-generation check proves the two files and expectations are deterministic.
+
 ### Aggregate decoded-budget gate
 
 Aggregate decoded-state exhaustion is not part of the invalid corpus. The same valid file succeeds
@@ -591,6 +635,11 @@ It is written in Python and it is the normative shape: `summarize()` names every
 each carries, and the rounding, the string-integers, the null-for-non-finite rule and the content
 order all live there. Read it as the schema. A prose copy of it on this page would go stale against
 the code, which is the one thing a normative shape may not do.
+
+The capability-gated optional-identity family deliberately uses the smaller `identityRows` /
+`identityStates` documents described above. Their executable schema is the corresponding builder in
+`generate.py` and their committed JSON, because those expectations must precede an SDK capable of
+reading them. They use `canonical.py`'s number rendering and the same parsed-value comparison.
 
 **What is compared.** The harness parses the runner's stdout and the committed expectation, and
 compares the parsed values:

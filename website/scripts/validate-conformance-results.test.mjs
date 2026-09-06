@@ -26,6 +26,7 @@ function runner(readPath, counts) {
     canonicalStateOrder: true,
     aggregateDecodedBudget: true,
     lateFrontMatterRecords: true,
+    optionalIdentityDefaults: false,
     command: `./decode_${readPath}`,
     ...counts,
   };
@@ -82,6 +83,7 @@ test("an honest partial, one-path result is valid", () => {
       canonicalStateOrder: false,
       aggregateDecodedBudget: false,
       lateFrontMatterRecords: false,
+      optionalIdentityDefaults: false,
     },
   ];
   assert.equal(validateCatalog(withResults(partial)).results[0].runners[0].passed, 51);
@@ -145,6 +147,11 @@ const invalidCases = [
     "non-boolean late front matter capabilities",
     (value) => (value.results[0].runners[0].lateFrontMatterRecords = 1),
     /lateFrontMatterRecords: expected true or false/,
+  ],
+  [
+    "non-boolean optional identity capabilities",
+    (value) => (value.results[0].runners[0].optionalIdentityDefaults = 1),
+    /optionalIdentityDefaults: expected true or false/,
   ],
   [
     "late front matter without refusal diagnosis",

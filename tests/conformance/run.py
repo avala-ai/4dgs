@@ -102,6 +102,12 @@ KEYFRAME_PREFIX = "keyframe/"
 OBJECT = os.path.join(DATA, "object")
 OBJECT_PREFIX = "object/"
 
+#: Optional identity defaults have their own capability-gated valid family.  It carries
+#: one gaussian-birth and one keyframe-delta file under model-named subdirectories; neither
+#: is part of an SDK's score until that SDK explicitly claims the whole contract.
+IDENTITY = os.path.join(DATA, "identity")
+IDENTITY_PREFIX = "identity/"
+
 #: Invalid variants are named with this prefix, which is also their subdirectory. A
 #: runner is handed the same thing either way — a path — and the harness compares the
 #: same thing either way: parsed JSON against a committed expectation. What differs is
@@ -117,6 +123,14 @@ def variants() -> list[str]:
     obj = []
     if os.path.isdir(OBJECT):
         obj = sorted(OBJECT_PREFIX + f[: -len(".json")] for f in os.listdir(OBJECT) if f.endswith(".json"))
+    identity = []
+    if os.path.isdir(IDENTITY):
+        for directory, _subdirectories, files in os.walk(IDENTITY):
+            relative = os.path.relpath(directory, DATA).replace(os.sep, "/")
+            identity.extend(
+                f"{relative}/{filename[: -len('.json')]}" for filename in files if filename.endswith(".json")
+            )
+        identity.sort()
     refusals = []
     if os.path.isdir(INVALID):
         refusals = sorted(INVALID_PREFIX + f[: -len(".json")] for f in os.listdir(INVALID) if f.endswith(".json"))
@@ -126,7 +140,7 @@ def variants() -> list[str]:
             for f in os.listdir(LATE_FRONT_MATTER)
             if f.endswith(".json")
         )
-    return valid + keyframe + obj + refusals
+    return valid + keyframe + obj + identity + refusals
 
 
 #: Families whose runners answer a refusal expectation — printing `{"refused": "<id>"}`
@@ -156,6 +170,11 @@ CANONICAL_STATE_ORDER_FAMILIES = frozenset({"dart", "python", "rust", "typescrip
 # into the collecting API and report the registered resource result. The shared-contract
 # layer intentionally claims no implementation.
 AGGREGATE_DECODED_BUDGET_FAMILIES: frozenset[str] = frozenset({"python", "rust"})
+
+# Optional identity zero-defaults are introduced as a stacked conformance change.  A
+# family enters only after both maintained read paths return the exact logical rows for
+# both temporal models.  The shared corpus layer intentionally claims no SDK.
+OPTIONAL_IDENTITY_DEFAULTS_FAMILIES: frozenset[str] = frozenset()
 
 # The resource gate reuses one tiny valid corpus file. One decoded gaussian cannot fit in
 # one byte under any SDK representation, so the test is independent of allocator overhead
@@ -248,6 +267,9 @@ class Capabilities:
     #: Whether this runner passes a caller-injected limit to its collecting decoder and
     #: reports aggregate decoded-state exhaustion as the registered resource result.
     aggregate_decoded_budget: bool = False
+    #: Whether this runner answers both valid optional-identity witnesses, including
+    #: zero-default materialization and absolute update replacement for all three lanes.
+    optional_identity_defaults: bool = False
 
 
 def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
@@ -267,6 +289,7 @@ def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
         exact_aggregates=family in EXACT_AGGREGATE_FAMILIES,
         canonical_state_order=family in CANONICAL_STATE_ORDER_FAMILIES,
         aggregate_decoded_budget=family in AGGREGATE_DECODED_BUDGET_FAMILIES,
+        optional_identity_defaults=family in OPTIONAL_IDENTITY_DEFAULTS_FAMILIES,
     )
 
 
@@ -291,6 +314,10 @@ def supports(caps: Capabilities, variant: str) -> bool:
         if variant in invalid_corpus.STREAMED_ONLY_REFUSALS:
             return caps.refusals and caps.late_front_matter_records and not caps.indexed
         return caps.refusals
+    # This is one indivisible semantic claim.  A runner that opts in answers both temporal
+    # models; `declines` cannot quietly reduce the family after the handshake said yes.
+    if variant.startswith(IDENTITY_PREFIX):
+        return caps.optional_identity_defaults and (not caps.indexed or "UseChunkIndex" in variant)
     if any(flag in variant for flag in caps.declines):
         return False
     if not caps.indexed:
@@ -546,6 +573,9 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     aggregate_decoded_budget = doc.get("aggregateDecodedBudget", False)
     if not isinstance(aggregate_decoded_budget, bool):
         raise ProtocolError(f"declares aggregateDecodedBudget {aggregate_decoded_budget!r}; expected true or false")
+    optional_identity_defaults = doc.get("optionalIdentityDefaults", False)
+    if not isinstance(optional_identity_defaults, bool):
+        raise ProtocolError(f"declares optionalIdentityDefaults {optional_identity_defaults!r}; expected true or false")
     late_front_matter_records = doc.get("lateFrontMatterRecords", False)
     if not isinstance(late_front_matter_records, bool):
         raise ProtocolError(f"declares lateFrontMatterRecords {late_front_matter_records!r}; expected true or false")
@@ -562,6 +592,7 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
         exact_aggregates=exact_aggregates,
         canonical_state_order=canonical_state_order,
         aggregate_decoded_budget=aggregate_decoded_budget,
+        optional_identity_defaults=optional_identity_defaults,
     )
 
 
@@ -753,6 +784,7 @@ def external_jobs(commands: list[str], timeout: float) -> list[tuple[Capabilitie
             f"{caps.name}: protocol {PROTOCOL_VERSION}, {'indexed' if caps.indexed else 'streamed'} read path, "
             f"refusals {'answered' if caps.refusals else 'declined'}, "
             f"aggregate budget {'claimed' if caps.aggregate_decoded_budget else 'unclaimed'}, "
+            f"optional identity {'claimed' if caps.optional_identity_defaults else 'unclaimed'}, "
             f"late front matter {'answered' if caps.late_front_matter_records else 'declined'}, "
             f"declines {declines}"
         )

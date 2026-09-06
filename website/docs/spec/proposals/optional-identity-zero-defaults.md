@@ -237,6 +237,10 @@ The change is delivered as a stack, with one writer per lane:
    profile under `keyframe-delta`, and their feature-matrix claims land through #79's own
    spec/corpus/language sequence rather than hitchhiking on the identity-default fix.
 
+The second layer is now represented by the two generated files under `data/identity/`, gated as one
+`optionalIdentityDefaults` runner capability. The shared capability set intentionally names no SDK;
+each language still owns step 3, and #79 remains open for the object semantics in step 4.
+
 ---
 
 ## 7. Rejected alternatives

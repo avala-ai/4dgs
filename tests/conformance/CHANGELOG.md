@@ -23,6 +23,17 @@ What each part of the version means here:
 
 ### Added
 
+- Two valid, indexed optional-identity witnesses under `identity/`, one per temporal model. Together
+  they pin zero for omitted `source_group`, `source_index` and `object_id`, exact signed and
+  same-bit unsigned labels, absent-to-present zero materialization, omitted-update carry,
+  omitted-birth zero suffixes, absolute update replacement and complete-keyframe reset. The
+  generator tests their physical stream omission, index provenance and deterministic checksums
+  independently of any SDK.
+
+- The all-or-none `optionalIdentityDefaults` runner capability and downloadable-manifest marker. The
+  shared layer claims no built-in SDK; each language must pass both witnesses on both maintained
+  read paths before entering the capability set.
+
 - Eighteen streamed-only `late-front-matter-record` refusal variants: one for every defined
   front-matter opcode under `gaussian-birth`, plus Quantization, Window Table and Object Track
   through the independent `keyframe-delta` loop. Each expectation includes the exact physical late
