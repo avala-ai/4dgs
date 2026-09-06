@@ -3,6 +3,32 @@
 
 import CFourDGS
 
+#if canImport(Darwin)
+    import Darwin
+
+    /// Apple releases link the immutable core artifact named in `Package.swift`. Resolve
+    /// additive ABI entries by name so source using a newer header still links against an
+    /// older published artifact; the public operation diagnoses the absent entry if called.
+    private let fourdgsProcessHandle = dlopen(nil, RTLD_LAZY)
+
+    private func optionalCoreSymbol<T>(_ name: String, as type: T.Type) -> T? {
+        guard let handle = fourdgsProcessHandle,
+            let address = name.withCString({ dlsym(handle, $0) })
+        else { return nil }
+        return unsafeBitCast(address, to: type)
+    }
+#endif
+
+private typealias SceneInt64Column = @convention(c) (OpaquePointer?) -> UnsafePointer<Int64>?
+private typealias HeaderAttributeCall = @convention(c) (
+    UnsafePointer<UInt8>?, Int, UnsafePointer<CChar>?, Int,
+    UnsafeMutablePointer<UnsafePointer<CChar>?>?, UnsafeMutablePointer<Int>?
+) -> Int32
+private typealias KeyframeIdentityCall = @convention(c) (
+    UnsafePointer<UInt8>?, Int, Int32, UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+    UnsafeMutablePointer<Int>?
+) -> Int32
+
 /// **The seam.** Every call this package makes into the Rust core goes through this file
 /// and no other.
 ///
@@ -337,6 +363,8 @@ enum Core {
             winHi: floats(fourdgs_scene_win_hi(scene.raw), 1),
             shDegree: Int(fourdgs_scene_sh_degree(scene.raw)),
             sh: sh,
+            sourceGroups: sourceGroups(scene, count: count),
+            sourceIndices: sourceIndices(scene, count: count),
             objectIds: objectIds(scene, count: count))
     }
 
@@ -620,6 +648,40 @@ enum Core {
         return result
     }
 
+    /// One Header attribute without decoding state. `nil` is an absent key; an empty
+    /// string is a present empty value.
+    static func peekHeaderAttribute(_ bytes: [UInt8], key: String) throws -> String? {
+        let call: HeaderAttributeCall
+        #if canImport(Darwin)
+            guard
+                let resolved = optionalCoreSymbol(
+                    "fourdgs_peek_header_attribute", as: HeaderAttributeCall.self)
+            else {
+                throw FourDGSError.notImplemented(
+                    "the linked Rust core does not expose Header attribute lookup")
+            }
+            call = resolved
+        #else
+            call = fourdgs_peek_header_attribute
+        #endif
+
+        var out: UnsafePointer<CChar>?
+        var length = 0
+        let keyBytes = key.utf8CString
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            keyBytes.withUnsafeBufferPointer { keyBuffer in
+                call(
+                    buffer.baseAddress, buffer.count, keyBuffer.baseAddress, keyBuffer.count - 1,
+                    &out, &length)
+            }
+        }
+        guard status == ok else { throw error(status) }
+        guard out != nil else { return nil }
+        let result = string(out, length)
+        fourdgs_string_free(out, length)
+        return result
+    }
+
     /// Decode a keyframe-delta file to its canonical states JSON. `indexed` chooses the read
     /// path: `false` composes front to back, `true` walks each instant's chain through the
     /// index. Both must agree, which is why the suite runs this on both.
@@ -632,6 +694,38 @@ enum Core {
         let status = bytes.withUnsafeBufferPointer { buffer in
             fourdgs_keyframe_delta_states_json(
                 buffer.baseAddress, buffer.count, Int32(indexed ? 1 : 0), &out, &length)
+        }
+        guard status == ok else { throw error(status) }
+        let result = string(out, length)
+        fourdgs_string_free(out, length)
+        return result
+    }
+
+    /// Exact optional identities after every keyframe or delta record, ordered by gaussian
+    /// id. The core owns composition so this binding cannot drift on carry versus zero-fill.
+    static func keyframeDeltaIdentityStatesJson(_ bytes: [UInt8], indexed: Bool) throws -> String {
+        if !indexed {
+            try StreamedRecordPlacement.validate(InMemoryReader(bytes))
+        }
+        let call: KeyframeIdentityCall
+        #if canImport(Darwin)
+            guard
+                let resolved = optionalCoreSymbol(
+                    "fourdgs_keyframe_delta_identity_states_json",
+                    as: KeyframeIdentityCall.self)
+            else {
+                throw FourDGSError.notImplemented(
+                    "the linked Rust core does not expose keyframe-delta identity states")
+            }
+            call = resolved
+        #else
+            call = fourdgs_keyframe_delta_identity_states_json
+        #endif
+
+        var out: UnsafePointer<CChar>?
+        var length = 0
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            call(buffer.baseAddress, buffer.count, Int32(indexed ? 1 : 0), &out, &length)
         }
         guard status == ok else { throw error(status) }
         let result = string(out, length)
@@ -799,6 +893,39 @@ enum Core {
         return Array(UnsafeBufferPointer(start: base, count: count))
     }
 
+    /// Signed producer labels per resident gaussian, or empty for a wholly absent column.
+    static func sourceGroups(_ scene: SceneHandle, count: Int) -> [Int64] {
+        #if canImport(Darwin)
+            guard
+                let call = optionalCoreSymbol(
+                    "fourdgs_scene_source_groups", as: SceneInt64Column.self)
+            else { return [] }
+            return int64Column(scene, count: count, call: call)
+        #else
+            return int64Column(scene, count: count, call: fourdgs_scene_source_groups)
+        #endif
+    }
+
+    /// Signed producer-stable labels, with the same absence/default convention.
+    static func sourceIndices(_ scene: SceneHandle, count: Int) -> [Int64] {
+        #if canImport(Darwin)
+            guard
+                let call = optionalCoreSymbol(
+                    "fourdgs_scene_source_indices", as: SceneInt64Column.self)
+            else { return [] }
+            return int64Column(scene, count: count, call: call)
+        #else
+            return int64Column(scene, count: count, call: fourdgs_scene_source_indices)
+        #endif
+    }
+
+    private static func int64Column(
+        _ scene: SceneHandle, count: Int, call: SceneInt64Column
+    ) -> [Int64] {
+        guard count > 0, let base = call(scene.raw) else { return [] }
+        return Array(UnsafeBufferPointer(start: base, count: count))
+    }
+
     /// Shared shape for the core's owned-string accessors.
     private static func ownedString(
         _ call: (inout UnsafePointer<CChar>?, inout Int) -> Int32
@@ -951,10 +1078,21 @@ public func peekTemporalModel(_ bytes: [UInt8]) throws -> String {
     try Core.peekTemporalModel(bytes)
 }
 
+/// One Header attribute read without decoding state. `nil` means absent; an empty string is
+/// a present empty value.
+public func peekHeaderAttribute(_ bytes: [UInt8], key: String) throws -> String? {
+    try Core.peekHeaderAttribute(bytes, key: key)
+}
+
 /// Decode a keyframe-delta file to its canonical states JSON. `indexed` chooses the read
 /// path: `false` composes front to back, `true` walks each instant's chain through the index.
 public func keyframeDeltaStatesJson(_ bytes: [UInt8], indexed: Bool) throws -> String {
     try Core.keyframeDeltaStatesJson(bytes, indexed: indexed)
+}
+
+/// Exact optional identities after every keyframe or delta record, ordered by gaussian id.
+public func keyframeDeltaIdentityStatesJson(_ bytes: [UInt8], indexed: Bool) throws -> String {
+    try Core.keyframeDeltaIdentityStatesJson(bytes, indexed: indexed)
 }
 
 // MARK: - The reader callbacks

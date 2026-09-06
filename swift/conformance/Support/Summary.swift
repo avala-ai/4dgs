@@ -18,6 +18,36 @@ public enum Summary {
     static let cameraKeyframes = 4
     static let audioKeyframes = 4
 
+    /// Exact logical rows for the gaussian-birth optional-identity witness. This narrow
+    /// projection deliberately bypasses the ordinary rounded summary: producer labels are
+    /// exact integers and an absent physical column is a logical run of zeroes.
+    public static func optionalIdentityGaussianBirth(_ gaussians: GaussianState) -> JSON {
+        let order = (0..<gaussians.count).sorted { left, right in
+            for component in 0..<3 {
+                let a = gaussians.positions[left * 3 + component]
+                let b = gaussians.positions[right * 3 + component]
+                if a != b { return a < b }
+            }
+            return left < right
+        }
+        let rows = order.map { row in
+            JSON.object([
+                "sourceGroup": .integer(
+                    gaussians.sourceGroups.isEmpty ? Int64(0) : gaussians.sourceGroups[row]),
+                "sourceIndex": .integer(
+                    gaussians.sourceIndices.isEmpty ? Int64(0) : gaussians.sourceIndices[row]),
+                "objectId": .integer(
+                    gaussians.objectIds.isEmpty ? UInt32(0) : gaussians.objectIds[row]),
+                "position": .array(
+                    (0..<3).map { .number(gaussians.positions[row * 3 + $0]) }),
+            ])
+        }
+        return .object([
+            "temporalModel": .string("gaussian-birth"),
+            "identityRows": .array(rows),
+        ])
+    }
+
     public static func build(
         scene: Scene,
         gaussians: GaussianState,
