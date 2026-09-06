@@ -47,7 +47,10 @@ pub const AUDIO_KEYFRAMES: usize = 4;
 /// into one outcome — and the invalid corpus exists precisely to tell those apart.
 pub enum Failure {
     /// A refusal this reader can name. The identifier is compared across every SDK.
-    Refused(&'static str),
+    Refused {
+        code: &'static str,
+        late_front_matter: Option<fourdgs::error::LateFrontMatterRecords>,
+    },
     /// A supported collecting operation exceeded the caller's decoded-state ceiling.
     ResourceLimit,
     /// Anything else. Goes to stderr with a non-zero exit, as before.
@@ -65,7 +68,10 @@ impl Failure {
             return Failure::ResourceLimit;
         }
         match error.refusal_code() {
-            Some(code) => Failure::Refused(code),
+            Some(code) => Failure::Refused {
+                code,
+                late_front_matter: error.late_front_matter_records(),
+            },
             None => Failure::Message(format!("{path}: {error}")),
         }
     }
@@ -81,6 +87,20 @@ impl From<String> for Failure {
 /// The canonical answer for a refused file.
 pub fn refusal_json(code: &str) -> String {
     format!("{{\n  \"refused\": \"{code}\"\n}}")
+}
+
+/// The structured answer for the placement refusal whose proof has two physical sites.
+pub fn late_front_matter_refusal_json(
+    code: &str,
+    records: fourdgs::error::LateFrontMatterRecords,
+) -> String {
+    format!(
+        "{{\n  \"firstStateRecord\": {{\n    \"at\": \"{}\",\n    \"opcode\": {}\n  }},\n  \"lateRecord\": {{\n    \"at\": \"{}\",\n    \"opcode\": {}\n  }},\n  \"refused\": \"{code}\"\n}}",
+        records.first_state_record.offset,
+        records.first_state_record.opcode,
+        records.late_record.offset,
+        records.late_record.opcode,
+    )
 }
 
 pub enum J {
@@ -1064,10 +1084,32 @@ pub fn keyframe_delta_states_json(seq: &DecodedSequence) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{summarize, Extras, J};
+    use super::{late_front_matter_refusal_json, refusal_json, summarize, Extras, Failure, J};
+    use fourdgs::error::refusal;
     use fourdgs::model::GaussianSet;
     use fourdgs::object_layer::{canonical_parts, ObjectLayer};
     use fourdgs::records::Header;
+
+    #[test]
+    fn refusal_answers_preserve_the_baseline_and_add_both_late_sites() {
+        assert_eq!(
+            refusal_json(refusal::MAGIC_MISMATCH),
+            "{\n  \"refused\": \"magic-mismatch\"\n}"
+        );
+
+        let error = fourdgs::Error::late_front_matter_record(0x25, 3427, 0x05, 512);
+        let Failure::Refused {
+            code,
+            late_front_matter: Some(records),
+        } = Failure::from_error("fixture.4dgs", &error)
+        else {
+            panic!("late placement lost its structured sites")
+        };
+        assert_eq!(
+            late_front_matter_refusal_json(code, records),
+            "{\n  \"firstStateRecord\": {\n    \"at\": \"512\",\n    \"opcode\": 5\n  },\n  \"lateRecord\": {\n    \"at\": \"3427\",\n    \"opcode\": 37\n  },\n  \"refused\": \"late-front-matter-record\"\n}"
+        );
+    }
 
     fn gaussians(positions: &[[f32; 3]], motions: &[[f32; 3]]) -> GaussianSet {
         let count = positions.len();

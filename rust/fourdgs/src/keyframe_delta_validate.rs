@@ -1859,6 +1859,17 @@ mod tests {
                 "{}: {streamed}",
                 op::name(opcode)
             );
+            let expected_records = crate::error::LateFrontMatterRecords {
+                late_record: crate::error::RecordSite {
+                    opcode,
+                    offset: late_at as u64,
+                },
+                first_state_record: crate::error::RecordSite {
+                    opcode: op::CHUNK,
+                    offset: first_state_at as u64,
+                },
+            };
+            assert_eq!(streamed.late_front_matter_records(), Some(expected_records));
             for mode in [ValidationMode::Streamed, ValidationMode::Indexed] {
                 let failure = failure(&bytes, mode);
                 assert_eq!(failure.offset, Some(late_at as u64));
@@ -1868,6 +1879,12 @@ mod tests {
                     "{} in {mode:?}: {}",
                     op::name(opcode),
                     failure.error
+                );
+                assert_eq!(
+                    failure.error.late_front_matter_records(),
+                    Some(expected_records),
+                    "{} in {mode:?}",
+                    op::name(opcode)
                 );
                 let message = failure.error.to_string();
                 assert!(

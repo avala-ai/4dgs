@@ -72,7 +72,24 @@ pub enum Error {
         code: &'static str,
         kind: RefusalKind,
         message: String,
+        /// Physical evidence carried independently of the human-readable diagnosis for
+        /// the one placement refusal that requires two record sites.
+        late_front_matter: Option<LateFrontMatterRecords>,
     },
+}
+
+/// One physical top-level record site in a late-front-matter diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordSite {
+    pub opcode: u8,
+    pub offset: u64,
+}
+
+/// The two physical records that prove a front-matter placement refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LateFrontMatterRecords {
+    pub late_record: RecordSite,
+    pub first_state_record: RecordSite,
 }
 
 /// The variant a [`Error::Refused`] would have been without its identifier.
@@ -173,6 +190,7 @@ impl Error {
             code,
             kind,
             message,
+            late_front_matter: None,
         }
     }
 
@@ -229,15 +247,25 @@ impl Error {
         first_state_opcode: u8,
         first_state_offset: u64,
     ) -> Error {
-        Error::refused(
-            refusal::LATE_FRONT_MATTER_RECORD,
-            RefusalKind::Malformed,
-            format!(
+        Error::Refused {
+            code: refusal::LATE_FRONT_MATTER_RECORD,
+            kind: RefusalKind::Malformed,
+            message: format!(
                 "the defined front-matter record {} (opcode 0x{late_opcode:02X}) at byte {late_offset} follows the first state record {} (opcode 0x{first_state_opcode:02X}) at byte {first_state_offset}; every defined front-matter record must precede the first state record",
                 crate::opcode::name(late_opcode),
                 crate::opcode::name(first_state_opcode),
             ),
-        )
+            late_front_matter: Some(LateFrontMatterRecords {
+                late_record: RecordSite {
+                    opcode: late_opcode,
+                    offset: late_offset,
+                },
+                first_state_record: RecordSite {
+                    opcode: first_state_opcode,
+                    offset: first_state_offset,
+                },
+            }),
+        }
     }
 
     pub(crate) fn at_record(self, record: &str, offset: u64) -> Error {
@@ -256,10 +284,12 @@ impl Error {
                 code,
                 kind,
                 message,
+                late_front_matter,
             } => Error::Refused {
                 code,
                 kind,
                 message: context(message),
+                late_front_matter,
             },
             Error::Io(error) => Error::Io(error),
         }
@@ -336,6 +366,16 @@ impl Error {
     pub fn refusal_code(&self) -> Option<&'static str> {
         match self {
             Error::Refused { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// Structured physical evidence for `late-front-matter-record`, when present.
+    pub fn late_front_matter_records(&self) -> Option<LateFrontMatterRecords> {
+        match self {
+            Error::Refused {
+                late_front_matter, ..
+            } => *late_front_matter,
             _ => None,
         }
     }

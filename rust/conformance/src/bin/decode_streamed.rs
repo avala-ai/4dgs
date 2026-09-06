@@ -12,7 +12,10 @@ use fourdgs::keyframe_delta_file::decode_streamed_with_options as decode_keyfram
 use fourdgs::opcode;
 use fourdgs::records::Header;
 use fourdgs::serialization::{check_magic, Records, MAGIC};
-use fourdgs_conformance::{keyframe_delta_states_json, refusal_json, summarize, Extras, Failure};
+use fourdgs_conformance::{
+    keyframe_delta_states_json, late_front_matter_refusal_json, refusal_json, summarize, Extras,
+    Failure,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -30,7 +33,14 @@ fn main() -> ExitCode {
         }
         // A refusal is an answer, not a crash: stdout and exit 0, so the harness can
         // diff it against the expectation instead of only seeing that we fell over.
-        Err(Failure::Refused(code)) => {
+        Err(Failure::Refused {
+            code,
+            late_front_matter: Some(records),
+        }) => {
+            println!("{}", late_front_matter_refusal_json(code, records));
+            ExitCode::SUCCESS
+        }
+        Err(Failure::Refused { code, .. }) => {
             println!("{}", refusal_json(code));
             ExitCode::SUCCESS
         }

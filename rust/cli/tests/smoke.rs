@@ -264,6 +264,29 @@ fn expected_refusal(json_path: &Path) -> Option<String> {
     Some(rest[start..end].to_string())
 }
 
+fn expected_record_site(json_path: &Path, record: &str) -> Option<(u64, u8)> {
+    let text = std::fs::read_to_string(json_path).ok()?;
+    let marker = format!("\"{record}\"");
+    let object = text.split_once(&marker)?.1.split_once('}')?.0;
+    let at = object
+        .split_once("\"at\"")?
+        .1
+        .split('"')
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let opcode = object
+        .split_once("\"opcode\"")?
+        .1
+        .split_once(':')?
+        .1
+        .trim()
+        .trim_end_matches(',')
+        .parse()
+        .ok()?;
+    Some((at, opcode))
+}
+
 /// Every file in the invalid corpus, with the identifier it must be refused for.
 fn invalid_corpus() -> Vec<(String, PathBuf, String)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/invalid");
@@ -335,6 +358,55 @@ fn every_invalid_variant_is_refused_by_its_own_identifier() {
         invalid_expectation_count(),
         "the generated invalid corpus must match every committed expectation"
     );
+}
+
+#[test]
+fn validator_proves_both_sites_for_all_shared_late_front_matter_witnesses() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/conformance/data/invalid/late-front-matter");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI generates the late-front-matter corpus"
+        );
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "4dgs")
+        })
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths.len(),
+        18,
+        "the shared placement family is all-or-nothing"
+    );
+
+    for path in paths {
+        let expectation = path.with_extension("json");
+        let (first_at, first_opcode) =
+            expected_record_site(&expectation, "firstStateRecord").unwrap();
+        let (late_at, late_opcode) = expected_record_site(&expectation, "lateRecord").unwrap();
+        let output = run(&["validate", path.to_str().unwrap()]);
+        let text = stdout(&output);
+        assert_eq!(output.status.code(), Some(1), "{}: {text}", path.display());
+        assert!(
+            text.contains("refusal late-front-matter-record"),
+            "{}: {text}",
+            path.display()
+        );
+        for (at, opcode) in [(late_at, late_opcode), (first_at, first_opcode)] {
+            assert!(
+                text.contains(&format!("(opcode 0x{opcode:02X}) at byte {at}")),
+                "{}: missing opcode 0x{opcode:02X} at {at}: {text}",
+                path.display()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
