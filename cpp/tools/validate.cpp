@@ -191,6 +191,9 @@ void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<In
   if (!opened) {
     if (opened.error().code == ErrorCode::kIo) {
       incomplete(report, "a seeking reader could not obtain the file: " + opened.error().message);
+    } else if (opened.error().code == ErrorCode::kUnsupportedMode) {
+      incomplete(report,
+                 "a seeking reader reached a bounded decoder limit: " + opened.error().message);
     } else {
       refused(report, "a seeking reader cannot open this file: ", opened.error(), &walk,
               std::nullopt);
@@ -206,6 +209,9 @@ void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<In
     if (refusal->error.code == ErrorCode::kIo) {
       incomplete(report,
                  "chunk payload validation could not read the file: " + refusal->error.message);
+    } else if (refusal->error.code == ErrorCode::kUnsupportedMode) {
+      incomplete(report, "chunk payload validation reached a bounded decoder limit: " +
+                             refusal->error.message);
     } else {
       refused(report, "a chunk does not decode: ", refusal->error, &walk, refusal->site);
     }
