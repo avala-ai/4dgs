@@ -139,7 +139,9 @@ typedef enum fourdgs_status {
      * by index, for instance. Neither the file nor the call is malformed; the operation
      * belongs to the other path, and a caller that meets this should skip rather than fail.
      */
-    FOURDGS_STATUS_UNSUPPORTED_MODE = 9
+    FOURDGS_STATUS_UNSUPPORTED_MODE = 9,
+    /** A supported operation crossed a caller-configured implementation resource ceiling. */
+    FOURDGS_STATUS_RESOURCE_LIMIT = 10
 } fourdgs_status;
 
 /**
@@ -278,6 +280,24 @@ int fourdgs_open_path_ex(const char *path, int mode, fourdgs_scene **out);
  * identically, including when this call fails.
  */
 int fourdgs_open_reader_ex(fourdgs_reader reader, int mode, fourdgs_scene **out);
+
+/**
+ * Options-bearing opens. `max_decoded_state_bytes` is the positive aggregate ceiling for
+ * library-owned decoded gaussian state and its decode working storage. Exactly the limit is
+ * allowed; zero is FOURDGS_STATUS_INVALID_ARGUMENT. Existing open functions use 536870912.
+ *
+ * The reader overload takes ownership of `reader.ctx` and calls `reader.release` exactly once,
+ * including when the mode, budget, callbacks, or open itself are invalid.
+ */
+int fourdgs_open_memory_with_options(const uint8_t *data, size_t length, int mode,
+                                     uint64_t max_decoded_state_bytes,
+                                     fourdgs_scene **out);
+int fourdgs_open_path_with_options(const char *path, int mode,
+                                   uint64_t max_decoded_state_bytes,
+                                   fourdgs_scene **out);
+int fourdgs_open_reader_with_options(fourdgs_reader reader, int mode,
+                                     uint64_t max_decoded_state_bytes,
+                                     fourdgs_scene **out);
 
 /**
  * Called once for every lifetime gaussian identity introduced by keyframe-delta payloads.
@@ -484,6 +504,14 @@ int fourdgs_scene_audio_read(fourdgs_scene *scene, uint64_t offset, uint64_t len
 
 /** Decode every chunk into the working set. */
 int fourdgs_scene_load_all(fourdgs_scene *scene, uint8_t max_sh_band);
+
+/**
+ * Decode every chunk under a positive caller-selected aggregate decoded-state ceiling.
+ * The check includes an already-resident result, happens before replacement allocation, and a
+ * failure leaves the prior working set intact. The existing function uses 536870912 bytes.
+ */
+int fourdgs_scene_load_all_with_options(fourdgs_scene *scene, uint8_t max_sh_band,
+                                        uint64_t max_decoded_state_bytes);
 
 /**
  * Decode only the chunks covering `t` into the working set.
@@ -953,6 +981,16 @@ int fourdgs_peek_temporal_model(const uint8_t *data, size_t length, const char *
  */
 int fourdgs_keyframe_delta_states_json(const uint8_t *data, size_t length, int indexed,
                                        const char **out, size_t *out_len);
+
+/**
+ * As fourdgs_keyframe_delta_states_json, with a positive aggregate decoded-state ceiling.
+ * The ceiling counts the decoded states and decode working storage; canonical JSON serialization
+ * is output formatting, outside the decoded-state boundary. The existing function uses
+ * 536870912 bytes.
+ */
+int fourdgs_keyframe_delta_states_json_with_options(
+    const uint8_t *data, size_t length, int indexed,
+    uint64_t max_decoded_state_bytes, const char **out, size_t *out_len);
 
 /**
  * Canonical provenance JSON for the opened scene (spec §5.15), or an empty string when the

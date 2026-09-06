@@ -8,6 +8,11 @@ All notable changes to the Rust crate are documented here, following
 
 ### Changed
 
+- **The C ABI carries aggregate decoded-state budgets into the Rust core.** Append-only
+  options-bearing memory, path, range-reader, whole-scene load, and keyframe-delta entry points take
+  a positive `uint64_t max_decoded_state_bytes`; existing symbols retain the 512 MiB default.
+  Exhaustion maps to the appended `FOURDGS_STATUS_RESOURCE_LIMIT = 10` without a file-refusal code,
+  and invalid options preserve range-reader ownership and release it exactly once before any I/O.
 - **Collecting readers expose a configurable aggregate decoded-state budget.** `ReadOptions` now
   defaults `max_decoded_state_bytes` to 512 MiB, with options-bearing byte/path reads, `SceneReader`
   opens, and streamed/indexed keyframe-delta decoders preserving the existing convenience wrappers.
