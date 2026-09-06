@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "fourdgs/model.hpp"
+#include "fourdgs/result.hpp"
 
 /// The canonical JSON two implementations are diffed on.
 ///
@@ -123,6 +124,10 @@ std::string canonical(const SceneSummary& summary);
 /// rejects a bad-magic file because it mis-parsed the version would pass a bare-refusal test
 /// and fail this one.
 std::string refusalJson(const std::string& identifier);
+
+/// The structured answer for the placement refusal whose proof has two physical sites.
+std::string lateFrontMatterRefusalJson(const std::string& identifier,
+                                       const LateFrontMatterRecords& records);
 
 }  // namespace conformance
 }  // namespace fourdgs

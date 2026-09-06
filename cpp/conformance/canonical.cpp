@@ -634,5 +634,20 @@ std::string refusalJson(const std::string& identifier) {
   return Json::object(std::move(members)).render();
 }
 
+std::string lateFrontMatterRefusalJson(const std::string& identifier,
+                                       const LateFrontMatterRecords& records) {
+  const auto site = [](const RecordSite& record) {
+    std::map<std::string, Json> members;
+    members.emplace("at", Json::string(std::to_string(record.offset)));
+    members.emplace("opcode", Json::number(std::to_string(record.opcode)));
+    return Json::object(std::move(members));
+  };
+  std::map<std::string, Json> members;
+  members.emplace("firstStateRecord", site(records.firstStateRecord));
+  members.emplace("lateRecord", site(records.lateRecord));
+  members.emplace("refused", Json::string(identifier));
+  return Json::object(std::move(members)).render();
+}
+
 }  // namespace conformance
 }  // namespace fourdgs

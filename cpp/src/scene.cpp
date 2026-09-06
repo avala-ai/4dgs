@@ -12,6 +12,101 @@ namespace fourdgs {
 
 namespace {
 
+constexpr std::uint64_t kMagicSize = 8;
+constexpr std::uint64_t kRecordHeaderSize = 9;
+constexpr const char* kLateFrontMatterRecord = "late-front-matter-record";
+
+std::uint64_t readU64(const std::uint8_t* at) {
+  std::uint64_t value = 0;
+  for (int i = 7; i >= 0; --i) value = (value << 8) | at[i];
+  return value;
+}
+
+bool isStateRecord(std::uint8_t opcode) { return opcode == 0x05 || opcode == 0x10; }
+
+bool isDefinedFrontMatter(std::uint8_t opcode) {
+  switch (opcode) {
+    case 0x01:  // Header
+    case 0x03:  // Quantization
+    case 0x04:  // Window Table
+    case 0x09:  // legacy Audio
+    case 0x0A:  // Camera
+    case 0x0B:  // Metadata
+    case 0x0D:  // Attachment
+    case 0x11:  // Audio Source
+    case 0x12:  // Audio Data
+    case 0x20:  // Coordinate Frame
+    case 0x21:  // Sensor Calibration
+    case 0x22:  // Rig Trajectory
+    case 0x23:  // Geodetic Anchor
+    case 0x24:  // Object Table
+    case 0x25:  // Object Track
+      return true;
+    default:
+      return false;
+  }
+}
+
+template <typename ReadHeader>
+std::optional<LateFrontMatterRecords> locateLateFrontMatter(std::uint64_t size,
+                                                            ReadHeader readHeader) {
+  std::optional<RecordSite> firstState;
+  std::uint64_t at = kMagicSize;
+  while (at <= size && size - at >= kRecordHeaderSize) {
+    std::uint8_t framing[kRecordHeaderSize] = {0};
+    if (!readHeader(at, framing)) return std::nullopt;
+    const std::uint8_t opcode = framing[0];
+    const std::uint64_t length = readU64(framing + 1);
+    if (length > size - at - kRecordHeaderSize) return std::nullopt;
+
+    if (firstState.has_value() && isDefinedFrontMatter(opcode)) {
+      return LateFrontMatterRecords{RecordSite{opcode, at}, *firstState};
+    }
+    if (!firstState.has_value() && isStateRecord(opcode)) {
+      firstState = RecordSite{opcode, at};
+    }
+    at += kRecordHeaderSize + length;
+  }
+  return std::nullopt;
+}
+
+std::optional<LateFrontMatterRecords> locateLateFrontMatter(Span<const std::uint8_t> bytes) {
+  return locateLateFrontMatter(bytes.size(), [&](std::uint64_t at, std::uint8_t* framing) {
+    const std::size_t offset = static_cast<std::size_t>(at);
+    for (std::size_t i = 0; i < kRecordHeaderSize; ++i) framing[i] = bytes[offset + i];
+    return true;
+  });
+}
+
+std::optional<LateFrontMatterRecords> locateLateFrontMatter(Readable& source) {
+  Result<std::uint64_t> size = source.size();
+  if (!size) return std::nullopt;
+  return locateLateFrontMatter(*size, [&](std::uint64_t at, std::uint8_t* framing) {
+    Result<std::size_t> got =
+        source.read(at, Span<std::uint8_t>(framing, static_cast<std::size_t>(kRecordHeaderSize)));
+    return got.ok() && *got == kRecordHeaderSize;
+  });
+}
+
+Error withLateFrontMatterRecords(Error error,
+                                 const std::optional<LateFrontMatterRecords>& records) {
+  if (error.refusal.has_value() && *error.refusal == kLateFrontMatterRecord &&
+      !error.lateFrontMatterRecords.has_value()) {
+    error.lateFrontMatterRecords = records;
+  }
+  return error;
+}
+
+Error withLateFrontMatterRecords(Error error, Readable& source) {
+  if (!error.refusal.has_value() || *error.refusal != kLateFrontMatterRecord) return error;
+  return withLateFrontMatterRecords(std::move(error), locateLateFrontMatter(source));
+}
+
+Error withLateFrontMatterRecords(Error error, Span<const std::uint8_t> bytes) {
+  if (!error.refusal.has_value() || *error.refusal != kLateFrontMatterRecord) return error;
+  return withLateFrontMatterRecords(std::move(error), locateLateFrontMatter(bytes));
+}
+
 Result<void> validateReadOptions(const ReadOptions& options) {
   if (options.maxDecodedStateBytes != 0) return Result<void>();
   return Error(ErrorCode::kInvalidArgument, "maxDecodedStateBytes must be greater than zero");
@@ -50,7 +145,17 @@ Result<std::unique_ptr<Scene>> Scene::openPath(const std::string& path, const Re
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
   Result<void> opened =
       detail::openPath(*handle, path, static_cast<int>(mode), options.maxDecodedStateBytes);
-  if (!opened) return opened.error();
+  if (!opened) {
+    Error error = opened.error();
+    if (error.refusal.has_value() && *error.refusal == kLateFrontMatterRecord) {
+      Result<FileReadable*> file = FileReadable::open(path);
+      if (file) {
+        std::unique_ptr<FileReadable> source(*file);
+        error = withLateFrontMatterRecords(std::move(error), *source);
+      }
+    }
+    return error;
+  }
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
 
@@ -65,7 +170,7 @@ Result<std::unique_ptr<Scene>> Scene::openMemory(Span<const std::uint8_t> bytes,
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
   Result<void> opened =
       detail::openMemory(*handle, bytes, static_cast<int>(mode), options.maxDecodedStateBytes);
-  if (!opened) return opened.error();
+  if (!opened) return withLateFrontMatterRecords(opened.error(), bytes);
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
 
@@ -80,7 +185,7 @@ Result<std::unique_ptr<Scene>> Scene::open(Readable& source, const ReadOptions& 
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
   Result<void> opened =
       detail::openReadable(*handle, source, static_cast<int>(mode), options.maxDecodedStateBytes);
-  if (!opened) return opened.error();
+  if (!opened) return withLateFrontMatterRecords(opened.error(), source);
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
 
@@ -270,7 +375,10 @@ Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool
                                             const ReadOptions& options) {
   Result<void> valid = validateReadOptions(options);
   if (!valid) return valid.error();
-  return detail::keyframeDeltaStatesJson(bytes, indexed, options.maxDecodedStateBytes);
+  Result<std::string> decoded =
+      detail::keyframeDeltaStatesJson(bytes, indexed, options.maxDecodedStateBytes);
+  if (!decoded) return withLateFrontMatterRecords(decoded.error(), bytes);
+  return decoded;
 }
 
 }  // namespace fourdgs

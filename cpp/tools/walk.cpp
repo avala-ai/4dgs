@@ -9,9 +9,10 @@
 /// raised where the value was parsed, not where the bytes sit, and by then the record's
 /// position is several frames down the call stack, on the other side of an ABI.
 ///
-/// So the tool supplies it. The refusal vocabulary is seven identifiers, each of which is about
-/// exactly one kind of record, and a framing walk knows where every record is. That is the
-/// whole mechanism: walk the framing, ask which record this refusal is about, print the byte.
+/// So the tool supplies it. Most refusal identifiers concern exactly one kind of record, and a
+/// framing walk knows where every record is. The late-front-matter refusal instead carries both
+/// proving records as typed data. That is the whole mechanism: walk the framing, ask which record
+/// this refusal is about, print the byte without parsing a human message.
 ///
 /// Front matter is located from framing alone. A refusal that lives inside a chunk's streams is
 /// located by decoding chunks one at a time until one of them refuses, which is also the only
@@ -456,7 +457,7 @@ std::optional<Site> frontMatterSite(const Walk* walk, const std::string& code) {
   // candidate and asking a registry about the value it declares, and this package has neither a
   // parser nor a registry; the alternative on offer is an offset pointing at a record with
   // nothing wrong with it, which the paragraph above rules out for the reason it gives. Every
-  // corpus variant carries one of each, so this costs none of the seven placements.
+  // original corpus variant carries one of each, so this costs none of those placements.
   const Frame* found = nullptr;
   if (walk->intactOpcodeCounts[opcode] != 1) return std::nullopt;
   for (const Frame& frame : walk->representatives) {
@@ -473,7 +474,15 @@ std::optional<Named> describe(const Error& error, const Walk* walk,
   if (!error.refusal.has_value()) return std::nullopt;
   Named named;
   named.code = *error.refusal;
-  named.site = site.has_value() ? site : frontMatterSite(walk, named.code);
+  named.lateFrontMatterRecords = error.lateFrontMatterRecords;
+  if (site.has_value()) {
+    named.site = site;
+  } else if (named.lateFrontMatterRecords.has_value()) {
+    const RecordSite& late = named.lateFrontMatterRecords->lateRecord;
+    named.site = Site{late.offset, "the " + opcodeName(late.opcode) + " record"};
+  } else {
+    named.site = frontMatterSite(walk, named.code);
+  }
   return named;
 }
 

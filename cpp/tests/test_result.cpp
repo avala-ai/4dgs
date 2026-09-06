@@ -13,6 +13,8 @@ namespace {
 using fourdgs::Error;
 using fourdgs::ErrorCode;
 using fourdgs::Exception;
+using fourdgs::LateFrontMatterRecords;
+using fourdgs::RecordSite;
 using fourdgs::Result;
 
 void carriesAValue() {
@@ -63,12 +65,13 @@ void voidResultReportsBothWays() {
 /// The refusal identifier is optional, and absent is a real answer.
 ///
 /// `code` says what kind of thing went wrong and `refusal` says which rule fired, so the two
-/// are not the same field: `kUnsupported` alone covers three of the seven named refusals, and
+/// are not the same field: `kUnsupported` alone covers three of the ten named refusals, and
 /// plenty of genuine failures — a truncated file, a transport that gave up — name no rule at
 /// all. Absent is therefore not "no error"; `Result::ok()` is what answers that.
 void refusalIsOptionalAndTravelsWithTheError() {
   Result<int> unnamed(ErrorCode::kTruncated, "the file ends inside chunk 3");
   CHECK(!unnamed.error().refusal.has_value());
+  CHECK(!unnamed.error().lateFrontMatterRecords.has_value());
 
   Result<void> named(Error(ErrorCode::kUnsupported,
                            "the Header declares temporal model 'frame-sequence'",
@@ -90,6 +93,42 @@ void refusalIsOptionalAndTravelsWithTheError() {
   CHECK(threw);
 }
 
+/// Placement evidence is typed data and follows every way an Error can travel.
+void lateFrontMatterSitesTravelWithTheError() {
+  const LateFrontMatterRecords records{
+      RecordSite{0x03, 2374},
+      RecordSite{0x05, 516},
+  };
+  Result<void> named(Error(ErrorCode::kMalformed, "Quantization follows the first Chunk",
+                           std::string("late-front-matter-record"), records));
+  CHECK(named.error().lateFrontMatterRecords.has_value());
+  if (!named.error().lateFrontMatterRecords.has_value()) return;
+  CHECK_EQ(named.error().lateFrontMatterRecords->lateRecord.opcode,
+           static_cast<std::uint8_t>(0x03));
+  CHECK_EQ(named.error().lateFrontMatterRecords->lateRecord.offset,
+           static_cast<std::uint64_t>(2374));
+  CHECK_EQ(named.error().lateFrontMatterRecords->firstStateRecord.opcode,
+           static_cast<std::uint8_t>(0x05));
+  CHECK_EQ(named.error().lateFrontMatterRecords->firstStateRecord.offset,
+           static_cast<std::uint64_t>(516));
+
+  bool threw = false;
+  try {
+    named.value();
+  } catch (const Exception& exception) {
+    threw = true;
+    CHECK_EQ(exception.error().code, ErrorCode::kMalformed);
+    CHECK(exception.error().lateFrontMatterRecords.has_value());
+    if (exception.error().lateFrontMatterRecords.has_value()) {
+      CHECK_EQ(exception.error().lateFrontMatterRecords->lateRecord.offset,
+               static_cast<std::uint64_t>(2374));
+      CHECK_EQ(exception.error().lateFrontMatterRecords->firstStateRecord.offset,
+               static_cast<std::uint64_t>(516));
+    }
+  }
+  CHECK(threw);
+}
+
 void codesHaveNames() {
   CHECK_EQ(std::string(fourdgs::toString(ErrorCode::kBadMagic)), std::string("kBadMagic"));
   CHECK_EQ(std::string(fourdgs::toString(ErrorCode::kOk)), std::string("kOk"));
@@ -103,6 +142,7 @@ void runTests() {
   valueThrowsForCallersWhoWantThat();
   voidResultReportsBothWays();
   refusalIsOptionalAndTravelsWithTheError();
+  lateFrontMatterSitesTravelWithTheError();
   codesHaveNames();
 }
 

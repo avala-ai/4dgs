@@ -20,6 +20,8 @@ namespace {
 using fourdgs::GaussianData;
 using fourdgs::GaussianView;
 using fourdgs::Header;
+using fourdgs::LateFrontMatterRecords;
+using fourdgs::RecordSite;
 using fourdgs::conformance::Json;
 
 GaussianData scene(std::size_t n, unsigned seed) {
@@ -217,6 +219,27 @@ void stringsAreEscaped() {
   CHECK_EQ(Json::string("a\"b\\c\nd").render(), std::string("\"a\\\"b\\\\c\\nd\""));
 }
 
+void lateFrontMatterRefusalCarriesBothTypedSites() {
+  const LateFrontMatterRecords records{
+      RecordSite{0x03, 2374},
+      RecordSite{0x05, 516},
+  };
+  CHECK_EQ(fourdgs::conformance::lateFrontMatterRefusalJson("late-front-matter-record", records),
+           std::string("{\n"
+                       "  \"firstStateRecord\": {\n"
+                       "    \"at\": \"516\",\n"
+                       "    \"opcode\": 5\n"
+                       "  },\n"
+                       "  \"lateRecord\": {\n"
+                       "    \"at\": \"2374\",\n"
+                       "    \"opcode\": 3\n"
+                       "  },\n"
+                       "  \"refused\": \"late-front-matter-record\"\n"
+                       "}"));
+  CHECK_EQ(fourdgs::conformance::refusalJson("unknown-stream-codec"),
+           std::string("{\n  \"refused\": \"unknown-stream-codec\"\n}"));
+}
+
 /// The substitution itself, asked directly, because the end-to-end check below can only run
 /// on a machine that has a comma-radix locale installed and most CI images do not.
 ///
@@ -301,6 +324,7 @@ void runTests() {
   checksumMatchesTheReference();
   keysAreSorted();
   stringsAreEscaped();
+  lateFrontMatterRefusalCarriesBothTypedSites();
   theRadixIsRewrittenBothWays();
   theCanonicalRadixIsNotTheLocaleRadix();
 }

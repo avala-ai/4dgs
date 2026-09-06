@@ -53,6 +53,12 @@ int refusedOrFailed(const Error& error) {
     return 0;
   }
   if (!error.refusal.has_value()) return fail(error.toString());
+  if (error.lateFrontMatterRecords.has_value()) {
+    std::printf("%s\n", fourdgs::conformance::lateFrontMatterRefusalJson(
+                            *error.refusal, *error.lateFrontMatterRecords)
+                            .c_str());
+    return 0;
+  }
   std::printf("%s\n", fourdgs::conformance::refusalJson(*error.refusal).c_str());
   return 0;
 }

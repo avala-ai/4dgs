@@ -17,6 +17,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,6 +31,7 @@
 namespace {
 
 using fourdgs::GaussianView;
+using fourdgs::LateFrontMatterRecords;
 using fourdgs::Result;
 using fourdgs::Scene;
 
@@ -98,6 +102,127 @@ std::vector<std::uint8_t> readWhole(const std::string& path, bool* found) {
   }
   std::fclose(handle);
   return bytes;
+}
+
+std::vector<std::filesystem::path> lateFrontMatterVariants(const std::string& directory) {
+  std::vector<std::filesystem::path> out;
+  const std::filesystem::path family =
+      std::filesystem::path(directory) / "invalid" / "late-front-matter";
+  if (!std::filesystem::is_directory(family)) return out;
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(family)) {
+    if (entry.path().extension() == ".4dgs") out.push_back(entry.path());
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+struct ExpectedRecordSite {
+  std::uint8_t opcode = 0;
+  std::uint64_t offset = 0;
+};
+
+ExpectedRecordSite expectedRecordSite(const std::filesystem::path& json,
+                                      const std::string& member) {
+  std::ifstream stream(json);
+  const std::string text((std::istreambuf_iterator<char>(stream)),
+                         std::istreambuf_iterator<char>());
+  ExpectedRecordSite result;
+  const std::size_t object = text.find("\"" + member + "\"");
+  const std::size_t close = object == std::string::npos ? object : text.find('}', object);
+  const std::size_t atKey = object == std::string::npos ? object : text.find("\"at\"", object);
+  const std::size_t atOpen =
+      atKey == std::string::npos ? atKey : text.find('"', text.find(':', atKey));
+  const std::size_t atClose = atOpen == std::string::npos ? atOpen : text.find('"', atOpen + 1);
+  const std::size_t opcodeKey =
+      object == std::string::npos ? object : text.find("\"opcode\"", object);
+  const std::size_t opcodeColon =
+      opcodeKey == std::string::npos ? opcodeKey : text.find(':', opcodeKey);
+  CHECK(stream.good() || stream.eof());
+  CHECK(object != std::string::npos);
+  CHECK(close != std::string::npos);
+  CHECK(atKey < close);
+  CHECK(atOpen < close);
+  CHECK(atClose < close);
+  CHECK(opcodeKey < close);
+  CHECK(opcodeColon < close);
+  if (object == std::string::npos || close == std::string::npos || atKey >= close ||
+      atOpen >= close || atClose >= close || opcodeKey >= close || opcodeColon >= close) {
+    return result;
+  }
+  result.offset = std::strtoull(text.substr(atOpen + 1, atClose - atOpen - 1).c_str(), nullptr, 10);
+  result.opcode =
+      static_cast<std::uint8_t>(std::strtoul(text.c_str() + opcodeColon + 1, nullptr, 10));
+  return result;
+}
+
+void checkLateFrontMatter(const fourdgs::Error& error, const ExpectedRecordSite& late,
+                          const ExpectedRecordSite& first) {
+  CHECK_EQ(error.code, fourdgs::ErrorCode::kMalformed);
+  CHECK(error.refusal.has_value());
+  if (error.refusal.has_value()) {
+    CHECK_EQ(*error.refusal, std::string("late-front-matter-record"));
+  }
+  CHECK(error.lateFrontMatterRecords.has_value());
+  if (!error.lateFrontMatterRecords.has_value()) return;
+  const LateFrontMatterRecords& actual = *error.lateFrontMatterRecords;
+  CHECK_EQ(actual.lateRecord.opcode, late.opcode);
+  CHECK_EQ(actual.lateRecord.offset, late.offset);
+  CHECK_EQ(actual.firstStateRecord.opcode, first.opcode);
+  CHECK_EQ(actual.firstStateRecord.offset, first.offset);
+}
+
+/// Every shared placement witness crosses the public streamed API with both proving records.
+void allLateFrontMatterWitnessesCarryBothSites(const std::string& directory) {
+  const std::vector<std::filesystem::path> files = lateFrontMatterVariants(directory);
+  CHECK_EQ(files.size(), static_cast<std::size_t>(18));
+  for (const std::filesystem::path& file : files) {
+    bool found = false;
+    const std::vector<std::uint8_t> bytes = readWhole(file.string(), &found);
+    CHECK(found);
+    if (!found) continue;
+    const std::filesystem::path expectation =
+        std::filesystem::path(file).replace_extension(".json");
+    const ExpectedRecordSite late = expectedRecordSite(expectation, "lateRecord");
+    const ExpectedRecordSite first = expectedRecordSite(expectation, "firstStateRecord");
+
+    if (file.filename().string().rfind("LateKeyframeDelta", 0) == 0) {
+      Result<std::string> decoded = fourdgs::keyframeDeltaStatesJson(
+          fourdgs::Span<const std::uint8_t>(bytes.data(), bytes.size()), false);
+      CHECK(!decoded.ok());
+      if (!decoded.ok()) checkLateFrontMatter(decoded.error(), late, first);
+    } else {
+      Result<std::unique_ptr<Scene>> opened =
+          Scene::openMemory(fourdgs::Span<const std::uint8_t>(bytes.data(), bytes.size()),
+                            fourdgs::ReadMode::kSequential);
+      CHECK(!opened.ok());
+      if (!opened.ok()) checkLateFrontMatter(opened.error(), late, first);
+    }
+  }
+
+  // The three public gaussian-birth doors all preserve the same evidence. Memory covers the
+  // family above; one representative pins the path and caller-owned transport adapters too.
+  if (files.empty()) return;
+  const auto representative = std::find_if(files.begin(), files.end(), [](const auto& file) {
+    return file.filename().string().rfind("LateKeyframeDelta", 0) != 0;
+  });
+  CHECK(representative != files.end());
+  if (representative == files.end()) return;
+  const ExpectedRecordSite late = expectedRecordSite(
+      std::filesystem::path(*representative).replace_extension(".json"), "lateRecord");
+  const ExpectedRecordSite first = expectedRecordSite(
+      std::filesystem::path(*representative).replace_extension(".json"), "firstStateRecord");
+  Result<std::unique_ptr<Scene>> fromPath =
+      Scene::openPath(representative->string(), fourdgs::ReadMode::kSequential);
+  CHECK(!fromPath.ok());
+  if (!fromPath.ok()) checkLateFrontMatter(fromPath.error(), late, first);
+
+  bool found = false;
+  const std::vector<std::uint8_t> bytes = readWhole(representative->string(), &found);
+  fourdgs::MemoryReadable source(bytes);
+  Result<std::unique_ptr<Scene>> fromReadable = Scene::open(source, fourdgs::ReadMode::kSequential);
+  CHECK(!fromReadable.ok());
+  if (!fromReadable.ok()) checkLateFrontMatter(fromReadable.error(), late, first);
 }
 
 std::uint64_t littleU64(const std::uint8_t* at) {
@@ -477,6 +602,7 @@ void runTests() {
   const std::string directory = corpusDirectory();
 
   refusalsAreNamed(directory);
+  allLateFrontMatterWitnessesCarryBothSites(directory);
   aNonPositiveBirthTimeGridCrossesBothOpenModes(directory);
 
   for (const char* variant : kVariants) {

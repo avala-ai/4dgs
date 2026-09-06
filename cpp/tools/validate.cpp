@@ -18,7 +18,7 @@
 /// here would make the tool a second implementation of the format that could disagree with the
 /// decoder it ships beside. So the checks below are the ones that need no parser — framing, the
 /// records a file must carry, where the index points, the summary checksum — plus everything
-/// the reader itself decides, which is where the seven named refusals live.
+/// the reader itself decides, which is where the ten named refusals live.
 ///
 /// The consequence is worth stating plainly: on a file this tool calls valid, Python may still
 /// have something to say. It reports a subset of Python's findings and never a finding Python
@@ -143,6 +143,29 @@ std::string hex2(std::uint8_t value) {
   out.push_back(digits[value >> 4]);
   out.push_back(digits[value & 0x0F]);
   return out;
+}
+
+bool isDefinedFrontMatter(std::uint8_t opcode) {
+  switch (opcode) {
+    case 0x01:  // Header
+    case 0x03:  // Quantization
+    case 0x04:  // Window Table
+    case 0x09:  // legacy Audio
+    case 0x0A:  // Camera
+    case 0x0B:  // Metadata
+    case 0x0D:  // Attachment
+    case 0x11:  // Audio Source
+    case 0x12:  // Audio Data
+    case 0x20:  // Coordinate Frame
+    case 0x21:  // Sensor Calibration
+    case 0x22:  // Rig Trajectory
+    case 0x23:  // Geodetic Anchor
+    case 0x24:  // Object Table
+    case 0x25:  // Object Track
+      return true;
+    default:
+      return false;
+  }
 }
 
 const Frame* secondRecord(const Walk& walk, std::uint8_t opcode) {
@@ -611,8 +634,7 @@ Report validate(Readable& source) {
   std::optional<Frame> undersizedIndex;
   std::optional<Frame> undersizedFooter;
   std::optional<Frame> firstStateRecord;
-  std::optional<Frame> lateDecodeFrontMatter;
-  std::optional<Frame> lateModernAudio;
+  std::optional<Frame> lateFrontMatter;
   Result<Walk> walked = walk(source, [&](const Frame& frame, bool complete) {
     if (complete && frame.opcode == op::kChunkIndex && frame.length < 40 &&
         !undersizedIndex.has_value()) {
@@ -625,13 +647,9 @@ Report validate(Readable& source) {
     if (!complete) return;
     const bool state = frame.opcode == op::kChunk || frame.opcode == op::kDeltaChunk;
     if (state && !firstStateRecord.has_value()) firstStateRecord = frame;
-    if (firstStateRecord.has_value() && !lateDecodeFrontMatter.has_value() &&
-        (frame.opcode == op::kQuantization || frame.opcode == op::kWindowTable)) {
-      lateDecodeFrontMatter = frame;
-    }
-    if (firstStateRecord.has_value() && !lateModernAudio.has_value() &&
-        (frame.opcode == op::kAudioSource || frame.opcode == op::kAudioData)) {
-      lateModernAudio = frame;
+    if (firstStateRecord.has_value() && !lateFrontMatter.has_value() &&
+        isDefinedFrontMatter(frame.opcode)) {
+      lateFrontMatter = frame;
     }
   });
   if (!walked) {
@@ -701,6 +719,24 @@ Report validate(Readable& source) {
     if (walk.cut.has_value()) noteTheCut(&report, walk);
     return report;
   }
+  if (lateFrontMatter.has_value()) {
+    const LateFrontMatterRecords records{
+        RecordSite{lateFrontMatter->opcode, lateFrontMatter->offset},
+        RecordSite{firstStateRecord->opcode, firstStateRecord->offset},
+    };
+    const Error placement(
+        ErrorCode::kMalformed,
+        "the defined front-matter record " + opcodeName(records.lateRecord.opcode) + " (opcode " +
+            hex2(records.lateRecord.opcode) + ") at byte " +
+            std::to_string(records.lateRecord.offset) + " follows the first state record " +
+            opcodeName(records.firstStateRecord.opcode) + " (opcode " +
+            hex2(records.firstStateRecord.opcode) + ") at byte " +
+            std::to_string(records.firstStateRecord.offset) +
+            "; every defined front-matter record must precede the first state record",
+        std::string("late-front-matter-record"), records);
+    refused(&report, "", placement, &walk, std::nullopt);
+    return report;
+  }
   if (walk.firstIntactRecord->opcode != op::kHeader) {
     error(&report, "first record is " + opcodeName(walk.firstIntactRecord->opcode) +
                        "; the Header must come first");
@@ -708,21 +744,6 @@ Report validate(Readable& source) {
   if (!header) error(&report, "no Header record");
   if (!quantization) error(&report, "no Quantization record");
   if (!footer) error(&report, "no Footer record");
-  if (lateDecodeFrontMatter.has_value()) {
-    error(&report, "the " + opcodeName(lateDecodeFrontMatter->opcode) + " record at byte " +
-                       std::to_string(lateDecodeFrontMatter->offset) + " appears after the first " +
-                       opcodeName(firstStateRecord->opcode) + " record at byte " +
-                       std::to_string(firstStateRecord->offset) +
-                       "; decode-affecting front matter must precede state records so streamed "
-                       "and indexed reads use the same grids");
-  }
-  if (lateModernAudio.has_value()) {
-    error(&report, "the " + opcodeName(lateModernAudio->opcode) + " record at byte " +
-                       std::to_string(lateModernAudio->offset) + " appears after the first " +
-                       opcodeName(firstStateRecord->opcode) + " record at byte " +
-                       std::to_string(firstStateRecord->offset) +
-                       "; Audio Source and Audio Data records must precede state records");
-  }
   if (walk.intactOpcodeCounts[op::kFooter] > 1) {
     error(&report, "the file carries " + std::to_string(walk.intactOpcodeCounts[op::kFooter]) +
                        " Footer records; the Footer must be unique and final");

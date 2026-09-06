@@ -41,6 +41,18 @@ enum class ErrorCode : std::int32_t {
 
 const char* toString(ErrorCode code) noexcept;
 
+/// One physical top-level record carried by a structured refusal.
+struct RecordSite {
+  std::uint8_t opcode = 0;
+  std::uint64_t offset = 0;
+};
+
+/// The two records that prove `late-front-matter-record`.
+struct LateFrontMatterRecords {
+  RecordSite lateRecord;
+  RecordSite firstStateRecord;
+};
+
 /// A code and the sentence that names the problem.
 ///
 /// Cross-SDK principle 6: a decoder that refuses a file says which byte, which record, which
@@ -53,11 +65,12 @@ struct Error {
   /// Which rule refused the file, in the specification's own vocabulary:
   /// `"magic-mismatch"`, `"unsupported-major-version"`, `"unknown-temporal-model"`,
   /// `"unknown-quantization-scheme"`, `"non-positive-step-time"`,
-  /// `"unknown-stream-codec"`, `"window-index-out-of-range"` — the same seven strings
-  /// every other SDK prints.
+  /// `"unknown-stream-codec"`, `"window-index-out-of-range"`, `"index-record-mismatch"`,
+  /// `"decoded-f32-overflow"`, `"late-front-matter-record"` — the same ten strings every
+  /// other SDK prints.
   ///
   /// `code` says what *kind* of thing went wrong, and `kUnsupported` alone covers three of
-  /// those seven; this says *which* one, so "refused the file" and "refused it for the right
+  /// those ten; this says *which* one, so "refused the file" and "refused it for the right
   /// reason" stop being the same observation.
   ///
   /// Absent for every failure the table does not name — a truncated file, a transport that
@@ -66,10 +79,22 @@ struct Error {
   /// and a successful call never reaches an `Error` at all.
   std::optional<std::string> refusal;
 
+  /// Both physical sites for `late-front-matter-record`, when the streamed C++ surface has
+  /// the input needed to recover them. Kept separate from `message`, so callers never parse
+  /// prose to identify records. Empty for every other error and for old backends that cannot
+  /// provide the evidence.
+  std::optional<LateFrontMatterRecords> lateFrontMatterRecords;
+
   Error() = default;
   Error(ErrorCode c, std::string m) : code(c), message(std::move(m)) {}
   Error(ErrorCode c, std::string m, std::optional<std::string> r)
       : code(c), message(std::move(m)), refusal(std::move(r)) {}
+  Error(ErrorCode c, std::string m, std::optional<std::string> r,
+        std::optional<LateFrontMatterRecords> records)
+      : code(c),
+        message(std::move(m)),
+        refusal(std::move(r)),
+        lateFrontMatterRecords(std::move(records)) {}
 
   /// `"kMalformed: window index 7 is outside a table of 4"` — code and detail, for a log line
   /// or a `what()`.
