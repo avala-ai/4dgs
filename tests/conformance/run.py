@@ -32,6 +32,7 @@ from collections.abc import Callable, Iterator
 from decimal import InvalidOperation
 from typing import NamedTuple
 
+import chunk_window
 from generator import invalid as invalid_corpus
 from json_compare import diagnostic_differences
 from json_compare import for_capabilities as comparison_document
@@ -108,6 +109,11 @@ OBJECT_PREFIX = "object/"
 IDENTITY = os.path.join(DATA, "identity")
 IDENTITY_PREFIX = "identity/"
 
+#: The two gaussian-birth Chunk/window witnesses are ordinary valid files but require
+#: instant reconstruction rather than the resident-only canonical summary. They stay in
+#: one explicitly gated family until each SDK implements the query invocation below.
+CHUNK_WINDOW = os.path.join(DATA, chunk_window.FAMILY)
+
 #: Invalid variants are named with this prefix, which is also their subdirectory. A
 #: runner is handed the same thing either way — a path — and the harness compares the
 #: same thing either way: parsed JSON against a committed expectation. What differs is
@@ -131,6 +137,11 @@ def variants() -> list[str]:
                 f"{relative}/{filename[: -len('.json')]}" for filename in files if filename.endswith(".json")
             )
         identity.sort()
+    chunk_windows = []
+    if os.path.isdir(CHUNK_WINDOW):
+        chunk_windows = sorted(
+            chunk_window.PREFIX + f[: -len(".json")] for f in os.listdir(CHUNK_WINDOW) if f.endswith(".json")
+        )
     refusals = []
     if os.path.isdir(INVALID):
         refusals = sorted(INVALID_PREFIX + f[: -len(".json")] for f in os.listdir(INVALID) if f.endswith(".json"))
@@ -140,7 +151,7 @@ def variants() -> list[str]:
             for f in os.listdir(LATE_FRONT_MATTER)
             if f.endswith(".json")
         )
-    return valid + keyframe + obj + identity + refusals
+    return valid + keyframe + obj + identity + chunk_windows + refusals
 
 
 #: Families whose runners answer a refusal expectation — printing `{"refused": "<id>"}`
@@ -175,6 +186,11 @@ AGGREGATE_DECODED_BUDGET_FAMILIES: frozenset[str] = frozenset({"cpp", "dart", "p
 # family enters only after both maintained read paths return the exact logical rows for
 # both temporal models.  The shared corpus layer intentionally claims no SDK.
 OPTIONAL_IDENTITY_DEFAULTS_FAMILIES: frozenset[str] = frozenset()
+
+# A family enters this set only after both read paths implement the explicit gaussian-
+# birth instant query and the streamed path also passes the no-index witness. The shared
+# corpus layer intentionally claims no implementation.
+GAUSSIAN_BIRTH_CHUNK_WINDOW_INTERSECTION_FAMILIES: frozenset[str] = frozenset()
 
 # The resource gate reuses one tiny valid corpus file. One decoded gaussian cannot fit in
 # one byte under any SDK representation, so the test is independent of allocator overhead
@@ -270,6 +286,9 @@ class Capabilities:
     #: Whether this runner answers both valid optional-identity witnesses, including
     #: zero-default materialization and absolute update replacement for all three lanes.
     optional_identity_defaults: bool = False
+    #: Whether the runner reconstructs gaussian-birth instants using the intersection of
+    #: each decoded Window with its owning Chunk interval.
+    gaussian_birth_chunk_window_intersection: bool = False
 
 
 def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
@@ -290,6 +309,7 @@ def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
         canonical_state_order=family in CANONICAL_STATE_ORDER_FAMILIES,
         aggregate_decoded_budget=family in AGGREGATE_DECODED_BUDGET_FAMILIES,
         optional_identity_defaults=family in OPTIONAL_IDENTITY_DEFAULTS_FAMILIES,
+        gaussian_birth_chunk_window_intersection=(family in GAUSSIAN_BIRTH_CHUNK_WINDOW_INTERSECTION_FAMILIES),
     )
 
 
@@ -318,11 +338,11 @@ def supports(caps: Capabilities, variant: str) -> bool:
     # models; `declines` cannot quietly reduce the family after the handshake said yes.
     if variant.startswith(IDENTITY_PREFIX):
         return caps.optional_identity_defaults and (not caps.indexed or "UseChunkIndex" in variant)
+    if variant.startswith(chunk_window.PREFIX):
+        return caps.gaussian_birth_chunk_window_intersection and (not caps.indexed or "UseChunkIndex" in variant)
     if any(flag in variant for flag in caps.declines):
         return False
-    if not caps.indexed:
-        return True
-    return "UseChunkIndex" in variant
+    return not caps.indexed or "UseChunkIndex" in variant
 
 
 class ProtocolError(Exception):
@@ -576,6 +596,11 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     optional_identity_defaults = doc.get("optionalIdentityDefaults", False)
     if not isinstance(optional_identity_defaults, bool):
         raise ProtocolError(f"declares optionalIdentityDefaults {optional_identity_defaults!r}; expected true or false")
+    gaussian_birth_chunk_window_intersection = doc.get(chunk_window.CAPABILITY, False)
+    if not isinstance(gaussian_birth_chunk_window_intersection, bool):
+        raise ProtocolError(
+            f"declares {chunk_window.CAPABILITY} {gaussian_birth_chunk_window_intersection!r}; expected true or false"
+        )
     late_front_matter_records = doc.get("lateFrontMatterRecords", False)
     if not isinstance(late_front_matter_records, bool):
         raise ProtocolError(f"declares lateFrontMatterRecords {late_front_matter_records!r}; expected true or false")
@@ -593,6 +618,7 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
         canonical_state_order=canonical_state_order,
         aggregate_decoded_budget=aggregate_decoded_budget,
         optional_identity_defaults=optional_identity_defaults,
+        gaussian_birth_chunk_window_intersection=gaussian_birth_chunk_window_intersection,
     )
 
 
@@ -739,6 +765,40 @@ def aggregate_budget_problem(command: list[str], timeout: float) -> str | None:
     return None
 
 
+def variant_arguments(variant: str, path: str) -> list[str]:
+    """Arguments appended to one runner command for this corpus variant."""
+    if variant.startswith(chunk_window.PREFIX):
+        return [*chunk_window.runner_arguments(), path]
+    return [path]
+
+
+def chunk_window_verdict(document) -> tuple[tuple[object, object], ...] | None:
+    """The instant contribution facts that streamed and indexed paths must share.
+
+    Resident summaries legitimately differ when one file has no Chunk Index. The direct
+    path comparison therefore extracts only the state times and live counts which #171
+    exposed, while the ordinary expectation comparison remains strict over every field.
+    """
+    if not isinstance(document, dict) or not isinstance(document.get("states"), list):
+        return None
+    verdict = []
+    for state in document["states"]:
+        if not isinstance(state, dict) or "t" not in state or "liveCount" not in state:
+            return None
+        verdict.append((state["t"], state["liveCount"]))
+    return tuple(verdict)
+
+
+def chunk_window_path_pairs(results):
+    """Yield submitted streamed/indexed verdict pairs for the same family and file."""
+    paired = sorted({(family, variant) for family, variant, _indexed in results})
+    for family, variant in paired:
+        streamed = results.get((family, variant, False))
+        indexed = results.get((family, variant, True))
+        if streamed is not None and indexed is not None:
+            yield family, variant, streamed, indexed
+
+
 def builtin_jobs(family_filter: str | None) -> Iterator[tuple[Capabilities, list[str]]]:
     """Every built-in runner that is present on this machine.
 
@@ -785,6 +845,8 @@ def external_jobs(commands: list[str], timeout: float) -> list[tuple[Capabilitie
             f"refusals {'answered' if caps.refusals else 'declined'}, "
             f"aggregate budget {'claimed' if caps.aggregate_decoded_budget else 'unclaimed'}, "
             f"optional identity {'claimed' if caps.optional_identity_defaults else 'unclaimed'}, "
+            "gaussian-birth Chunk/window intersection "
+            f"{'claimed' if caps.gaussian_birth_chunk_window_intersection else 'unclaimed'}, "
             f"late front matter {'answered' if caps.late_front_matter_records else 'declined'}, "
             f"declines {declines}"
         )
@@ -843,6 +905,7 @@ def main(argv=None) -> int:
     #: Indexed by position rather than keyed by name, so two jobs that call themselves the
     #: same thing are still counted apart.
     executed = [0] * len(jobs)
+    chunk_window_results: dict[tuple[str, str, bool], tuple[tuple[object, object], ...]] = {}
     for job, (caps, command) in enumerate(jobs):
         ran_families.add(caps.family)
         if caps.aggregate_decoded_budget:
@@ -870,7 +933,7 @@ def main(argv=None) -> int:
             expectation_path = os.path.join(DATA, *parts[:-1], f"{parts[-1]}.json")
             # A runner that exits non-zero, hangs, or cannot be started is a reportable
             # failure of one variant, not an exception out of the harness.
-            outcome = invoke(command, [path], args.timeout)
+            outcome = invoke(command, variant_arguments(variant, path), args.timeout)
             if outcome.error:
                 failed += 1
                 print(f"FAIL {caps.name} {variant}: runner {outcome.error}")
@@ -898,6 +961,10 @@ def main(argv=None) -> int:
                 print(f"  stdout: {actual[:200]!r}")
                 continue
             assert actual_json is not None
+            if variant.startswith(chunk_window.PREFIX):
+                verdict = chunk_window_verdict(actual_json)
+                if verdict is not None:
+                    chunk_window_results[(caps.family, variant, caps.indexed)] = verdict
             expected_json = load_canonical_json(expected)
             compared, comparison_error = compared_documents(actual_json, expected_json, caps)
             if comparison_error is not None:
@@ -917,6 +984,18 @@ def main(argv=None) -> int:
                 print(f"FAIL {caps.name} {variant}")
                 for line in diagnostic_differences(expected_comparable, actual_comparable):
                     print("  " + line)
+
+    # Fidelity to one expectation alone was not enough to expose #171: the defect was a
+    # disagreement inside one implementation. When both paths were submitted and claimed
+    # the capability, compare their exact instant verdicts directly as a second invariant.
+    for family, variant, streamed, indexed in chunk_window_path_pairs(chunk_window_results):
+        if streamed == indexed:
+            print(f"PASS {family} {variant}: streamed/indexed instant results agree")
+        else:
+            failed += 1
+            print(f"FAIL {family} {variant}: streamed/indexed instant results disagree")
+            print(f"  streamed: {streamed!r}")
+            print(f"  indexed:  {indexed!r}")
 
     print(f"\n{passed} passed, {skipped} skipped (variant not supported), {failed} failed")
     if failed:

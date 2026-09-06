@@ -176,6 +176,12 @@ condition of file validity.
    the no-index streamed path where applicable, then claims the shared capability only after its
    runner passes.
 
+Delivery step 2 is now represented by the capability-gated
+`data/chunk-window-intersection/WindowOverhang-*` pair. It queries before, inside, exactly at `t1`
+and after the owning Chunk; the indexed file is run through both paths and the no-index file through
+the streamed path. The shared layer claims no SDK family and moves no feature-matrix cell. Step 3
+remains the implementation work.
+
 The shared layer should compare the paths directly at the boundary rather than infer visibility from
 the current whole-scene canonical summary. That is the disagreement #171 exposed and the smallest
 test that cannot pass while either path still uses the other interpretation.

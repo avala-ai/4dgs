@@ -27,6 +27,7 @@ import hashlib
 import io
 import math
 import os
+import struct
 import sys
 from decimal import Decimal
 from itertools import zip_longest
@@ -41,12 +42,14 @@ LATE_FRONT_MATTER = os.path.join(INVALID, "late-front-matter")
 KEYFRAME = os.path.join(DATA, "keyframe")
 OBJECT = os.path.join(DATA, "object")
 IDENTITY = os.path.join(DATA, "identity")
+CHUNK_WINDOW = os.path.join(DATA, "chunk-window-intersection")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
 sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python", "fourdgs"))
 
 import canonical as canonical_module
+import chunk_window
 import fourdgs
 import invalid
 import scenarios
@@ -370,6 +373,116 @@ def build_invalid() -> list[tuple[str, bytes, str]]:
         if data == late_kd_base:
             raise AssertionError(f"{refusal.name}: the mutation changed nothing")
         out.append((refusal.name, data, canonical(refusal.expectation(data))))
+    return out
+
+
+# --------------------------------------------------------------------------
+# gaussian-birth Chunk/window-intersection corpus
+# --------------------------------------------------------------------------
+#
+# These two files differ only in whether the writer emits a Chunk Index. The writer
+# first creates the ordinary contained shape (window and owning Chunk both [1, 2)); a
+# length-preserving replacement then widens the Window Table row to [0, 3). This keeps
+# every offset and index claim valid while producing the legal overhang §3/§5.5 defines.
+# The expectation is authored from that normative intersection, not from the current
+# Python GaussianSet.state_at implementation, which intentionally has no owning-Chunk
+# argument yet. No SDK implementation is therefore allowed to become the oracle for
+# the conformance rule it has not claimed.
+
+_CHUNK_WINDOW_NAMES = (
+    "WindowOverhang-NoChunkIndex",
+    "WindowOverhang-UseChunkIndex-UseCrc",
+)
+
+
+def _chunk_window_gaussian() -> fourdgs.GaussianSet:
+    return fourdgs.GaussianSet(
+        positions=np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+        scales=np.asarray([[0.1, 0.1, 0.1]], dtype=np.float32),
+        rotations=np.asarray([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+        colors=np.asarray([[0.25, 0.5, 0.75, 0.8]], dtype=np.float32),
+        motions=np.zeros((1, 3), dtype=np.float32),
+        mu_t=np.asarray([1.5], dtype=np.float32),
+        # Marginal 1 at every probe: only the two half-open gates decide contribution.
+        sigma_t=np.asarray([np.inf], dtype=np.float32),
+        win_lo=np.asarray([1.0], dtype=np.float64),
+        win_hi=np.asarray([2.0], dtype=np.float64),
+    )
+
+
+def _widen_chunk_window(data: bytes) -> bytes:
+    """Replace the only Window Table row with [0, 3), without moving any byte."""
+    from fourdgs import opcode as op
+    from fourdgs.records import WindowTable, parse_chunk
+    from fourdgs.serialization import MAGIC, iter_records
+
+    records = list(iter_records(data, len(MAGIC)))
+    table = [record for record in records if record.opcode == op.WINDOW_TABLE]
+    chunks = [record for record in records if record.opcode == op.CHUNK]
+    if len(table) != 1 or WindowTable.parse(table[0].content).windows != [(1.0, 2.0)]:
+        raise AssertionError("Chunk/window base must carry exactly the contained [1, 2) window")
+    if len(chunks) != 1:
+        raise AssertionError("Chunk/window base must carry exactly one Chunk")
+    head, _streams = parse_chunk(chunks[0].content)
+    if (head.t0, head.t1, head.count) != (1.0, 2.0, 1):
+        raise AssertionError(f"Chunk/window base moved to {(head.t0, head.t1, head.count)!r}")
+
+    widened = bytearray(data)
+    # Record header, then the Window Table's u32 row count, then its two f64 endpoints.
+    struct.pack_into("<dd", widened, table[0].offset + 9 + 4, 0.0, 3.0)
+    return bytes(widened)
+
+
+def _chunk_window_summary(data: bytes) -> str:
+    scene = fourdgs.read(data)
+    summary = summarize(
+        scene.header,
+        scene.gaussians,
+        scene.audio_sources,
+        [(entry.t0, entry.t1) for entry in scene.chunk_index],
+        camera=scene.camera,
+        metadata=scene.metadata,
+        attachments=scene.attachments,
+        statistics=scene.statistics,
+        summary_offsets=scene.summary_offsets,
+        summary_crc_ok=scene.summary_crc_ok,
+        provenance=scene.provenance,
+        objects=scene.objects,
+    )
+    # The stored window contains every probe and never_fades makes the marginal 1, so
+    # the owning Chunk's [1, 2) interval is the only term that can change this count.
+    summary["states"] = [
+        {
+            "t": canonical_module.num(t),
+            "liveCount": "1" if 1.0 <= t < 2.0 else "0",
+        }
+        for t in chunk_window.PROBE_TIMES
+    ]
+    return canonical(summary)
+
+
+def build_chunk_window_corpus() -> list[tuple[str, bytes, str]]:
+    out = []
+    for name in _CHUNK_WINDOW_NAMES:
+        indexed = "UseChunkIndex" in name
+        buf = io.BytesIO()
+        fourdgs.write(
+            buf,
+            _chunk_window_gaussian(),
+            3.0,
+            options=fourdgs.WriteOptions(
+                max_depth=0,
+                min_chunk_gaussians=1,
+                write_index=indexed,
+                write_statistics=False,
+                write_summary_offsets=False,
+                write_crc=indexed,
+                library="4dgs conformance generator",
+                metadata={"conformance": chunk_window.MARKER},
+            ),
+        )
+        data = _widen_chunk_window(buf.getvalue())
+        out.append((name, data, _chunk_window_summary(data)))
     return out
 
 
@@ -1717,6 +1830,21 @@ def write_corpus(target: str) -> Corpus:
         checksums[f"{qualified}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
         expectations[qualified] = expectation + "\n"
 
+    # The resident-only top-level summary cannot prove an instant contribution rule.
+    # Keep these explicit-query witnesses in their own capability-gated family, where
+    # old SDK runners skip them until their language layer implements the invocation.
+    chunk_window_dir = os.path.join(target, chunk_window.FAMILY)
+    os.makedirs(chunk_window_dir, exist_ok=True)
+    for name, data, expectation in build_chunk_window_corpus():
+        with open(os.path.join(chunk_window_dir, f"{name}.4dgs"), "wb") as fh:
+            fh.write(data)
+        with open(os.path.join(chunk_window_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(expectation + "\n")
+        qualified = f"{chunk_window.PREFIX}{name}"
+        checksums[f"{qualified}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"{qualified}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[qualified] = expectation + "\n"
+
     invalid_dir = os.path.join(target, "invalid")
     late_front_matter_dir = os.path.join(invalid_dir, "late-front-matter")
     os.makedirs(invalid_dir, exist_ok=True)
@@ -1759,6 +1887,7 @@ def read_expectations() -> dict[str, str]:
         (OBJECT, "object/"),
         (os.path.join(IDENTITY, "gaussian-birth"), "identity/gaussian-birth/"),
         (os.path.join(IDENTITY, "keyframe-delta"), "identity/keyframe-delta/"),
+        (CHUNK_WINDOW, chunk_window.PREFIX),
     ):
         if not os.path.isdir(root):
             continue
@@ -1855,6 +1984,8 @@ def _verify(corpus: Corpus, committed_expectations: dict[str, str]) -> bool:
         record(f"object/{name}", data, expectation)
     for model, name, data, expectation in build_optional_identity_corpus():
         record(f"identity/{model}/{name}", data, expectation)
+    for name, data, expectation in build_chunk_window_corpus():
+        record(f"{chunk_window.PREFIX}{name}", data, expectation)
     for name, digest in checksums.items():
         if second.get(name) != digest:
             failures.append(f"{name}: encoder is not deterministic between runs")

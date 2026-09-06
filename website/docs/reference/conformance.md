@@ -82,6 +82,7 @@ and it says what a major, minor and patch bump each mean for a score taken again
     CHECKSUMS.txt    SHA-256 per generated file, `sha256sum -c` compatible
     <variant>.4dgs   the file
     <variant>.json   exactly what a correct decoder must produce from it
+    chunk-window-intersection/  gaussian-birth instant-query capability witnesses
     keyframe/        the keyframe-delta temporal model
     object/          the object layer: an Object Table and SE(3) tracks
     identity/        capability-gated optional identity defaults
@@ -97,10 +98,10 @@ unpacked corpus is a drop-in replacement for a generated one, so nothing that al
 
 `MANIFEST.json` is what a harness that is not `run.py` reads. Per variant it carries both paths,
 both SHA-256s, the byte length, the temporal model, whether a runner reading through the chunk index
-may be asked it at all, the optional `requiredCapability` for a gated valid family, and — for an
-invalid variant — the refusal identifier a conforming reader must produce. Those last three are the
-rules the harness applies when it decides what to skip, written down as data so an outside harness
-does not have to reimplement them by reading Python.
+may be asked it at all, any required capability and arguments inserted before the file path, and —
+for an invalid variant — the refusal identifier a conforming reader must produce. Those are the
+rules the harness applies when it decides what to skip or how to invoke a capability case, written
+down as data so an outside harness does not have to reimplement them by reading Python.
 
 ### Verify it
 
@@ -190,7 +191,8 @@ argument. It must exit zero and print one JSON object:
   "exactAggregates": true,
   "canonicalStateOrder": true,
   "aggregateDecodedBudget": true,
-  "optionalIdentityDefaults": true
+  "optionalIdentityDefaults": true,
+  "gaussianBirthChunkWindowIntersection": true
 }
 ```
 
@@ -205,9 +207,12 @@ features the runner does not implement. `exactAggregates` and `canonicalStateOrd
 and opt into strict comparison of exact root/state totals and composed-state samples. During the
 stacked transition, false omits only those fields; it never skips a variant or relaxes another
 field. `aggregateDecodedBudget` defaults to false and opts into the separate injected-limit gate
-below; false makes no memory claim and skips only that gate. A malformed declaration, a non-zero
-exit, or a command that cannot start fails the run; it is not silently treated as an implementation
-that supports nothing.
+below; false makes no memory claim and skips only that gate. `gaussianBirthChunkWindowIntersection`
+defaults to false and gates the two legal-overhang witnesses described below; true opts the streamed
+path into both and the indexed path into the indexed form. It is all-or-none for the path, so
+`declines` cannot remove one witness after the capability is claimed. A malformed declaration, a
+non-zero exit, or a command that cannot start fails the run; it is not silently treated as an
+implementation that supports nothing.
 
 `optionalIdentityDefaults` defaults to false. True opts into both valid identity witnesses and both
 temporal models for that runner's read path; `declines` cannot remove only one after the runner made
@@ -224,7 +229,8 @@ Unix and `CommandLineToArgvW`-compatible quoting on Windows.
 For an ordinary corpus comparison, the harness spawns the runner as a child process once per variant
 that the harness says it supports and appends exactly one argument to its command line: the path of
 the `.4dgs` file to read. An unsupported variant is skipped before the process starts. The aggregate
-decoded-budget capability adds one explicitly described invocation; nothing else is passed.
+decoded-budget and gaussian-birth Chunk/window capabilities add the two explicitly described
+invocations below; nothing else is passed.
 
 The path is absolute, so the runner's working directory is irrelevant — deliberately, because the
 harness does not set one, and a runner that resolved a relative path would work only when the suite
@@ -398,6 +404,9 @@ derived from the tables in `run.py`; out-of-tree runners receive the same record
 5. `optionalIdentityDefaults`: membership in `OPTIONAL_IDENTITY_DEFAULTS_FAMILIES` for a built-in or
    the external declaration's boolean. True activates both identity witnesses; decline fragments
    cannot reduce this all-or-none claim.
+6. `gaussianBirthChunkWindowIntersection`: membership in the corresponding built-in family set or
+   the external declaration's boolean. False skips both legal-overhang witnesses. True applies both
+   to a streamed runner and only the indexed form to an indexed runner; `declines` cannot weaken it.
 
 Some built-in entry points still define their own `supportsVariant` function. `run.py` does not call
 it; the capability record is authoritative. That keeps support decisions outside file invocation,
@@ -592,6 +601,40 @@ paths implement the flag. An external runner opts in through the capabilities ob
 an existing tiny valid file, changes no corpus expectation or checksum, and proves configuration
 plumbing plus error classification without allocating hundreds of megabytes.
 
+### Gaussian-birth Chunk/window-intersection gate
+
+The two files under `data/chunk-window-intersection/` are valid gaussian-birth inputs. Both contain
+one gaussian with a decoded Window `[0, 3)` inside an owning Chunk `[1, 2)`; one file carries a
+Chunk Index and one does not. The gaussian is flagged `never_fades`, so its marginal is exactly one
+at every probe and the Chunk/window intersection is the only term that can remove it.
+
+A runner declaring `"gaussianBirthChunkWindowIntersection": true` receives these arguments before
+the absolute file path:
+
+```text
+--gaussian-birth-state-times [0.5,1.5,2.0,2.5]
+```
+
+The second argument is one compact JSON array, not four command-line tokens. The runner emits its
+ordinary canonical gaussian-birth summary with an additive `states` array whose rows have the shape
+`{"t": <number>, "liveCount": "<decimal>"}` in the requested order. The resident sample must retain
+the stored `winLo: [0.0]` and `winHi: [3.0]`; the state counts must be `0, 1, 0, 0`. Thus `0.5`
+proves the left overhang is clipped, `1.5` is the live control, `2.0` pins the exclusive Chunk `t1`,
+and `2.5` proves the right overhang is clipped.
+
+The indexed runner is asked only for `WindowOverhang-UseChunkIndex-UseCrc`; the streamed runner is
+also asked for `WindowOverhang-NoChunkIndex`. This proves that a no-index streamed reader uses `t0`
+and `t1` from the Chunk record itself. If both paths for one family are submitted, the harness
+additionally compares their exact `(t, liveCount)` sequences on the indexed witness. That direct
+check is intentionally redundant with each committed expectation: #171 was a disagreement between
+two paths inside one implementation, and the suite now states that invariant in its own terms.
+
+The Header contains `conformance=gaussian-birth-chunk-window-intersection-v1`, which identifies the
+generated purpose from bytes rather than a filename. It is test metadata, not a format feature or
+visibility profile. The files are not refusals and add no renderer behaviour. Built-in families opt
+in only through `GAUSSIAN_BIRTH_CHUNK_WINDOW_INTERSECTION_FAMILIES`; the shared layer leaves that
+set empty until each SDK implementation lands.
+
 The Python and Rust **indexed** runners inspect the version prefix before Header dispatch. If it is
 the exact version-1 magic, they read through the Header's length-prefixed `profile` and `library`
 fields to choose the gaussian-birth or keyframe-delta indexed decoder. If the prefix differs —
@@ -766,6 +809,8 @@ the Python and Rust cores rather than in `canonical.py`; the `data/keyframe/` ex
 those. The valid `gaussian-birth` expectations are `summarize()`'s. The eleven baseline
 `data/invalid/*.json` expectations are the one-key refusal documents described above, not summaries
 of their files; the structured placement expectations live under `data/invalid/late-front-matter/`.
+The two `data/chunk-window-intersection/` expectations are gaussian-birth summaries with the
+explicitly queried `states` array added; they remain resident-field summaries everywhere else.
 
 Finally, an artifact worth naming so that nobody chases it: the committed `.json` files were written
 by the Python implementation, so they carry Python's spelling of every float. That is a fact about

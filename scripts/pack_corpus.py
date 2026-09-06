@@ -44,6 +44,7 @@ DATA = os.path.join(ROOT, "tests", "conformance", "data")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
 sys.path.insert(0, os.path.join(ROOT, "tests", "conformance"))
 
+import chunk_window
 from generator import invalid as invalid_corpus
 
 #: The corpus's version, and the only place it is written. The release job asserts the tag
@@ -129,11 +130,13 @@ def describe(name: str, directory: str, path: str, expectation_path: str) -> dic
 
     Everything here is derived from the corpus itself, and everything here is something a
     harness would otherwise have to learn by reading `run.py`: which read paths may be
-    asked for this variant, which temporal model it uses, and — for an invalid variant —
-    which refusal identifier a conforming reader must produce.
+    asked for this variant, which temporal model it uses, any required capability and
+    invocation arguments, and — for an invalid variant — which refusal identifier a
+    conforming reader must produce.
     """
     qualified = f"{directory}/{name}" if directory else name
     invalid = directory == "invalid" or directory.startswith("invalid/")
+    chunk_window_query = directory == chunk_window.FAMILY
     refusal = None
     if invalid:
         with open(expectation_path, encoding="utf-8") as handle:
@@ -162,7 +165,16 @@ def describe(name: str, directory: str, path: str, expectation_path: str) -> dic
         # The live harness enforces the same all-or-none gate from the capabilities
         # handshake. This additive field lets an outside harness select the downloadable
         # family without learning that rule from Python source.
-        "requiredCapability": "optionalIdentityDefaults" if directory.startswith("identity/") else None,
+        "requiredCapability": (
+            "optionalIdentityDefaults"
+            if directory.startswith("identity/")
+            else chunk_window.CAPABILITY
+            if chunk_window_query
+            else None
+        ),
+        # Capability-specific arguments are inserted before the file path exactly as the
+        # live harness does. Path-only families keep an empty list.
+        "runnerArguments": list(chunk_window.runner_arguments()) if chunk_window_query else [],
         # `null` for a valid variant: it must decode. For an invalid one this is the whole
         # expectation — the identifier of the rule a conforming reader refuses it under.
         "refusal": refusal,
@@ -209,6 +221,7 @@ them usable by somebody who has not cloned it.
     CHECKSUMS.txt    SHA-256 per generated file, `sha256sum -c` compatible
     <variant>.4dgs   the file
     <variant>.json   exactly what a correct decoder must produce from it
+    chunk-window-intersection/  gaussian-birth instant-query capability witnesses
     keyframe/        the keyframe-delta temporal model
     object/          the object layer: an Object Table and SE(3) tracks
     identity/        capability-gated optional identity defaults
@@ -332,16 +345,21 @@ exit "$failed"
 ```
 
 `MANIFEST.json` says which variants a runner may skip and why: `family` separates the base,
-keyframe-delta, object-layer, optional-identity and invalid corpora; `indexed` is false for a variant
-an indexed reader is not obligated to answer; `requiredCapability` names an all-or-none semantic
-claim for a gated valid family; and `refusal` is non-null for a file that must be refused. The JSON beside
-the file is the exact answer: ordinarily `{{"refused": "<identifier>"}}`, while a rule that requires
-structured evidence carries those additional fields too. The exit status is still 0, because a
-refusal is a result rather than a crash. A feature-level partial implementation sets `allowlist` to a text file
-containing the exact manifest `name` values it supports; unknown names, malformed manifest data and
-an empty selection all fail before the runner is invoked. Any non-zero runner status fails its
-variant before stdout is compared.
+keyframe-delta, object-layer, capability-gated and invalid corpora; `indexed` is false for a variant
+an indexed reader is not obligated to answer; `requiredCapability` is non-null when opting in needs
+an explicit protocol capability; `runnerArguments` lists arguments inserted before the path for
+that capability; and `refusal` is non-null for a file that must be refused. The shell loop above is
+the path-only baseline and deliberately does not select the `chunk-window-intersection` family. A
+runner claiming `gaussianBirthChunkWindowIntersection` runs those entries with the listed
+`runnerArguments`, or uses the repository harness, which performs that invocation and compares the
+two read paths directly when both are present.
 
+The JSON beside the file is the exact answer: ordinarily `{{"refused": "<identifier>"}}`, while a
+rule that requires structured evidence carries those additional fields too. The exit status is
+still 0, because a refusal is a result rather than a crash. A feature-level partial implementation
+sets `allowlist` to a text file containing the exact manifest `name` values it supports; unknown
+names, malformed manifest data and an empty selection all fail before the runner is invoked. Any
+non-zero runner status fails its variant before stdout is compared.
 The full contract — invocation, stdout, exit codes, the canonical JSON rules — is at
 <https://4dgs.dev/docs/reference/conformance>.
 

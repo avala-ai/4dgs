@@ -1,0 +1,106 @@
+{
+  "aggregate": {
+    "neverFadesCount": "1",
+    "opacitySum": 0.8,
+    "positionSum": [
+      1.0,
+      2.0,
+      3.0
+    ],
+    "zeroMotionCount": "1"
+  },
+  "attachments": [],
+  "audioSources": [],
+  "camera": null,
+  "chunkIntervals": [
+    [
+      1.0,
+      2.0
+    ]
+  ],
+  "cutoff": 0.05,
+  "durationSec": 3.0,
+  "gaussianCount": "1",
+  "hasAudio": false,
+  "headerAttributes": {
+    "conformance": "gaussian-birth-chunk-window-intersection-v1"
+  },
+  "library": "4dgs conformance generator",
+  "metadataRecords": [],
+  "profile": "",
+  "sample": {
+    "colors": [
+      [
+        0.25098,
+        0.501961,
+        0.752941,
+        0.8
+      ]
+    ],
+    "motions": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "muT": [
+      1.5
+    ],
+    "positions": [
+      [
+        1.0,
+        2.0,
+        3.0
+      ]
+    ],
+    "rotations": [
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "scales": [
+      [
+        0.10055,
+        0.10055,
+        0.10055
+      ]
+    ],
+    "sigmaT": [
+      null
+    ],
+    "winHi": [
+      3.0
+    ],
+    "winLo": [
+      0.0
+    ]
+  },
+  "sh": null,
+  "shDegree": 0,
+  "states": [
+    {
+      "liveCount": "0",
+      "t": 0.5
+    },
+    {
+      "liveCount": "1",
+      "t": 1.5
+    },
+    {
+      "liveCount": "0",
+      "t": 2.0
+    },
+    {
+      "liveCount": "0",
+      "t": 2.5
+    }
+  ],
+  "statistics": null,
+  "summaryCrcOk": true,
+  "summaryOffsets": [],
+  "temporalModel": "gaussian-birth"
+}

@@ -44,10 +44,23 @@ What each part of the version means here:
   spec §4's exemption from scanning beyond the first state record. The independent-results catalog
   preserves and validates the same capability in published runner evidence.
 
+- Two valid gaussian-birth Chunk/window-intersection witnesses. Both store one never-fading gaussian
+  with Window `[0, 3)` in a Chunk `[1, 2)` and query before, inside, exactly at `t1` and after the
+  Chunk. The indexed form is eligible for both read paths; its paired no-index form proves the
+  streamed path reads the Chunk gate from the record itself.
+
+- The optional `gaussianBirthChunkWindowIntersection` runner capability and its explicit
+  `--gaussian-birth-state-times` invocation. It activates the whole witness family, keeps the
+  no-index exemption for indexed readers, and directly compares streamed/indexed instant verdicts
+  when both paths are available. No built-in SDK claims it in the shared layer.
+
 ### Changed
 
 - Release manifests now use the same streamed-only registry as the live harness, and correctly
   identify invalid witnesses cut from keyframe-delta bases.
+
+- Release manifest entries now identify an optional `requiredCapability` and the `runnerArguments`
+  inserted before a capability-gated file path.
 
 ## [0.1.0] - 2026-09-05
 
