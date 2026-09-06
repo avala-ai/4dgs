@@ -2163,7 +2163,13 @@ Future<void> _checkKeyframeDelta(
 
       if (frame.opcode == opChunk) {
         final FourdgsChunkBody body = parseChunk(content);
-        state = keyframeDeltaStateFromChunk(content, chunkOffset: frame.offset);
+        state = keyframeDeltaStateFromChunk(
+          content,
+          chunkOffset: frame.offset,
+          quantization: scene.quantization,
+          windows: windows,
+          cutoff: scene.header.cutoff,
+        );
         if (requireObjectId &&
             state.count > 0 &&
             !state.hasAttribute(attrObjectId)) {
@@ -2266,6 +2272,9 @@ Future<void> _checkKeyframeDelta(
           reference,
           body,
           chunkOffset: frame.offset,
+          quantization: scene.quantization,
+          windows: windows,
+          cutoff: scene.header.cutoff,
         );
         if (index.isEmpty) {
           distinctIds = await _recordIdentityIntroductions(

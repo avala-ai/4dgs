@@ -23,6 +23,9 @@ const String refusalUnknownStreamCodec = 'unknown-stream-codec';
 /// A gaussian's window index names a row the Window Table does not have.
 const String refusalWindowIndexOutOfRange = 'window-index-out-of-range';
 
+/// A reconstructed floating attribute cannot be represented as finite f32.
+const String refusalDecodedF32Overflow = 'decoded-f32-overflow';
+
 /// A Chunk Index count disagrees with decoded content it describes.
 const String refusalIndexRecordMismatch = 'index-record-mismatch';
 
@@ -31,7 +34,7 @@ const String refusalIndexRecordMismatch = 'index-record-mismatch';
 /// Named constants rather than string literals at the raise sites, because these
 /// are compared across six implementations: a typo in one is a conformance
 /// failure that reads like a decoder bug. This set exists so a test can assert
-/// that a code it saw is one of the eight rather than something invented locally.
+/// that a code it saw is one of the nine rather than something invented locally.
 const Set<String> fourdgsRefusalCodes = <String>{
   refusalMagicMismatch,
   refusalUnsupportedMajorVersion,
@@ -40,6 +43,7 @@ const Set<String> fourdgsRefusalCodes = <String>{
   refusalNonPositiveStepTime,
   refusalUnknownStreamCodec,
   refusalWindowIndexOutOfRange,
+  refusalDecodedF32Overflow,
   refusalIndexRecordMismatch,
 };
 
