@@ -36,6 +36,7 @@ is, checked by each runner against the valid corpus.
 from __future__ import annotations
 
 import struct
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -182,6 +183,63 @@ def _unknown_stream_codec(data: bytes) -> bytes:
     return _patch(data, cursor + 3, b"\x09")  # attribute_id, symbol_width, mode, [codec]
 
 
+def _delta_index_count_offsets(data: bytes) -> tuple[int, int, int]:
+    """Return `(chunk_offset, gaussian_count byte, live_count byte)` for the first delta entry."""
+    for opcode, content, length in _records(data):
+        if opcode != 0x08:  # Chunk Index
+            continue
+        assert length >= 40, "the Chunk Index entry is shorter than its fixed prefix"
+        (chunk_offset,) = struct.unpack_from("<Q", data, content + 16)
+        (band_count,) = struct.unpack_from("<I", data, content + 36)
+        appended = content + 40 + band_count * 17  # u8 band, u64 offset, u64 length
+        end = content + length
+        if appended == end:  # gaussian-birth: no keyframe-delta block and no live_count
+            continue
+        assert end - appended >= 28, "the keyframe-delta index block is truncated"
+        if data[appended] == 1:  # chunk_kind: Delta Chunk
+            return chunk_offset, content + 32, appended + 20
+    raise AssertionError("the base file carries no delta Chunk Index entry")
+
+
+def _summary_crc_fields(data: bytes) -> tuple[int, int, int, int]:
+    """Return `(crc byte, summary start, footer start, declared crc)` from the Footer."""
+    footer_content, length = _find(data, 0x02)
+    assert length >= 20, "the Footer is shorter than its version-1 fields"
+    summary_start, _summary_offset_start, declared = struct.unpack_from("<QQI", data, footer_content)
+    footer_start = footer_content - _RECORD_HEADER.size
+    assert 0 < summary_start <= footer_start, "the base file carries no contiguous summary"
+    return footer_content + 16, summary_start, footer_start, declared
+
+
+def _wrong_index_count(data: bytes, field: str) -> bytes:
+    """Increment one delta index count and repair the checksum that covers the summary."""
+    _chunk, gaussian_count, live_count = _delta_index_count_offsets(data)
+    crc_offset, summary_start, footer_start, declared_crc = _summary_crc_fields(data)
+    actual_crc = zlib.crc32(data[summary_start:footer_start]) & 0xFFFFFFFF
+    assert declared_crc != 0 and declared_crc == actual_crc, "the witness base must have a valid summary CRC"
+
+    if field == "gaussian_count":
+        offset, encoding, limit = gaussian_count, "<I", 0xFFFFFFFF
+    elif field == "live_count":
+        offset, encoding, limit = live_count, "<Q", 0xFFFFFFFFFFFFFFFF
+    else:  # pragma: no cover - private callers pass one of the two wire fields above
+        raise AssertionError(f"unknown Chunk Index count {field!r}")
+    (value,) = struct.unpack_from(encoding, data, offset)
+    assert value < limit, f"the base {field} leaves no value to mutate to"
+
+    mutated = _patch(data, offset, struct.pack(encoding, value + 1))
+    repaired_crc = zlib.crc32(mutated[summary_start:footer_start]) & 0xFFFFFFFF
+    return _patch(mutated, crc_offset, struct.pack("<I", repaired_crc))
+
+
+def _wrong_index_gaussian_count(data: bytes) -> bytes:
+    return _wrong_index_count(data, "gaussian_count")
+
+
+def _wrong_index_live_count(data: bytes) -> bytes:
+    return _wrong_index_count(data, "live_count")
+
+
 #: The two witnesses for spec issue #306. Both are length-preserving patches of the
 #: Quantization record's birth-time grid, so no later offset or checksum-covered range moves.
 STEP_TIME_REFUSALS: tuple[Refusal, ...] = (
@@ -203,6 +261,18 @@ REFUSALS: tuple[Refusal, ...] = (
     Refusal("WindowIndexOutOfRange", "window-index-out-of-range", "spec 5.4", _window_index_out_of_range),
     Refusal("UnknownStreamCodec", "unknown-stream-codec", "spec 5.5, registry stream codecs", _unknown_stream_codec),
     *STEP_TIME_REFUSALS,
+)
+
+#: The two witnesses for spec issue #195. They are cut from the churn sequence because
+#: its first delta has two operations over a four-gaussian live population, making the
+#: fields' distinct meanings observable. Each patch changes one count and recomputes the
+#: summary CRC, so checksum failure cannot mask the index-record disagreement. They join
+#: `build_invalid()` only after every SDK layer can name them: the invalid corpus contract
+#: remains all-or-none, while these need a keyframe-delta base rather than `BASE_SCENARIO`.
+INDEX_COUNT_BASE = "KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics"
+INDEX_COUNT_REFUSALS: tuple[Refusal, ...] = (
+    Refusal("WrongIndexGaussianCount", "index-record-mismatch", "spec 5.8", _wrong_index_gaussian_count),
+    Refusal("WrongIndexLiveCount", "index-record-mismatch", "spec 5.8", _wrong_index_live_count),
 )
 
 #: Invalid variants the encoder writes directly rather than a mutation producing.
@@ -227,5 +297,6 @@ ENCODED: tuple[tuple[str, str, str, dict], ...] = (
 )
 
 #: Every identifier the suite knows. A runner may produce no other, and a new refusal is
-#: added here rather than invented in one language.
-CODES = frozenset(r.code for r in REFUSALS) | {code for _, code, _, _ in ENCODED}
+#: added here rather than invented in one language. The staged index-count identifier is
+#: already vocabulary even though its two corpus files activate only after the SDK stack.
+CODES = frozenset(r.code for r in (*REFUSALS, *INDEX_COUNT_REFUSALS)) | {code for _, code, _, _ in ENCODED}
