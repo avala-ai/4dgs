@@ -31,6 +31,8 @@ static void check_null_safety(void) {
     check(fourdgs_scene_audio_source_count(NULL) == 0, "audio count of a null scene is 0");
     check(fourdgs_scene_loaded_count(NULL) == 0, "loaded count of a null scene is 0");
     check(fourdgs_scene_positions(NULL) == NULL, "positions of a null scene is null");
+    check(fourdgs_scene_source_groups(NULL) == NULL, "source groups of a null scene is null");
+    check(fourdgs_scene_source_indices(NULL) == NULL, "source indices of a null scene is null");
     check(fourdgs_scene_sh(NULL) == NULL, "sh of a null scene is null");
     check(fourdgs_state_count(NULL) == 0, "count of a null state is 0");
     check(fourdgs_state_centers(NULL) == NULL, "centers of a null state is null");
@@ -374,6 +376,14 @@ static void check_writer(void) {
               "a gaussian-birth buffer peeks as gaussian-birth");
         fourdgs_string_free(model, model_len);
 
+        const char *attribute = (const char *)1;
+        size_t attribute_len = 1;
+        check(fourdgs_peek_header_attribute(data, length, "missing", strlen("missing"),
+                                            &attribute, &attribute_len) == FOURDGS_STATUS_OK,
+              "a Header attribute is peekable from bytes");
+        check(attribute == NULL && attribute_len == 0,
+              "a missing Header attribute is null with zero length");
+
         const char *states = NULL;
         size_t states_len = 0;
         check(fourdgs_keyframe_delta_states_json(data, length, 0, &states, &states_len) ==
@@ -383,6 +393,14 @@ static void check_writer(void) {
                   data, length, 0, 536870912, &states, &states_len) ==
                   FOURDGS_STATUS_UNSUPPORTED_CODEC,
               "the options-bearing keyframe-delta decoder reaches the core");
+        check(fourdgs_keyframe_delta_identity_states_json(
+                  data, length, 0, &states, &states_len) ==
+                  FOURDGS_STATUS_UNSUPPORTED_CODEC,
+              "the identity-state decoder refuses a gaussian-birth file");
+        check(fourdgs_keyframe_delta_identity_states_json_with_options(
+                  data, length, 0, 536870912, &states, &states_len) ==
+                  FOURDGS_STATUS_UNSUPPORTED_CODEC,
+              "the options-bearing identity-state decoder reaches the core");
         const char *wrong_model_code = NULL;
         size_t wrong_model_code_len = 0;
         check(fourdgs_last_refusal_code(&wrong_model_code, &wrong_model_code_len) ==
@@ -397,9 +415,15 @@ static void check_writer(void) {
         check(fourdgs_peek_temporal_model(data, length, NULL, NULL) ==
                   FOURDGS_STATUS_INVALID_ARGUMENT,
               "a null peek out parameter is invalid");
+        check(fourdgs_peek_header_attribute(data, length, "k", 1, NULL, NULL) ==
+                  FOURDGS_STATUS_INVALID_ARGUMENT,
+              "a null attribute out parameter is invalid");
         check(fourdgs_keyframe_delta_states_json(data, length, 0, NULL, NULL) ==
                   FOURDGS_STATUS_INVALID_ARGUMENT,
               "a null states out parameter is invalid");
+        check(fourdgs_keyframe_delta_identity_states_json(data, length, 0, NULL, NULL) ==
+                  FOURDGS_STATUS_INVALID_ARGUMENT,
+              "a null identity-states out parameter is invalid");
         fourdgs_string_free(NULL, 0);
 
         fourdgs_buffer_free(buffer);

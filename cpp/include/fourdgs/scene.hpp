@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -240,11 +241,21 @@ class Scene {
 /// dispatches on before choosing a read path.
 Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes);
 
+/// One Header attribute read from bytes without decoding state. `nullopt` means absent; an
+/// empty string is a present empty value.
+Result<std::optional<std::string>> peekHeaderAttribute(Span<const std::uint8_t> bytes,
+                                                       const std::string& key);
+
 /// Decode a keyframe-delta file to its canonical states JSON. `indexed` chooses the read
 /// path: `false` composes front to back, `true` walks each instant's chain through the index.
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed);
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed,
                                             const ReadOptions& options);
+
+/// Exact optional identities after every keyframe or delta record, ordered by gaussian id.
+Result<std::string> keyframeDeltaIdentityStatesJson(Span<const std::uint8_t> bytes, bool indexed);
+Result<std::string> keyframeDeltaIdentityStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                                    const ReadOptions& options);
 
 }  // namespace fourdgs
 

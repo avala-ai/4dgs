@@ -296,6 +296,100 @@ void aNonPositiveBirthTimeGridCrossesBothOpenModes(const std::string& directory)
   }
 }
 
+/// Optional identity columns cross the public binding with their exact signedness and
+/// zero-default semantics. The shared harness proves the complete canonical document; this
+/// pins the C++ seam itself, where a missing pointer, a wrong element width, or forwarding the
+/// ordinary keyframe summary would otherwise all look like a decoder failure.
+void optionalIdentityCrossesTheBinding(const std::string& directory) {
+  bool found = false;
+  const std::string gaussianPath =
+      directory +
+      "/identity/gaussian-birth/OptionalIdentityGaussianBirth-UseChunkIndex-UseCrc.4dgs";
+  const std::vector<std::uint8_t> gaussianBytes = readWhole(gaussianPath, &found);
+  CHECK(found);
+  if (!found) return;
+  const fourdgs::Span<const std::uint8_t> gaussianInput(gaussianBytes.data(), gaussianBytes.size());
+
+  Result<std::optional<std::string>> marker =
+      fourdgs::peekHeaderAttribute(gaussianInput, "conformance");
+  CHECK(marker.ok());
+  if (marker.ok()) {
+    CHECK(marker->has_value());
+    if (marker->has_value()) {
+      CHECK_EQ(**marker, std::string("optional-identity-zero-defaults-v1"));
+    }
+  }
+  Result<std::optional<std::string>> missing =
+      fourdgs::peekHeaderAttribute(gaussianInput, "not-present");
+  CHECK(missing.ok());
+  if (missing.ok()) CHECK(!missing->has_value());
+
+  const std::int64_t expectedGroups[] = {-2147483648ll, 2147483647ll, 0, 0, 0};
+  const std::int64_t expectedIndices[] = {2147483647ll, -2147483648ll, 0, 0, 0};
+  const std::uint32_t expectedObjects[] = {2147483648u, 4294967295u, 0, 0, 0};
+  for (const fourdgs::ReadMode mode :
+       {fourdgs::ReadMode::kSequential, fourdgs::ReadMode::kIndexed}) {
+    Result<std::unique_ptr<Scene>> opened = Scene::openMemory(gaussianInput, mode);
+    CHECK(opened.ok());
+    if (!opened.ok()) continue;
+    Result<void> loaded = (*opened)->loadAll(3);
+    CHECK(loaded.ok());
+    if (!loaded.ok()) continue;
+    const GaussianView view = (*opened)->gaussians();
+    CHECK_EQ(view.count, static_cast<std::size_t>(5));
+    CHECK_EQ(view.sourceGroups.size(), view.count);
+    CHECK_EQ(view.sourceIndices.size(), view.count);
+    CHECK_EQ(view.objectIds.size(), view.count);
+    if (view.positions.size() != view.count * 3 || view.sourceGroups.size() != view.count ||
+        view.sourceIndices.size() != view.count || view.objectIds.size() != view.count) {
+      continue;
+    }
+    std::vector<std::size_t> order(view.count);
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+      return view.positions[a * 3] < view.positions[b * 3];
+    });
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      const std::size_t row = order[i];
+      CHECK_EQ(view.positions[row * 3], static_cast<float>(i));
+      CHECK_EQ(view.sourceGroups[row], expectedGroups[i]);
+      CHECK_EQ(view.sourceIndices[row], expectedIndices[i]);
+      CHECK_EQ(view.objectIds[row], expectedObjects[i]);
+    }
+  }
+
+  const std::string keyframePath =
+      directory +
+      "/identity/keyframe-delta/"
+      "OptionalIdentityKeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs";
+  const std::vector<std::uint8_t> keyframeBytes = readWhole(keyframePath, &found);
+  CHECK(found);
+  if (!found) return;
+  const fourdgs::Span<const std::uint8_t> keyframeInput(keyframeBytes.data(), keyframeBytes.size());
+  Result<std::string> streamed =
+      fourdgs::keyframeDeltaIdentityStatesJson(keyframeInput, /*indexed=*/false);
+  Result<std::string> indexed =
+      fourdgs::keyframeDeltaIdentityStatesJson(keyframeInput, /*indexed=*/true);
+  CHECK(streamed.ok());
+  CHECK(indexed.ok());
+  if (streamed.ok() && indexed.ok()) {
+    CHECK_EQ(*streamed, *indexed);
+    CHECK(streamed->find("\"identityStates\"") != std::string::npos);
+    CHECK(streamed->find("\"sourceGroup\":\"-17\"") != std::string::npos);
+    CHECK(streamed->find("\"sourceIndex\":\"-2147483648\"") != std::string::npos);
+    CHECK(streamed->find("\"objectId\":\"4294967295\"") != std::string::npos);
+  }
+
+  fourdgs::ReadOptions tiny;
+  tiny.maxDecodedStateBytes = 1;
+  for (const bool indexedMode : {false, true}) {
+    Result<std::string> bounded =
+        fourdgs::keyframeDeltaIdentityStatesJson(keyframeInput, indexedMode, tiny);
+    CHECK(!bounded.ok());
+    if (!bounded.ok()) CHECK_EQ(bounded.error().code, fourdgs::ErrorCode::kResourceLimit);
+  }
+}
+
 /// The codes this package documents. Anything else — or an empty message — means a caller
 /// cannot tell what to do about the failure, which is the whole point of the enum.
 bool isDocumented(const fourdgs::Error& error) {
@@ -604,6 +698,7 @@ void runTests() {
   refusalsAreNamed(directory);
   allLateFrontMatterWitnessesCarryBothSites(directory);
   aNonPositiveBirthTimeGridCrossesBothOpenModes(directory);
+  optionalIdentityCrossesTheBinding(directory);
 
   for (const char* variant : kVariants) {
     const std::string path = directory + "/" + variant + ".4dgs";

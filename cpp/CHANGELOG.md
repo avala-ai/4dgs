@@ -8,6 +8,13 @@ All notable changes to the C++ package are documented here, following
 
 ### Changed
 
+- **Optional identity columns now default to logical zero without losing present values.** Gaussian
+  views expose signed `sourceGroups` and `sourceIndices` beside `objectIds`; a mixed population
+  materializes all three to the full gaussian count, while a wholly absent column remains an empty
+  zero-default view. Both conformance read paths emit exact identity rows for the shared
+  gaussian-birth witness. The keyframe-delta surface delegates its exact identity timeline to the
+  Rust core, including omitted-update carry, zero-filled births and keyframes, absolute
+  replacements, signed extremes, and the caller's decoded-state ceiling.
 - **Streamed readers and the validator diagnose every late defined front-matter record.** The public
   `Error` carries typed `lateRecord` and `firstStateRecord` sites without changing existing result
   codes, exceptions or catch behavior. The streamed gaussian-birth and keyframe-delta runners now

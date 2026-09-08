@@ -185,6 +185,35 @@ final class ConformanceRunnerTests: XCTestCase {
         XCTAssertEqual(actualJSON, expectedJSON as NSDictionary)
     }
 
+    func testOptionalIdentityWitnessesCrossBothRunnersExactly() throws {
+        let directory = corpusDirectory()
+        let witnesses = [
+            "identity/gaussian-birth/OptionalIdentityGaussianBirth-UseChunkIndex-UseCrc",
+            "identity/keyframe-delta/OptionalIdentityKeyframeDelta-UseChunkIndex-UseCrc-UseStatistics",
+        ]
+        for witness in witnesses {
+            let input = directory.appendingPathComponent("\(witness).4dgs")
+            let expectation = directory.appendingPathComponent("\(witness).json")
+            guard FileManager.default.fileExists(atPath: input.path) else {
+                if ProcessInfo.processInfo.environment["CI"] != nil {
+                    XCTFail("the corpus is missing; run tests/conformance/generate.py")
+                    return
+                }
+                throw XCTSkip("no corpus; run tests/conformance/generate.py first")
+            }
+            let expected =
+                try JSONSerialization.jsonObject(with: Data(contentsOf: expectation)) as? NSDictionary
+            for runner in runners {
+                let done = try decode(runner, Data(contentsOf: input))
+                XCTAssertEqual(done.code, 0, "\(runner) \(witness): \(done.err)")
+                XCTAssertEqual(done.err, "", "\(runner) \(witness)")
+                let actual =
+                    try JSONSerialization.jsonObject(with: Data(done.out.utf8)) as? NSDictionary
+                XCTAssertEqual(actual, expected, "\(runner) \(witness)")
+            }
+        }
+    }
+
     /// The rule both runners share, asked of the classifier directly: `nil` is "not one of
     /// the refusals the corpus compares", which the callers turn into a failed invocation
     /// rather than into a refusal nobody can check.

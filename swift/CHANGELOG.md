@@ -8,6 +8,14 @@ All notable changes to the Swift package are documented here, following
 
 ### Changed
 
+- **Optional identity columns now default to logical zero without losing present values.**
+  `GaussianState` exposes signed `sourceGroups` and `sourceIndices` beside `objectIds`; filtering
+  keeps them aligned, and chunk-wise indexed reads zero-pad an omitted column whenever another Chunk
+  materializes it. Both conformance paths emit the shared gaussian-birth identity rows, while
+  keyframe-delta identity timelines remain core-owned and preserve omitted-update carry, zero-filled
+  births and keyframes, and absolute replacements. The published 0.7.1 Apple core predates these
+  additive C ABI entries: it remains link-compatible through optional symbol lookup, while identity
+  access requires the current source-built core until the next Apple core artifact is published.
 - Explicit streamed reads and `4dgs validate` now refuse every defined front-matter opcode found
   after the first Chunk or Delta Chunk as `late-front-matter-record`, carrying both physical
   opcode/byte sites as typed data. The bounded Swift framing pass also gives Apple consumers the

@@ -172,6 +172,17 @@ const GOP_INVARIANT: ReadonlySet<number> = new Set([
 ]);
 
 /**
+ * Optional exact-label lanes. Omission from a complete state or birth means logical zero;
+ * omission from an update carries the reference value. A present update replaces the label
+ * absolutely because labels are not coordinates on a quantization grid (spec §11.3).
+ */
+const ZERO_DEFAULT_IDENTITY: ReadonlySet<number> = new Set([
+  Attribute.SourceGroup,
+  Attribute.SourceIndex,
+  Attribute.ObjectId,
+]);
+
+/**
  * Attributes an update restates outright rather than differencing. The smallest-three
  * rotation coding omits the largest-magnitude component, so the three stored bins mean
  * different components either side of a change; a rotating object crosses that boundary
@@ -180,6 +191,7 @@ const GOP_INVARIANT: ReadonlySet<number> = new Set([
 const ABSOLUTE_IN_UPDATE: ReadonlySet<number> = new Set([
   Attribute.RotationIndex,
   Attribute.Rotation,
+  ...ZERO_DEFAULT_IDENTITY,
 ]);
 
 /**
@@ -256,6 +268,30 @@ export class KeyframeDeltaState {
   get count(): number {
     return this.ids.length;
   }
+
+  /**
+   * The three logical optional identity values for one population row.
+   *
+   * A physically absent column reads as zero. Returning scalars keeps the composed bin
+   * storage private and immutable while still exposing exact labels for every row,
+   * including rows outside an instant's temporal support.
+   */
+  identityAt(row: number): OptionalIdentity {
+    if (!Number.isInteger(row) || row < 0 || row >= this.count) {
+      throw new RangeError(`identity row ${row} is outside the ${this.count}-row population`);
+    }
+    const sourceGroup = this.#bins.get(Attribute.SourceGroup)?.values[row] ?? 0;
+    const sourceIndex = this.#bins.get(Attribute.SourceIndex)?.values[row] ?? 0;
+    const objectCode = this.#bins.get(Attribute.ObjectId)?.values[row] ?? 0;
+    return { sourceGroup, sourceIndex, objectId: objectCode >>> 0 };
+  }
+}
+
+/** Exact optional identity labels for one logical gaussian row. */
+export interface OptionalIdentity {
+  readonly sourceGroup: number;
+  readonly sourceIndex: number;
+  readonly objectId: number;
 }
 
 /** Typed-array capacity owned directly by one composed state's identity and bin lanes. */
@@ -684,11 +720,20 @@ function applyDelta(
         );
       }
       checkChannels(attribute, delta, "an update group");
-      const target = bins.get(attribute);
-      if (target === undefined) {
+      let target = bins.get(attribute);
+      if (target === undefined && !ZERO_DEFAULT_IDENTITY.has(attribute)) {
         throw new MalformedFile(
           `an update touches attribute ${attribute}, which the referenced state does not carry`,
         );
+      }
+      if (target === undefined) {
+        // A physically absent identity lane is a logical population-length zero column.
+        // Materialize it only when an update supplies a value for one or more rows.
+        target = {
+          channels: delta.channels,
+          values: new Int32Array(ids.length * delta.channels),
+        };
+        bins.set(attribute, target);
       }
       const ch = target.channels;
       const absolute = ABSOLUTE_IN_UPDATE.has(attribute);
@@ -727,7 +772,8 @@ function applyDelta(
     }
     const absent: number[] = [];
     for (const attribute of bins.keys()) {
-      if (attribute !== Attribute.ObjectId && !birthBins.has(attribute)) absent.push(attribute);
+      if (!ZERO_DEFAULT_IDENTITY.has(attribute) && !birthBins.has(attribute))
+        absent.push(attribute);
     }
     if (absent.length > 0) {
       absent.sort((a, b) => a - b);
@@ -754,19 +800,12 @@ function applyDelta(
     for (const attribute of attributes) {
       const existing = bins.get(attribute);
       const added = birthBins.get(attribute);
-      // A birth may introduce a column the referenced state does not carry: `object_id`
-      // is optional per gaussian and per chunk, so a background keyframe legitimately
-      // omits it and a later birth legitimately supplies membership. The rows already in
-      // the state still need a value, and §6.6 says which one — a state that omits the
-      // stream is read as though every gaussian in it carried `0`. Without the prefix the
-      // merged column is `birth_count` rows long against `count` ids, so the birth's
-      // membership lands on the first pre-existing gaussian and the birth itself reads
-      // past the end: two gaussians in the wrong object, silently.
+      // A birth may introduce an optional identity column the referenced state did not
+      // carry. Existing rows receive the lane's logical-zero prefix; conversely, a birth
+      // omitting a lane beside an existing column receives a logical-zero suffix. The same
+      // population-alignment rule applies to source_group, source_index and object_id.
       const channels = existing?.channels ?? added!.channels;
       const before = existing?.values ?? new Int32Array(ids.length * channels);
-      // The inverse case is just as important: when an existing object_id
-      // column meets a birth that omits membership, §6.6 supplies background
-      // id 0 for the appended rows rather than making the birth malformed.
       const after = added?.values ?? new Int32Array(birthIds.length * channels);
       const merged = new Int32Array(before.length + after.length);
       merged.set(before, 0);
@@ -2814,9 +2853,13 @@ export interface KeyframeDeltaGaussians {
   readonly opacity: Float64Array;
   /** Stored spherical-harmonic coefficients in component-major order, or `null` at degree 0. */
   readonly sh: ShCoefficients | null;
+  /** Exact producer-group labels, or `null` when the physical state omitted the lane. */
+  readonly sourceGroup: Int32Array | null;
+  /** Exact producer-local indices, or `null` when the physical state omitted the lane. */
+  readonly sourceIndex: Int32Array | null;
   /**
-   * `count` object ids (spec §6.6), or `null` when the composed state carries no
-   * membership stream. `0` is background.
+   * `count` object ids (spec §6.6), or `null` when the physical state omitted the lane.
+   * For all three optional identities, `null` is logically an all-zero column.
    */
   readonly objectId: Uint32Array | null;
 }
@@ -2883,12 +2926,20 @@ export function reconstructKeyframeDelta(
   const n = state.count;
   checkCompleteSh(state, sequence.header.shDegree, `state chunk at byte ${chunk.offset}`);
   const bins = binsOf(state);
+  const sourceGroupColumn = bins.get(Attribute.SourceGroup);
+  const sourceIndexColumn = bins.get(Attribute.SourceIndex);
   const objectIdColumn = bins.get(Attribute.ObjectId);
-  if (objectIdColumn !== undefined && objectIdColumn.channels !== 1) {
-    throw new MalformedFile(
-      `the object_id column of the keyframe-delta chunk at byte ${chunk.offset} declares ` +
-        `${objectIdColumn.channels} channels, the format defines 1`,
-    );
+  for (const [name, column] of [
+    ["source_group", sourceGroupColumn],
+    ["source_index", sourceIndexColumn],
+    ["object_id", objectIdColumn],
+  ] as const) {
+    if (column !== undefined && column.channels !== 1) {
+      throw new MalformedFile(
+        `the ${name} column of the keyframe-delta chunk at byte ${chunk.offset} declares ` +
+          `${column.channels} channels, the format defines 1`,
+      );
+    }
   }
   if (n === 0) {
     const emptySh =
@@ -2905,6 +2956,8 @@ export function reconstructKeyframeDelta(
       rgb: new Float64Array(0),
       opacity: new Float64Array(0),
       sh: emptySh,
+      sourceGroup: sourceGroupColumn === undefined ? null : new Int32Array(0),
+      sourceIndex: sourceIndexColumn === undefined ? null : new Int32Array(0),
       objectId: objectIdColumn === undefined ? null : new Uint32Array(0),
     };
   }
@@ -2931,6 +2984,8 @@ export function reconstructKeyframeDelta(
   const sigmaBinsCol = bins.get(Attribute.SigmaT)!.values;
   const flags = bins.get(Attribute.Flags)!.values;
   const windowBins = bins.get(Attribute.WindowIndex)!.values;
+  const sourceGroupBins = sourceGroupColumn?.values;
+  const sourceIndexBins = sourceIndexColumn?.values;
   const objectIdBins = objectIdColumn?.values;
 
   const steps = stepsFrom(sequence.quantization);
@@ -2984,6 +3039,8 @@ export function reconstructKeyframeDelta(
   const rotations = new Float64Array(visible * 4);
   const rgb = new Float64Array(visible * 3);
   const opacity = new Float64Array(visible);
+  const sourceGroup = sourceGroupColumn === undefined ? null : new Int32Array(visible);
+  const sourceIndex = sourceIndexColumn === undefined ? null : new Int32Array(visible);
   const objectId = objectIdColumn === undefined ? null : new Uint32Array(visible);
 
   let out = 0;
@@ -3037,6 +3094,8 @@ export function reconstructKeyframeDelta(
     const alpha = clamp(reconstructLinear(opacityBins[i]!, steps.alpha), 0, 1);
     const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
     opacity[out] = alpha * marginal;
+    if (sourceGroup !== null) sourceGroup[out] = sourceGroupBins![i]!;
+    if (sourceIndex !== null) sourceIndex[out] = sourceIndexBins![i]!;
     if (objectId !== null) objectId[out] = objectIdBins![i]!;
     out++;
   }
@@ -3051,6 +3110,8 @@ export function reconstructKeyframeDelta(
     rgb,
     opacity,
     sh: composedSh,
+    sourceGroup,
+    sourceIndex,
     objectId,
   };
 }

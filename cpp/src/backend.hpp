@@ -141,8 +141,12 @@ Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
 /// opening; `keyframeDeltaStatesJson` decodes and returns the canonical states summary the
 /// core computes.
 Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes);
+Result<std::optional<std::string>> peekHeaderAttribute(Span<const std::uint8_t> bytes,
+                                                       const std::string& key);
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed,
                                             std::uint64_t maxDecodedStateBytes);
+Result<std::string> keyframeDeltaIdentityStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                                    std::uint64_t maxDecodedStateBytes);
 
 /// Canonical provenance JSON for an opened scene (spec §5.15). Empty when the file carries
 /// none — the binding should omit the key rather than emit null.

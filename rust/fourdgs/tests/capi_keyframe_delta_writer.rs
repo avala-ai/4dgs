@@ -98,6 +98,42 @@ unsafe fn encode(writer: *mut fourdgs_kd_writer) -> Result<Vec<u8>, c_int> {
     Ok(bytes)
 }
 
+fn identity_states_json(bytes: &[u8], indexed: c_int, options: bool) -> String {
+    let mut output: *const c_char = std::ptr::null();
+    let mut length = 0usize;
+    // SAFETY: the input and output pointers remain live for the call; the returned allocation
+    // is copied before it is released with the matching length.
+    let status = unsafe {
+        if options {
+            fourdgs_keyframe_delta_identity_states_json_with_options(
+                bytes.as_ptr(),
+                bytes.len(),
+                indexed,
+                fourdgs::DEFAULT_MAX_DECODED_STATE_BYTES as u64,
+                &mut output,
+                &mut length,
+            )
+        } else {
+            fourdgs_keyframe_delta_identity_states_json(
+                bytes.as_ptr(),
+                bytes.len(),
+                indexed,
+                &mut output,
+                &mut length,
+            )
+        }
+    };
+    assert_eq!(status, FOURDGS_STATUS_OK, "{}", last_error());
+    // SAFETY: success returns exactly `length` owned bytes.
+    let json = unsafe {
+        String::from_utf8(std::slice::from_raw_parts(output.cast::<u8>(), length).to_vec())
+            .expect("identity JSON is UTF-8")
+    };
+    // SAFETY: this is the allocation and length returned above, released once.
+    unsafe { fourdgs_string_free(output, length) };
+    json
+}
+
 /// A two-sample drift of four gaussians over an eight-second clip.
 fn drift() -> (Columns, Columns) {
     (
@@ -239,6 +275,12 @@ fn a_sequence_assembled_through_the_abi_is_the_file_rust_would_have_written() {
         // Two state chunks tiling [0, 8): the second sample is a delta against the first,
         // because the default cadence is eight.
         assert_eq!(decoded.chunks.len(), 2);
+        let expected = kdf::keyframe_delta_identity_states_json(&decoded);
+        assert_eq!(identity_states_json(&bytes, 0, false), expected);
+        assert_eq!(identity_states_json(&bytes, 1, true), expected);
+        assert!(expected.contains("\"sourceGroup\":\"0\""));
+        assert!(expected.contains("\"sourceIndex\":\"0\""));
+        assert!(expected.contains("\"objectId\":\"0\""));
         // The indexed path is the one that checks the tiling and walks the chain, so a wrong
         // offset or a wrong reference shows up only here.
         kdf::decode_indexed(&bytes).expect("indexed decode");

@@ -19,7 +19,11 @@ use fourdgs::opcode;
 use fourdgs::readable::{FileReadable, Readable};
 use fourdgs::records::{ChunkIndexEntry, Header};
 use fourdgs::serialization::{Records, MAGIC};
-use fourdgs_conformance::{keyframe_delta_states_json, refusal_json, summarize, Extras, Failure};
+use fourdgs_conformance::{
+    is_optional_identity_witness, keyframe_delta_states_json,
+    optional_identity_gaussian_birth_json, optional_identity_keyframe_delta_json, refusal_json,
+    summarize, Extras, Failure,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -122,6 +126,9 @@ fn run(path: &str, options: &fourdgs::ReadOptions) -> Result<String, Failure> {
         // against the same committed expectation the streamed runner is held to.
         let (seq, _) = decode_keyframe_delta_indexed(&data, options)
             .map_err(|e| Failure::from_error(path, &e))?;
+        if is_optional_identity_witness(&seq.header) {
+            return Ok(optional_identity_keyframe_delta_json(&seq));
+        }
         return Ok(keyframe_delta_states_json(&seq));
     }
 
@@ -143,6 +150,9 @@ fn run(path: &str, options: &fourdgs::ReadOptions) -> Result<String, Failure> {
     collecting
         .load_all(3)
         .map_err(|e| Failure::from_error(path, &e))?;
+    if is_optional_identity_witness(&scene.header) {
+        return Ok(optional_identity_gaussian_birth_json(collecting.loaded()));
+    }
     let audio_sources =
         read_audio_sources(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;
     let camera = read_camera(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;

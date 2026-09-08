@@ -34,10 +34,20 @@ pub const BIN_MAX: i64 = (1i64 << 31) - 1;
 /// a difference between bins on two different grids.
 pub const GOP_INVARIANT: [u8; 3] = [op::A_SIGMA_T, op::A_FLAGS, op::A_WINDOW_INDEX];
 
+/// Optional exact identity labels. Introducing records default an omitted lane to logical
+/// zero; update omission carries its reference value forward.
+pub const OPTIONAL_IDENTITY: [u8; 3] = [op::A_SOURCE_GROUP, op::A_SOURCE_INDEX, op::A_OBJECT_ID];
+
 /// Attributes an update restates outright rather than differencing: the smallest-three
-/// rotation coding omits the largest-magnitude component, so the three stored bins mean
-/// different components either side of a change.
-pub const ABSOLUTE_IN_UPDATE: [u8; 2] = [op::A_ROTATION_INDEX, op::A_ROTATION];
+/// rotation coding omits the largest-magnitude component, while identity labels are not
+/// temporal measurements and therefore have no meaningful bin difference.
+pub const ABSOLUTE_IN_UPDATE: [u8; 5] = [
+    op::A_ROTATION_INDEX,
+    op::A_ROTATION,
+    op::A_SOURCE_GROUP,
+    op::A_SOURCE_INDEX,
+    op::A_OBJECT_ID,
+];
 
 fn is_gop_invariant(attribute: u8) -> bool {
     GOP_INVARIANT.contains(&attribute)
@@ -238,6 +248,12 @@ pub(crate) fn apply_delta_with_rows(
                     ),
                 );
             }
+            if !state.bins.contains_key(attribute) && OPTIONAL_IDENTITY.contains(attribute) {
+                state.bins.insert(
+                    *attribute,
+                    BinArray::new(vec![0; state.ids.len()], delta.channels),
+                );
+            }
             let Some(base) = state.bins.get_mut(attribute) else {
                 return refuse(
                     "unknown-attribute-in-update",
@@ -298,7 +314,7 @@ pub(crate) fn apply_delta_with_rows(
             .bins
             .keys()
             .copied()
-            .filter(|a| !birth_bins.contains_key(a))
+            .filter(|a| !OPTIONAL_IDENTITY.contains(a) && !birth_bins.contains_key(a))
             .collect();
         absent.sort_unstable();
         if !absent.is_empty() {
@@ -348,12 +364,20 @@ pub(crate) fn apply_delta_with_rows(
                     let mut values = base.values.clone();
                     if let Some(b) = birth {
                         values.extend_from_slice(&b.values);
+                    } else if OPTIONAL_IDENTITY.contains(&attribute) {
+                        values.resize(values.len() + birth_ids.len() * base.channels, 0);
                     }
                     merged.insert(attribute, BinArray::new(values, base.channels));
                 }
                 None => {
                     let b = birth.expect("attribute came from one of the two maps");
-                    merged.insert(attribute, b.clone());
+                    if OPTIONAL_IDENTITY.contains(&attribute) {
+                        let mut values = vec![0; birth_start * b.channels];
+                        values.extend_from_slice(&b.values);
+                        merged.insert(attribute, BinArray::new(values, b.channels));
+                    } else {
+                        merged.insert(attribute, b.clone());
+                    }
                 }
             }
         }

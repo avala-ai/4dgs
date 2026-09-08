@@ -30,6 +30,11 @@ import { FileHandleReadable } from "@4dgs/nodejs";
 
 import { AudioPayloadDigests, canonical, refusalAnswer, summarize } from "./canonical.js";
 import { checkStreamedRecords, checkTruncationRecovery } from "./checks.js";
+import {
+  gaussianBirthIdentityJson,
+  isOptionalIdentityWitness,
+  keyframeDeltaIdentityJson,
+} from "./optionalIdentity.js";
 
 /** Reads small enough that even the smallest variant arrives in several of them. */
 const BLOCK_SIZE = 8 * 1024;
@@ -65,8 +70,11 @@ export async function run(
       // Truncation recovery is a gaussian-birth check: the states canonical is a different
       // statement and a cut file is a different file.
       const data = await source.read(0n, BigInt(size));
+      const decoded = await decodeKeyframeDeltaStreamed(data, { maxDecodedStateBytes });
       return canonical(
-        keyframeDeltaStatesJson(await decodeKeyframeDeltaStreamed(data, { maxDecodedStateBytes })),
+        isOptionalIdentityWitness(decoded.header)
+          ? keyframeDeltaIdentityJson(decoded)
+          : keyframeDeltaStatesJson(decoded),
       );
     }
 
@@ -81,6 +89,10 @@ export async function run(
     await checkTruncationRecovery(source, size, scene, (readable) =>
       decode(readable, maxDecodedStateBytes),
     );
+
+    if (isOptionalIdentityWitness(scene.header)) {
+      return canonical(gaussianBirthIdentityJson(scene.gaussians));
+    }
 
     return canonical(
       summarize({

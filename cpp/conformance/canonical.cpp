@@ -478,6 +478,47 @@ std::vector<std::size_t> stableOrder(const GaussianView& gaussians) {
   return order;
 }
 
+bool isOptionalIdentityWitness(const std::string& marker) {
+  return marker == "optional-identity-zero-defaults-v1";
+}
+
+std::string optionalIdentityGaussianBirthJson(const GaussianView& gaussians) {
+  std::vector<std::size_t> order(gaussians.count);
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    for (std::size_t component = 0; component < 3; ++component) {
+      const float left = gaussians.positions[a * 3 + component];
+      const float right = gaussians.positions[b * 3 + component];
+      if (left < right) return true;
+      if (right < left) return false;
+    }
+    return false;
+  });
+
+  std::vector<Json> rows;
+  rows.reserve(order.size());
+  for (std::size_t row : order) {
+    const std::int64_t sourceGroup =
+        gaussians.sourceGroups.empty() ? 0 : gaussians.sourceGroups[row];
+    const std::int64_t sourceIndex =
+        gaussians.sourceIndices.empty() ? 0 : gaussians.sourceIndices[row];
+    const std::uint32_t objectId = gaussians.objectIds.empty() ? 0 : gaussians.objectIds[row];
+    rows.push_back(Json::object({
+        {"sourceGroup", integer(sourceGroup)},
+        {"sourceIndex", integer(sourceIndex)},
+        {"objectId", integer(static_cast<std::uint64_t>(objectId))},
+        {"position",
+         Json::array({num(gaussians.positions[row * 3]), num(gaussians.positions[row * 3 + 1]),
+                      num(gaussians.positions[row * 3 + 2])})},
+    }));
+  }
+  return Json::object({
+                          {"temporalModel", Json::string("gaussian-birth")},
+                          {"identityRows", Json::array(std::move(rows))},
+                      })
+      .render();
+}
+
 std::string canonical(const SceneSummary& summary) {
   const Header& header = *summary.header;
   const GaussianView& gaussians = *summary.gaussians;

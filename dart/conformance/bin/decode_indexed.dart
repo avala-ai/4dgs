@@ -20,6 +20,7 @@ import 'package:fourdgs/fourdgs.dart';
 import 'package:fourdgs/io.dart';
 import 'package:fourdgs_conformance/canonical.dart';
 import 'package:fourdgs_conformance/checks.dart';
+import 'package:fourdgs_conformance/optional_identity.dart';
 
 /// Every band this version defines, so the summary sees the coefficients the
 /// file carries rather than the ones a default happened to admit.
@@ -54,13 +55,15 @@ Future<String> run(
     // chain — the seeking client's path — and emit the same states canonical the
     // streamed runner does. Agreeing across the two paths is most of what makes
     // an indexed keyframe-delta reader trustworthy.
-    return canonical(
-      keyframeDeltaStatesJson(
+    final sequence =
         decodeKeyframeDeltaIndexed(
           data,
           maxDecodedStateBytes: maxDecodedStateBytes,
-        ).sequence,
-      ),
+        ).sequence;
+    return canonical(
+      isOptionalIdentityWitness(sequence.header)
+          ? keyframeDeltaIdentityJson(sequence)
+          : keyframeDeltaStatesJson(sequence),
     );
   }
 
@@ -117,6 +120,10 @@ Future<String> run(
       sh: sh,
       decodedStateBudget: decodedStateBudget,
     );
+
+    if (isOptionalIdentityWitness(scene.header)) {
+      return canonical(gaussianBirthIdentityJson(whole));
+    }
 
     // Everything above this line assembles the whole scene, which is exactly why
     // it cannot see a gaussian filed in the wrong chunk: the summary carries it

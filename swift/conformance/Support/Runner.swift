@@ -41,11 +41,18 @@ public enum Runner {
             // printed verbatim — byte-identical to every other SDK's, which is the whole
             // point of computing it once in Rust rather than in each binding.
             let bytes = [UInt8](try Data(contentsOf: URL(fileURLWithPath: path)))
+            let optionalIdentity =
+                try peekHeaderAttribute(bytes, key: "conformance")
+                == "optional-identity-zero-defaults-v1"
             if try peekTemporalModel(bytes) == "keyframe-delta" {
-                print(try keyframeDeltaStatesJson(bytes, indexed: mode == .indexed))
+                if optionalIdentity {
+                    print(try keyframeDeltaIdentityStatesJson(bytes, indexed: mode == .indexed))
+                } else {
+                    print(try keyframeDeltaStatesJson(bytes, indexed: mode == .indexed))
+                }
                 exit(0)
             }
-            let json = try summarize(path: path, mode: mode)
+            let json = try summarize(path: path, mode: mode, optionalIdentity: optionalIdentity)
             print(json.serialized())
             exit(0)
         } catch let error as FourDGSError {
@@ -100,7 +107,7 @@ public enum Runner {
         return .object(["refused": .string(code.rawValue)])
     }
 
-    static func summarize(path: String, mode: Mode) throws -> JSON {
+    static func summarize(path: String, mode: Mode, optionalIdentity: Bool = false) throws -> JSON {
         let reader = try SceneReader(path: path, readPath: mode.readPath)
         var scene = reader.scene
         // Canonical JSON proves payload bytes too, but normal SDK opening deliberately
@@ -125,6 +132,10 @@ public enum Runner {
                 parts.append(try reader.chunk(i))
             }
             gaussians = GaussianState.concatenated(parts)
+        }
+
+        if optionalIdentity {
+            return Summary.optionalIdentityGaussianBirth(gaussians)
         }
 
         // The two rows the canonical JSON cannot carry, each on the runner that owns it: a cut

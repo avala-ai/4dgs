@@ -61,7 +61,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 2 MB
+      - name: Rust sources under 2112 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -123,6 +123,12 @@ jobs:
         # with room to be wrong about the next few files rather than exactly right about
         # today's.
         #
+        # Raised to 2112 KiB for the optional identity zero-default contract: both
+        # temporal models now preserve three population-aligned logical columns across
+        # omitted physical streams, and the streamed/indexed conformance projections plus
+        # transition and C-ABI regressions take the clean Rust tree to 2076 KiB. The next
+        # 64 KiB step leaves 36 KiB while remaining far below a vendored dependency.
+        #
         # 1856 after the canonical-state work and the bounded-validation branch: `keyframe_delta_states_json` and the
         # order-independent summary it now produces, the exact-aggregate arithmetic that
         # replaced summation order as a source of divergence, and two test files
@@ -133,7 +139,7 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 2048 ] || { echo "::error::rust is ${size_kb} KiB, over the 2048 KiB budget"; exit 1; }
+          [ "$size_kb" -le 2112 ] || { echo "::error::rust is ${size_kb} KiB, over the 2112 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 1408 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
@@ -202,7 +208,7 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 1408 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1408 KiB budget"; exit 1; }
-      - name: Dart sources under 1600 KB
+      - name: Dart sources under 1664 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -275,10 +281,14 @@ jobs:
         # decoder checks both temporal models and its tests pin the refusal context and
         # legal sentinel controls. The clean source tree measures 1576 KiB, so the next
         # 64 KiB step leaves 24 KiB of explicit headroom.
+        # Raised to 1664 KiB for optional identity zero-defaults: both temporal models,
+        # both read paths, exact conformance projections and focused regressions make the
+        # clean Dart tree 1616 KiB. The next 64 KiB step leaves 48 KiB without weakening
+        # the vendored-dependency tripwire.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 1600 ] || { echo "::error::dart is ${size_kb} KiB, over the 1600 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1664 ] || { echo "::error::dart is ${size_kb} KiB, over the 1664 KiB budget"; exit 1; }
       - name: C++ sources under 896 KB
         # New, and the reason it is new is worth stating: every other SDK has had a
         # sub-budget here for some time and C++ never did, so the whole-tree gate above was

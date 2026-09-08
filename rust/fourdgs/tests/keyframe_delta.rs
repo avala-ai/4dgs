@@ -244,6 +244,114 @@ fn rotation_is_restated_absolutely_in_an_update() {
     assert_eq!(out.bins[&op::A_ROTATION_INDEX].values, vec![2]);
 }
 
+fn logical_identity(state: &State, attribute: u8) -> Vec<i64> {
+    state
+        .bins
+        .get(&attribute)
+        .map_or_else(|| vec![0; state.count()], |values| values.values.clone())
+}
+
+#[test]
+fn optional_identity_updates_and_births_compose_as_logical_zero_labels() {
+    let empty = BTreeMap::new();
+    // A complete keyframe may omit all three lanes; every logical row starts at zero.
+    let initial = keyframe(&[10, 20], &[0, 0, 0, 1, 0, 0]);
+    for attribute in [op::A_SOURCE_GROUP, op::A_SOURCE_INDEX, op::A_OBJECT_ID] {
+        assert_eq!(logical_identity(&initial, attribute), [0, 0]);
+    }
+
+    // A present update introduces materialized survivor zeros and replaces absolutely.
+    let labelled = apply_delta(
+        &initial,
+        &[10],
+        &bins(&[
+            (op::A_SOURCE_GROUP, &[-17], 1),
+            (op::A_SOURCE_INDEX, &[23], 1),
+            // The signed wire code -1 is the same-bit bridge to u32::MAX.
+            (op::A_OBJECT_ID, &[-1], 1),
+        ]),
+        &[],
+        &empty,
+        &[],
+    )
+    .expect("identity labels may be introduced into an implicit-zero reference");
+    assert_eq!(logical_identity(&labelled, op::A_SOURCE_GROUP), [-17, 0]);
+    assert_eq!(logical_identity(&labelled, op::A_SOURCE_INDEX), [23, 0]);
+    assert_eq!(logical_identity(&labelled, op::A_OBJECT_ID), [-1, 0]);
+
+    // An omitted birth lane appends zero, and an omitted update carries labels forward.
+    let born = apply_delta(
+        &labelled,
+        &[],
+        &empty,
+        &[30],
+        &bins(&[(op::A_POSITION, &[2, 0, 0], 3)]),
+        &[],
+    )
+    .expect("optional identity is not part of incomplete-birth");
+    assert_eq!(logical_identity(&born, op::A_SOURCE_GROUP), [-17, 0, 0]);
+    assert_eq!(logical_identity(&born, op::A_SOURCE_INDEX), [23, 0, 0]);
+    assert_eq!(logical_identity(&born, op::A_OBJECT_ID), [-1, 0, 0]);
+    let carried = apply_delta(
+        &born,
+        &[10],
+        &bins(&[(op::A_POSITION, &[1, 0, 0], 3)]),
+        &[],
+        &empty,
+        &[],
+    )
+    .expect("an omitted update lane carries its reference value");
+    assert_eq!(logical_identity(&carried, op::A_SOURCE_GROUP), [-17, 0, 0]);
+
+    // Explicit zeros reset labels: they are absolute values, not additions.
+    let reset = apply_delta(
+        &carried,
+        &[10],
+        &bins(&[
+            (op::A_SOURCE_GROUP, &[0], 1),
+            (op::A_SOURCE_INDEX, &[0], 1),
+            (op::A_OBJECT_ID, &[0], 1),
+        ]),
+        &[],
+        &empty,
+        &[],
+    )
+    .expect("explicit zero is an absolute identity reset");
+    for attribute in [op::A_SOURCE_GROUP, op::A_SOURCE_INDEX, op::A_OBJECT_ID] {
+        assert_eq!(logical_identity(&reset, attribute), [0, 0, 0]);
+    }
+
+    // The inverse introduction creates a zero survivor prefix before the birth suffix.
+    let fresh = keyframe(&[10, 20], &[0, 0, 0, 1, 0, 0]);
+    let introduced = apply_delta(
+        &fresh,
+        &[],
+        &empty,
+        &[40],
+        &bins(&[
+            (op::A_POSITION, &[3, 0, 0], 3),
+            (op::A_SOURCE_GROUP, &[i32::MAX as i64], 1),
+            (op::A_SOURCE_INDEX, &[i32::MIN as i64], 1),
+            // Signed i32::MIN is the wire bridge to logical object id 2^31.
+            (op::A_OBJECT_ID, &[i32::MIN as i64], 1),
+        ]),
+        &[],
+    )
+    .expect("birth identity creates a zero prefix for survivors");
+    assert_eq!(
+        logical_identity(&introduced, op::A_SOURCE_GROUP),
+        [0, 0, i32::MAX as i64]
+    );
+    assert_eq!(
+        logical_identity(&introduced, op::A_SOURCE_INDEX),
+        [0, 0, i32::MIN as i64]
+    );
+    assert_eq!(
+        logical_identity(&introduced, op::A_OBJECT_ID),
+        [0, 0, i32::MIN as i64]
+    );
+}
+
 #[test]
 fn absolute_state_bins_and_rotation_pairs_are_complete_and_i32_bounded() {
     let empty = BTreeMap::new();

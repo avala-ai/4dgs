@@ -8,6 +8,12 @@ All notable changes to the Rust crate are documented here, following
 
 ### Changed
 
+- **Omitted optional identity lanes reconstruct as logical zero.** Gaussian-birth assembly now
+  zero-fills mixed-Chunk `source_group`, `source_index`, and `object_id` columns. Keyframe-delta
+  keyframes and births use the same introducing-record default, while update omission carries the
+  reference label and a present update replaces it absolutely. Composition materializes survivor
+  zero prefixes and birth zero suffixes as needed, preserving the full same-bit `u32` object-id
+  bridge on streamed and indexed reads.
 - **The C ABI carries aggregate decoded-state budgets into the Rust core.** Append-only
   options-bearing memory, path, range-reader, whole-scene load, and keyframe-delta entry points take
   a positive `uint64_t max_decoded_state_bytes`; existing symbols retain the 512 MiB default.

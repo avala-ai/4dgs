@@ -92,6 +92,12 @@ std::string crc32String(const std::uint8_t* data, std::size_t length);
 /// state rows the reference orders by the rounded row they emit rather than by the gaussian.
 std::vector<std::size_t> stableOrder(const GaussianView& gaussians);
 
+/// Whether a Header marker selects the narrow optional-identity projection.
+bool isOptionalIdentityWitness(const std::string& marker);
+
+/// Exact logical identity rows for the gaussian-birth conformance witness.
+std::string optionalIdentityGaussianBirthJson(const GaussianView& gaussians);
+
 /// What a summary needs beyond the gaussians. A record that changes nothing here is a record
 /// an implementation could ignore entirely and still pass.
 struct SceneSummary {

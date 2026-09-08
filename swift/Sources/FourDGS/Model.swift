@@ -384,6 +384,11 @@ public struct GaussianState: Sendable, Equatable {
     public let winHi: [Float]
     /// 0...3. `0` means ``sh`` is empty.
     public let shDegree: Int
+    /// Optional producer grouping labels. Empty is the storage-optimized form of a logical
+    /// all-zero column; mixed Chunk presence is materialized to ``count`` rows.
+    public let sourceGroups: [Int64]
+    /// Optional producer-stable labels, with the same zero/default convention.
+    public let sourceIndices: [Int64]
     /// Object membership per gaussian (spec §6.6), or empty when the scene carries no
     /// `object_id` stream.
     ///
@@ -403,8 +408,11 @@ public struct GaussianState: Sendable, Equatable {
         count: Int, positions: [Float], scales: [Float], rotations: [Float], colors: [Float],
         motions: [Float],
         muT: [Float], sigmaT: [Float], winLo: [Float], winHi: [Float], shDegree: Int, sh: [UInt8],
+        sourceGroups: [Int64] = [], sourceIndices: [Int64] = [],
         objectIds: [UInt32] = []
     ) {
+        self.sourceGroups = sourceGroups
+        self.sourceIndices = sourceIndices
         self.objectIds = objectIds
         self.count = count
         self.positions = positions
