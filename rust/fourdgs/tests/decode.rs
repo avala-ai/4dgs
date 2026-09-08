@@ -94,6 +94,53 @@ fn one_gaussian_file() -> Vec<u8> {
     .expect("encode one gaussian")
 }
 
+#[test]
+fn gaussian_birth_assembly_zero_fills_each_optional_identity_lane() {
+    fn chunk(
+        x: f32,
+        source_group: Option<i64>,
+        source_index: Option<i64>,
+        object_id: Option<u32>,
+    ) -> fourdgs::chunk::DecodedChunk {
+        fourdgs::chunk::DecodedChunk {
+            count: 1,
+            positions: vec![x, 0.0, 0.0],
+            scales: vec![1.0; 3],
+            rotations: vec![0.0, 0.0, 0.0, 1.0],
+            colors: vec![0.0; 4],
+            motions: vec![0.0; 3],
+            mu_t: vec![0.0],
+            sigma_t: vec![1.0],
+            window_index: vec![0],
+            source_group: source_group.map(|value| vec![value]),
+            source_index: source_index.map(|value| vec![value]),
+            object_id: object_id.map(|value| vec![value]),
+            ..Default::default()
+        }
+    }
+
+    let chunks = [
+        chunk(
+            0.0,
+            Some(i32::MIN as i64),
+            Some(i32::MAX as i64),
+            Some(u32::MAX),
+        ),
+        chunk(1.0, None, None, None),
+    ];
+    let scene = fourdgs::stream_reader::assemble(
+        &chunks,
+        &[BTreeMap::new(), BTreeMap::new()],
+        &[(0.0, 1.0)],
+        &Header::default(),
+    )
+    .expect("mixed physical identity streams are one logical population");
+
+    assert_eq!(scene.source_group, Some(vec![i32::MIN as i64, 0]));
+    assert_eq!(scene.source_index, Some(vec![i32::MAX as i64, 0]));
+    assert_eq!(scene.object_id, Some(vec![u32::MAX, 0]));
+}
+
 fn assert_decoded_state_limit(error: Error, limit: usize, phase: &str) {
     assert!(error.is_resource_limit(), "{error}");
     assert_eq!(error.refusal_code(), None, "{error}");

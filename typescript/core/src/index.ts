@@ -280,6 +280,7 @@ export {
   type KeyframeDeltaChunkInfo,
   type KeyframeDeltaDecodeOptions,
   type KeyframeDeltaGaussians,
+  type OptionalIdentity,
   type KeyframeDeltaIndexedResult,
   type KeyframeDeltaSequence,
   type OpenKeyframeDeltaIndexedOptions,

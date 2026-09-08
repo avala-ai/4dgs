@@ -367,6 +367,11 @@ Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes) {
   return detail::peekTemporalModel(bytes);
 }
 
+Result<std::optional<std::string>> peekHeaderAttribute(Span<const std::uint8_t> bytes,
+                                                       const std::string& key) {
+  return detail::peekHeaderAttribute(bytes, key);
+}
+
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed) {
   return keyframeDeltaStatesJson(bytes, indexed, ReadOptions());
 }
@@ -377,6 +382,20 @@ Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool
   if (!valid) return valid.error();
   Result<std::string> decoded =
       detail::keyframeDeltaStatesJson(bytes, indexed, options.maxDecodedStateBytes);
+  if (!decoded) return withLateFrontMatterRecords(decoded.error(), bytes);
+  return decoded;
+}
+
+Result<std::string> keyframeDeltaIdentityStatesJson(Span<const std::uint8_t> bytes, bool indexed) {
+  return keyframeDeltaIdentityStatesJson(bytes, indexed, ReadOptions());
+}
+
+Result<std::string> keyframeDeltaIdentityStatesJson(Span<const std::uint8_t> bytes, bool indexed,
+                                                    const ReadOptions& options) {
+  Result<void> valid = validateReadOptions(options);
+  if (!valid) return valid.error();
+  Result<std::string> decoded =
+      detail::keyframeDeltaIdentityStatesJson(bytes, indexed, options.maxDecodedStateBytes);
   if (!decoded) return withLateFrontMatterRecords(decoded.error(), bytes);
   return decoded;
 }

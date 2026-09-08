@@ -798,11 +798,11 @@ FourdgsGaussianSet assembleGaussians(
   final sigmaT = Float32List(total);
   final winLo = Float32List(total);
   final winHi = Float32List(total);
-  final haveSourceGroup = chunks.every(
+  final haveSourceGroup = chunks.any(
     (FourdgsDecodedChunk c) => c.sourceGroup != null,
   );
   final sourceGroup = haveSourceGroup ? Int32List(total) : null;
-  final haveSource = chunks.every(
+  final haveSource = chunks.any(
     (FourdgsDecodedChunk c) => c.sourceIndex != null,
   );
   final sourceIndex = haveSource ? Int32List(total) : null;
@@ -825,10 +825,10 @@ FourdgsGaussianSet assembleGaussians(
     sigmaT.setRange(at, at + chunk.count, chunk.sigmaT);
     winLo.setRange(at, at + chunk.count, chunk.winLo);
     winHi.setRange(at, at + chunk.count, chunk.winHi);
-    if (sourceGroup != null) {
+    if (sourceGroup != null && chunk.sourceGroup != null) {
       sourceGroup.setRange(at, at + chunk.count, chunk.sourceGroup!);
     }
-    if (sourceIndex != null) {
+    if (sourceIndex != null && chunk.sourceIndex != null) {
       sourceIndex.setRange(at, at + chunk.count, chunk.sourceIndex!);
     }
     if (objectId != null && chunk.objectId != null) {

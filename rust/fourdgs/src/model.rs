@@ -220,6 +220,11 @@ pub struct GaussianSet {
     /// Coefficients per colour component, so `sh` rows are `3 * this` wide.
     pub sh_coefficients: usize,
     pub sh_degree: u8,
+    /// Producer-side grouping labels. `None` is the storage-optimized representation of
+    /// a logical all-zero column; mixed physical Chunk presence is materialized.
+    pub source_group: Option<Vec<i64>>,
+    /// Producer-side stable labels. `None` is the storage-optimized representation of a
+    /// logical all-zero column; mixed physical Chunk presence is materialized.
     pub source_index: Option<Vec<i64>>,
     /// Per-gaussian object membership (spec section 5.15.6), or `None` when the file
     /// carries no `object_id` stream. Exact integers, `0` = background/unassigned; the

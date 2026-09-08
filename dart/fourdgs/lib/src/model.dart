@@ -407,15 +407,17 @@ class FourdgsGaussianSet {
   /// degree 3. Zero when the scene carries no harmonics.
   final int shCoefficients;
 
-  /// Optional producer-side grouping ids, when the file carried them.
+  /// Optional producer-side grouping ids. Null is the storage-optimized form
+  /// of a logical all-zero column; mixed Chunk presence is materialized.
   final Int32List? sourceGroup;
 
-  /// Optional producer-side stable ids, when the file carried them.
+  /// Optional producer-side stable ids. Null is the storage-optimized form of
+  /// a logical all-zero column; mixed Chunk presence is materialized.
   final Int32List? sourceIndex;
 
-  /// Object membership (spec section 6.6), or null when no chunk carried the
-  /// stream. `0` is background: a gaussian that belongs to no object and no
-  /// track may transform.
+  /// Object membership (spec section 6.6). Null is the storage-optimized form
+  /// of a logical all-zero column. `0` is background: a gaussian that belongs
+  /// to no object and no track may transform.
   ///
   /// Unsigned: the ids span the whole `u32` range and are compared for
   /// equality against a track's `object_id`, which is parsed as `u32`.

@@ -2432,6 +2432,12 @@ pub(crate) fn decoded_chunk_resident_bytes(
         vector_bytes(&chunk.sigma_t)?,
         vector_bytes(&chunk.window_index)?,
         chunk
+            .source_group
+            .as_ref()
+            .map(vector_bytes)
+            .transpose()?
+            .unwrap_or(0),
+        chunk
             .source_index
             .as_ref()
             .map(vector_bytes)
@@ -2475,6 +2481,12 @@ pub(crate) fn gaussian_set_resident_bytes(gaussians: &GaussianSet) -> Result<usi
         vector_bytes(&gaussians.win_hi)?,
         gaussians
             .sh
+            .as_ref()
+            .map(vector_bytes)
+            .transpose()?
+            .unwrap_or(0),
+        gaussians
+            .source_group
             .as_ref()
             .map(vector_bytes)
             .transpose()?
@@ -2634,7 +2646,9 @@ pub(crate) fn assemble_with_budgets(
         .unwrap_or(0)
         .checked_mul(3)
         .ok_or_else(|| Error::UnsupportedOperation("assembled SH row size overflows".into()))?;
-    let output_bytes_per_gaussian = 96usize
+    // The fixed bound includes all three optional identity columns. Physical all-omission
+    // may retain `None`, but mixed Chunk presence materializes a scene-width column.
+    let output_bytes_per_gaussian = 104usize
         .checked_add(sh_output_bytes)
         .ok_or_else(|| Error::UnsupportedOperation("assembled row size overflows".into()))?;
     let output_bytes = total
@@ -2682,7 +2696,10 @@ pub(crate) fn assemble_with_budgets(
     out.win_lo.reserve(total);
     out.win_hi.reserve(total);
 
-    let mut source_index: Option<Vec<i64>> = Some(Vec::with_capacity(total));
+    let mut source_group = Vec::with_capacity(total);
+    let mut saw_source_group = false;
+    let mut source_index = Vec::with_capacity(total);
+    let mut saw_source_index = false;
     let mut object_id: Vec<u32> = Vec::with_capacity(total);
     let mut saw_object_id = false;
     for chunk in chunks {
@@ -2704,9 +2721,19 @@ pub(crate) fn assemble_with_budgets(
             out.win_lo.push(lo as f32);
             out.win_hi.push(hi as f32);
         }
-        match (&mut source_index, &chunk.source_index) {
-            (Some(acc), Some(src)) => acc.extend_from_slice(src),
-            _ => source_index = None,
+        match &chunk.source_group {
+            Some(values) => {
+                source_group.extend_from_slice(values);
+                saw_source_group = true;
+            }
+            None => source_group.resize(source_group.len() + chunk.count, 0),
+        }
+        match &chunk.source_index {
+            Some(values) => {
+                source_index.extend_from_slice(values);
+                saw_source_index = true;
+            }
+            None => source_index.resize(source_index.len() + chunk.count, 0),
         }
         match &chunk.object_id {
             Some(ids) => {
@@ -2716,7 +2743,10 @@ pub(crate) fn assemble_with_budgets(
             None => object_id.resize(object_id.len() + chunk.count, 0),
         }
     }
-    out.source_index = source_index.filter(|s| s.len() == total && total > 0);
+    out.source_group =
+        (saw_source_group && source_group.len() == total && total > 0).then_some(source_group);
+    out.source_index =
+        (saw_source_index && source_index.len() == total && total > 0).then_some(source_index);
     out.object_id = (saw_object_id && object_id.len() == total && total > 0).then_some(object_id);
 
     if header.sh_degree > 0 {

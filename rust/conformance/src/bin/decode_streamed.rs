@@ -13,8 +13,9 @@ use fourdgs::opcode;
 use fourdgs::records::Header;
 use fourdgs::serialization::{check_magic, Records, MAGIC};
 use fourdgs_conformance::{
-    keyframe_delta_states_json, late_front_matter_refusal_json, refusal_json, summarize, Extras,
-    Failure,
+    is_optional_identity_witness, keyframe_delta_states_json, late_front_matter_refusal_json,
+    optional_identity_gaussian_birth_json, optional_identity_keyframe_delta_json, refusal_json,
+    summarize, Extras, Failure,
 };
 
 fn main() -> ExitCode {
@@ -102,12 +103,18 @@ fn run(path: &str, options: &fourdgs::ReadOptions) -> Result<String, Failure> {
         // different statement and a cut file is a different file.
         let seq = decode_keyframe_delta_streamed(&data, options)
             .map_err(|e| Failure::from_error(path, &e))?;
+        if is_optional_identity_witness(&seq.header) {
+            return Ok(optional_identity_keyframe_delta_json(&seq));
+        }
         return Ok(keyframe_delta_states_json(&seq));
     }
 
     let scene = fourdgs::read_bytes_with_options(&data, options)
         .map_err(|e| Failure::from_error(path, &e))?;
     check_truncation_recovery(&data, &scene, options)?;
+    if is_optional_identity_witness(&scene.header) {
+        return Ok(optional_identity_gaussian_birth_json(&scene.gaussians));
+    }
 
     let intervals: Vec<(f64, f64)> = scene.chunk_index.iter().map(|e| (e.t0, e.t1)).collect();
     summarize(

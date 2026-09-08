@@ -1140,8 +1140,11 @@ void main() {
       );
     });
 
-    test('object_id updates remain bin differences', () {
-      expect(keyframeDeltaAbsoluteInUpdate, isNot(contains(attrObjectId)));
+    test('optional identity updates remain absolute labels', () {
+      expect(
+        keyframeDeltaAbsoluteInUpdate,
+        containsAll(<int>[attrSourceGroup, attrSourceIndex, attrObjectId]),
+      );
     });
 
     test('spherical harmonics are refused instead of discarded', () {

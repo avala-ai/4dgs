@@ -14,6 +14,7 @@ import 'dart:typed_data';
 import 'package:fourdgs/fourdgs.dart';
 import 'package:fourdgs_conformance/canonical.dart';
 import 'package:fourdgs_conformance/checks.dart';
+import 'package:fourdgs_conformance/optional_identity.dart';
 
 /// The Header's temporal model, read without decoding the gaussians. A
 /// `keyframe-delta` file composes and summarizes differently from a
@@ -39,13 +40,14 @@ String run(
     // that reconstruction — not a whole-population summary — is what the SDKs
     // are diffed on. Truncation recovery is a gaussian-birth check: the states
     // canonical is a different statement and a cut file is a different file.
+    final sequence = decodeKeyframeDeltaStreamed(
+      data,
+      maxDecodedStateBytes: maxDecodedStateBytes,
+    );
     return canonical(
-      keyframeDeltaStatesJson(
-        decodeKeyframeDeltaStreamed(
-          data,
-          maxDecodedStateBytes: maxDecodedStateBytes,
-        ),
-      ),
+      isOptionalIdentityWitness(sequence.header)
+          ? keyframeDeltaIdentityJson(sequence)
+          : keyframeDeltaStatesJson(sequence),
     );
   }
 
@@ -59,6 +61,10 @@ String run(
     scene,
     maxDecodedStateBytes: maxDecodedStateBytes,
   );
+
+  if (isOptionalIdentityWitness(scene.header)) {
+    return canonical(gaussianBirthIdentityJson(scene.gaussians));
+  }
 
   return canonical(
     summarize(
