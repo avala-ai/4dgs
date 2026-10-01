@@ -23,4 +23,4 @@ zstd = ["dep:zstd"]
 
 [dependencies]
 flate2 = "1"
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
