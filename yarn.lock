@@ -10637,10 +10637,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"react@npm:19.2.8":
-  version: 19.2.8
-  resolution: "react@npm:19.2.8"
-  checksum: 10c0/5f86bdb56426652fd6d989d30a6f2e603c057272c47c9ca3a3fbe190a3a39ee9ccce937d63cfc039717abed1b8891d6a499134bc35311acc07eafdacd86537cd
+"react@npm:19.3.0":
+  version: 19.3.0
+  resolution: "react@npm:19.3.0"
+  checksum: 10c0/dd3099c3c43a7122bc01223bb26b0f8d5ba13cca569af6fb94a005fb54fa73223c9cb203bb226d40cfd49a82cbeef2e36ce84062a3a6d5b9fe8f4437694c7b52
   languageName: node
   linkType: hard
 
@@ -12474,7 +12474,7 @@ __metadata:
     "@mdx-js/react": "npm:3.1.1"
     clsx: "npm:2.1.1"
     prism-react-renderer: "npm:2.4.1"
-    react: "npm:19.2.8"
+    react: "npm:19.3.0"
     react-dom: "npm:19.3.0"
     typescript: "npm:5.6.3"
   languageName: unknown
