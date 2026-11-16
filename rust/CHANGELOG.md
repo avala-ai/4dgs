@@ -6,6 +6,8 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-16
+
 ### Changed
 
 - **Omitted optional identity lanes reconstruct as logical zero.** Gaussian-birth assembly now

@@ -6,6 +6,8 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-16
+
 ### Changed
 
 - **Optional identity lanes now have one zero-default rule.** Gaussian-birth assembly pads omitted
