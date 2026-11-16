@@ -1235,7 +1235,7 @@ jobs:
     # Package.swift meet real SDKs. The job separately proves that the current Rust core can
     # produce the next release artifact and that Swift consumes the already-published,
     # checksummed artifact exactly as an out-of-tree Apple package does.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - run: swift --version
