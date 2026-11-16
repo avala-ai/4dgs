@@ -5538,15 +5538,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"cssesc@npm:^3.0.0":
-  version: 3.0.0
-  resolution: "cssesc@npm:3.0.0"
-  bin:
-    cssesc: bin/cssesc
-  checksum: 10c0/6bcfd898662671be15ae7827120472c5667afb3d7429f1f917737f3bf84c4176003228131b643ae74543f17a394446247df090c597bb9a728cce298606ed0aa7
-  languageName: node
-  linkType: hard
-
 "cssnano-preset-advanced@npm:^6.1.2":
   version: 6.1.2
   resolution: "cssnano-preset-advanced@npm:6.1.2"
@@ -7235,21 +7226,12 @@ __metadata:
   languageName: node
   linkType: hard
 
-"image-size@npm:2.0.2":
-  version: 2.0.2
-  resolution: "image-size@npm:2.0.2"
+"image-size@npm:2.0.3":
+  version: 2.0.3
+  resolution: "image-size@npm:2.0.3"
   bin:
     image-size: bin/image-size.js
-  checksum: 10c0/f09dd0f7cf8511cd20e4f756bdb5a7cb6d2240de3323f41bde266bed8373392a293892bf12e907e2995f52833fd88dd27cf6b1a52ab93968afc716cb78cd7b79
-  languageName: node
-  linkType: hard
-
-"image-size@patch:image-size@npm%3A2.0.2#~/.yarn/patches/image-size-npm-2.0.2-43abbcfb5c.patch":
-  version: 2.0.2
-  resolution: "image-size@patch:image-size@npm%3A2.0.2#~/.yarn/patches/image-size-npm-2.0.2-43abbcfb5c.patch::version=2.0.2&hash=cacc8a"
-  bin:
-    image-size: bin/image-size.js
-  checksum: 10c0/6693ae90b952a068c1e8343b4cb3037d230c44def3eba8c5195e7cba5cd3c42e7bd7472460520162c4731bde774cd6671387e33acc428792472ac0aa0f2e0f7e
+  checksum: 10c0/bfd1cc9b45c68e329411877e5f2a176a1cad77cff8d28357930bb4c23c94bbadc9c7e59a2ee1c7d05c76aa164f58f63ff249c24480a958245442888420ff6bb2
   languageName: node
   linkType: hard
 
@@ -10230,22 +10212,20 @@ __metadata:
   linkType: hard
 
 "postcss-selector-parser@npm:^6.0.11, postcss-selector-parser@npm:^6.0.16":
-  version: 6.1.5
-  resolution: "postcss-selector-parser@npm:6.1.5"
+  version: 6.1.6
+  resolution: "postcss-selector-parser@npm:6.1.6"
   dependencies:
-    cssesc: "npm:^3.0.0"
     util-deprecate: "npm:^1.0.2"
-  checksum: 10c0/1b328959d68b90a680979cfb99501fe3781f2da61e56748a912c9a9c8c20f9644a0bd510ac820d74d94ed0990bce747aea75cc5b17b966ea3a70c7c1932d31fd
+  checksum: 10c0/553c0eee43055660b000938373558667254b87c46d7d55ceaa183689a1ebcf3d186c23b68c0ab8fad24b4d6cfc987b683c9f8036f28db3165e230ef0870bcb32
   languageName: node
   linkType: hard
 
 "postcss-selector-parser@npm:^7.0.0":
-  version: 7.1.4
-  resolution: "postcss-selector-parser@npm:7.1.4"
+  version: 7.2.1
+  resolution: "postcss-selector-parser@npm:7.2.1"
   dependencies:
-    cssesc: "npm:^3.0.0"
     util-deprecate: "npm:^1.0.2"
-  checksum: 10c0/3d533d25bab83592e7134be0435e6cb1e2865f5e7d9fde65f1e7e1c75ccc5905168c9f55b05d2a3e10d01914a178433d3a54eab003f5ef6aa9a9d6816926caa2
+  checksum: 10c0/bb82454497a6d2c8ec302cb53fbdc5c4ca36b8874c5c1b61acc6f9a0d6699135b7de6b1852d8d57c0d3404500e14fa9995595cd5d73b3fcdf48d717c2264784c
   languageName: node
   linkType: hard
 
@@ -10437,17 +10417,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"qs@npm:6.16.0":
-  version: 6.16.0
-  resolution: "qs@npm:6.16.0"
-  dependencies:
-    es-define-property: "npm:^1.0.1"
-    side-channel: "npm:^1.1.1"
-  checksum: 10c0/eb3e31992fbd70e31a1791e571ed817d70975de7d3bfcbbbec93d77d1dd305877e9e8fdbcc62303c228ee5c3606685622cd6231c042dbc4790bb4e7c65fcbe18
-  languageName: node
-  linkType: hard
-
-"qs@npm:~6.16.0":
+"qs@npm:6.16.1, qs@npm:~6.16.0":
   version: 6.16.1
   resolution: "qs@npm:6.16.1"
   dependencies:
