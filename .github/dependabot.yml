@@ -9,6 +9,11 @@ updates:
   - package-ecosystem: npm
     directory: /
     schedule: { interval: monthly }
+    groups:
+      # react and react-dom refuse to run at different versions, so a pull request that
+      # moves one without the other cannot build the website. Keep them in one update.
+      react:
+        patterns: ["react", "react-dom"]
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: monthly }
