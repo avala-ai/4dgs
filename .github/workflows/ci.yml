@@ -1256,6 +1256,16 @@ jobs:
           scripts/build_apple_xcframework.sh "$version" "$RUNNER_TEMP/apple-core"
       - name: Build for macOS through the published binary target
         run: swift build --scratch-path swift/.build
+      # The release job runs these same tests against the binary target before it creates a
+      # release, and a bare Swift tag cannot be taken back. Run them here so that job is
+      # never the first place the macOS suite meets the published core. The corpus is
+      # generated first so the CLI tests cannot skip into a green run.
+      - name: Test on macOS through the published binary target
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -e ./python/fourdgs >/dev/null
+          "$RUNNER_TEMP/venv/bin/python" tests/conformance/generate.py >/dev/null
+          swift test --scratch-path swift/.build
       - name: Build for visionOS and iOS
         # xcodebuild resolves the package from the working directory, which is the
         # repository root now that the manifest lives there — there is nothing to cd into.

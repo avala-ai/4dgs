@@ -36,12 +36,12 @@ six-language repository belonging to one of them is the price, and it was judged
 against maintaining a generated mirror repository.
 
 ```swift
-.package(url: "https://github.com/avala-ai/4dgs", from: "0.3.0")
+.package(url: "https://github.com/avala-ai/4dgs", from: "0.4.0")
 ```
 
 The versions that resolves against come from plain `vX.Y.Z` tags on this repository, because those
 are the only tags SwiftPM reads — the `releases/<lang>/vX.Y.Z` tags every other package here is cut
-from are invisible to it. **A bare `v0.3.0` tag is the Swift package's version and nothing else**;
+from are invisible to it. **A bare `v0.4.0` tag is the Swift package's version and nothing else**;
 it says nothing about Python, Rust, TypeScript, C++ or Dart. See
 [RELEASING.md](../RELEASING.md#swift-tags-look-repository-wide-and-are-not).
 
