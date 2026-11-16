@@ -44,6 +44,10 @@ hand-kept index of the same thing, so that the log is readable without leaving t
 | 2026-09-05 | Rust `fourdgs`   | 0.7.1   | [releases/rust/v0.7.1](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.7.1)     |
 | 2026-09-05 | Swift `FourDGS`  | 0.3.0   | [v0.3.0](https://github.com/avala-ai/4dgs/releases/tag/v0.3.0)                                     |
 | 2026-09-05 | Corpus           | 0.1.0   | [releases/corpus/v0.1.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fcorpus%2Fv0.1.0) |
+| 2026-11-16 | Python `fourdgs` | 0.7.0   | [releases/python/v0.7.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fpython%2Fv0.7.0) |
+| 2026-11-16 | Dart `fourdgs`   | 0.3.0   | [releases/dart/v0.3.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fdart%2Fv0.3.0)     |
+| 2026-11-16 | Rust `fourdgs`   | 0.8.0   | [releases/rust/v0.8.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.8.0)     |
+| 2026-11-16 | Swift `FourDGS`  | 0.4.0   | [v0.4.0](https://github.com/avala-ai/4dgs/releases/tag/v0.4.0)                                     |
 
 `fourdgs 0.0.1` on PyPI, `fourdgs 0.0.1` on crates.io and `@4dgs/core`, `@4dgs/browser`,
 `@4dgs/nodejs` and `@4dgs/codecs` at `0.0.1` on npm are name reservations, published by hand before
@@ -56,10 +60,10 @@ reservation has been published: the release job's OIDC exchange has no trusted p
 with on npm. The tag will be pushed when it can publish, which is the only thing that puts a line
 here.
 
-Dart 0.2.0 is public on pub.dev, and tag-driven automated publishing is enabled now that the package
+Dart 0.3.0 is public on pub.dev, and tag-driven automated publishing is enabled now that the package
 has completed its required first manual publication.
 
-Swift 0.3.0 is published from the bare `v0.3.0` tag because SwiftPM reads versions only from plain
+Swift 0.4.0 is published from the bare `v0.4.0` tag because SwiftPM reads versions only from plain
 SemVer tags and there is no registry between it and this repository. That bare tag is the Swift
 package's version and not this repository's — the reasoning, and the rule that nothing else may ever
 use that tag shape, are in [RELEASING.md](RELEASING.md#swift-tags-look-repository-wide-and-are-not).
