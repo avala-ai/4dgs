@@ -9,7 +9,7 @@
 // with it — every target below names its own path under `swift/`.
 import PackageDescription
 
-// Apple consumers get the immutable, checksummed core published by the Rust 0.7.1 release. The
+// Apple consumers get the immutable, checksummed core published by the Rust 0.8.0 release. The
 // manifest is evaluated on macOS for every Apple destination, so one binary target covers macOS,
 // iOS and visionOS device and simulator slices. Linux CI deliberately keeps the source-built
 // system-library route: that is where the Swift binding is tested against the current checkout's
@@ -17,8 +17,8 @@ import PackageDescription
 #if os(macOS)
 let cFourDGSTarget: Target = .binaryTarget(
     name: "CFourDGS",
-    url: "https://github.com/avala-ai/4dgs/releases/download/releases/rust/v0.7.1/fourdgs-core-apple-0.7.1.xcframework.zip",
-    checksum: "1e68e9c1b8f126f1d304c482aa6e7a2d92374fc70c8aa07abd7254798dd99387"
+    url: "https://github.com/avala-ai/4dgs/releases/download/releases/rust/v0.8.0/fourdgs-core-apple-0.8.0.xcframework.zip",
+    checksum: "dfb62c34704744f75558a259e34f0caf2c44ec3e43cd51629dae5d19e2c3f785"
 )
 #else
 let cFourDGSTarget: Target = .systemLibrary(
