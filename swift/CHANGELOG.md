@@ -8,6 +8,13 @@ All notable changes to the Swift package are documented here, following
 
 ## [0.4.0] - 2026-11-16
 
+### Added
+
+- Apple consumers now receive the Rust 0.8.0 core as the checksummed SwiftPM binary target. It
+  carries the C ABI entries the changes below rely on, so an out-of-tree Apple build gets them
+  without Cargo or a checkout of this repository. The Swift suite now also runs on macOS against
+  that published artifact in CI, not only in the release job.
+
 ### Changed
 
 - **Optional identity columns now default to logical zero without losing present values.**
@@ -15,13 +22,13 @@ All notable changes to the Swift package are documented here, following
   keeps them aligned, and chunk-wise indexed reads zero-pad an omitted column whenever another Chunk
   materializes it. Both conformance paths emit the shared gaussian-birth identity rows, while
   keyframe-delta identity timelines remain core-owned and preserve omitted-update carry, zero-filled
-  births and keyframes, and absolute replacements. The published 0.7.1 Apple core predates these
-  additive C ABI entries: it remains link-compatible through optional symbol lookup, while identity
-  access requires the current source-built core until this package adopts a newer Apple core.
+  births and keyframes, and absolute replacements. Apple hosts resolve these additive C ABI entries
+  by name, so the package still links against a core that predates them; the Rust 0.8.0 core this
+  version names provides them.
 - Explicit streamed reads and `4dgs validate` now refuse every defined front-matter opcode found
   after the first Chunk or Delta Chunk as `late-front-matter-record`, carrying both physical
-  opcode/byte sites as typed data. The bounded Swift framing pass also gives Apple consumers the
-  rule while the published 0.7.1 XCFramework predates it; indexed open keeps the specification's
+  opcode/byte sites as typed data. The bounded Swift framing pass applies the rule at the Swift
+  edge, so it holds whichever core an Apple consumer links; indexed open keeps the specification's
   permitted early stop. `FourDGSError.lateFrontMatterRecord` is an additive public enum case, so an
   exhaustive consumer switch must add a corresponding arm.
 - Chunk Index count mismatches now cross the Rust core boundary as the named `index-record-mismatch`

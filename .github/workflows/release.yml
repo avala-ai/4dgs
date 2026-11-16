@@ -284,7 +284,7 @@ jobs:
             echo
             echo "This tag is the version of the **Swift package** and of nothing else in this repository — Swift is the one language here whose package manager reads plain SemVer tags. See [RELEASING.md](https://github.com/avala-ai/4dgs/blob/main/RELEASING.md#swift-tags-look-repository-wide-and-are-not)."
             echo
-            echo "The package builds out of tree without Cargo: SwiftPM verifies and links the checksummed Rust 0.7.1 XCFramework described in [swift/README.md](https://github.com/avala-ai/4dgs/blob/main/swift/README.md#the-core-is-in-the-package)."
+            echo "The package builds out of tree without Cargo: SwiftPM verifies and links the checksummed Rust 0.8.0 XCFramework described in [swift/README.md](https://github.com/avala-ai/4dgs/blob/main/swift/README.md#the-core-is-in-the-package)."
           } > "$RUNNER_TEMP/notes.md"
 
       - name: Build and test what the tag will offer

@@ -47,7 +47,7 @@ it says nothing about Python, Rust, TypeScript, C++ or Dart. See
 
 ## The core is in the package
 
-On Apple hosts, `Package.swift` fetches the Rust 0.7.1 core as a checksummed binary target. The
+On Apple hosts, `Package.swift` fetches the Rust 0.8.0 core as a checksummed binary target. The
 published XCFramework contains macOS, iOS device and simulator, and visionOS device and simulator
 slices. A consumer resolving the package from this repository therefore needs neither Cargo nor a
 source checkout; SwiftPM verifies the archive before linking it.
