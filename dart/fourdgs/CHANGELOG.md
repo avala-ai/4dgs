@@ -6,6 +6,8 @@ All notable changes to the Dart package are documented here, following
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
 ### Fixed
 
 - **Omitted optional identity lanes reconstruct as logical zero.** Gaussian-birth assembly now
