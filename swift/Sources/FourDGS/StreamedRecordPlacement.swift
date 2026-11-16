@@ -3,10 +3,12 @@
 
 /// A constant-memory top-level framing pass for the placement rule in spec section 4.
 ///
-/// The current Linux core enforces this itself. Apple SwiftPM consumers, however, link the
-/// already-published 0.7.1 XCFramework, which predates the rule and exposes no ABI for its two
-/// record sites. Keeping the check at the Swift edge makes explicit streamed reads agree on every
-/// platform without parsing record bodies or changing indexed open's permitted early stop.
+/// The current Linux core enforces this itself. Apple SwiftPM consumers, however, link a
+/// published XCFramework rather than the checkout's core, and this pass was written while that
+/// artifact was 0.7.1, which predates the rule and exposes no ABI for its two record sites.
+/// Keeping the check at the Swift edge makes explicit streamed reads agree on every platform,
+/// whichever core is linked, without parsing record bodies or changing indexed open's permitted
+/// early stop.
 enum StreamedRecordPlacement {
     private static let magicSize: Int64 = 8
     private static let recordHeaderSize: Int64 = 9

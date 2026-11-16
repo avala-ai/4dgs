@@ -36,18 +36,18 @@ six-language repository belonging to one of them is the price, and it was judged
 against maintaining a generated mirror repository.
 
 ```swift
-.package(url: "https://github.com/avala-ai/4dgs", from: "0.3.0")
+.package(url: "https://github.com/avala-ai/4dgs", from: "0.4.0")
 ```
 
 The versions that resolves against come from plain `vX.Y.Z` tags on this repository, because those
 are the only tags SwiftPM reads — the `releases/<lang>/vX.Y.Z` tags every other package here is cut
-from are invisible to it. **A bare `v0.3.0` tag is the Swift package's version and nothing else**;
+from are invisible to it. **A bare `v0.4.0` tag is the Swift package's version and nothing else**;
 it says nothing about Python, Rust, TypeScript, C++ or Dart. See
 [RELEASING.md](../RELEASING.md#swift-tags-look-repository-wide-and-are-not).
 
 ## The core is in the package
 
-On Apple hosts, `Package.swift` fetches the Rust 0.7.1 core as a checksummed binary target. The
+On Apple hosts, `Package.swift` fetches the Rust 0.8.0 core as a checksummed binary target. The
 published XCFramework contains macOS, iOS device and simulator, and visionOS device and simulator
 slices. A consumer resolving the package from this repository therefore needs neither Cargo nor a
 source checkout; SwiftPM verifies the archive before linking it.
