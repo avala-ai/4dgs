@@ -120,7 +120,7 @@ jobs:
   rust-core-apple:
     name: Build the Apple Rust core
     if: startsWith(github.ref, 'refs/tags/releases/rust/')
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: read
     steps:
@@ -227,7 +227,7 @@ jobs:
     # declares. A release verified only on Linux would be verified on the one platform
     # the package is not for.
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-14
+    runs-on: macos-15
     environment: release
     permissions:
       # For the release step alone. No id-token: nothing here authenticates to anything.
